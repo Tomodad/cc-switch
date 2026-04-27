@@ -108,6 +108,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut has_sent_message_start = false;
         let mut current_non_tool_block_type: Option<&'static str> = None;
         let mut current_non_tool_block_index: Option<u32> = None;
+        let mut pending_leading_text = String::new();
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
 
@@ -180,6 +181,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                                         // 处理 reasoning（thinking）
                                         if let Some(reasoning) = &choice.delta.reasoning {
+                                            pending_leading_text.clear();
                                             if current_non_tool_block_type != Some("thinking") {
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({
@@ -225,6 +227,14 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         // 处理文本内容
                                         if let Some(content) = &choice.delta.content {
                                             if !content.is_empty() {
+                                                if current_non_tool_block_index.is_none()
+                                                    && current_non_tool_block_type.is_none()
+                                                    && content.trim().is_empty()
+                                                {
+                                                    pending_leading_text.push_str(content);
+                                                    continue;
+                                                }
+
                                                 if current_non_tool_block_type != Some("text") {
                                                     if let Some(index) = current_non_tool_block_index.take() {
                                                         let event = json!({
@@ -254,12 +264,20 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 }
 
                                                 if let Some(index) = current_non_tool_block_index {
+                                                    let text = if pending_leading_text.is_empty() {
+                                                        content.clone()
+                                                    } else {
+                                                        let mut text =
+                                                            std::mem::take(&mut pending_leading_text);
+                                                        text.push_str(content);
+                                                        text
+                                                    };
                                                     let event = json!({
                                                         "type": "content_block_delta",
                                                         "index": index,
                                                         "delta": {
                                                             "type": "text_delta",
-                                                            "text": content
+                                                            "text": text
                                                         }
                                                     });
                                                     let sse_data = format!("event: content_block_delta\ndata: {}\n\n",
@@ -271,6 +289,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                                         // 处理工具调用
                                         if let Some(tool_calls) = &choice.delta.tool_calls {
+                                            pending_leading_text.clear();
                                             if let Some(index) = current_non_tool_block_index.take() {
                                                 let event = json!({
                                                     "type": "content_block_stop",
@@ -381,7 +400,8 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                         "content_block": {
                                                             "type": "tool_use",
                                                             "id": id,
-                                                            "name": name
+                                                            "name": name,
+                                                            "input": {}
                                                         }
                                                     });
                                                     let sse_data = format!("event: content_block_start\ndata: {}\n\n",
@@ -473,7 +493,8 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                     "content_block": {
                                                         "type": "tool_use",
                                                         "id": id,
-                                                        "name": name
+                                                        "name": name,
+                                                        "input": {}
                                                     }
                                                 });
                                                 let sse_data = format!("event: content_block_start\ndata: {}\n\n",
@@ -658,6 +679,12 @@ mod tests {
                     event.pointer("/content_block/id").and_then(|v| v.as_str()),
                     event.get("index").and_then(|v| v.as_u64()),
                 ) {
+                    assert!(
+                        event
+                            .pointer("/content_block/input")
+                            .is_some_and(Value::is_object),
+                        "tool_use content_block_start must include an empty input object"
+                    );
                     tool_index_by_call.insert(call_id.to_string(), index);
                 }
             }
@@ -760,6 +787,12 @@ mod tests {
                 .unwrap_or(""),
             "first_tool"
         );
+        assert!(
+            starts[0]
+                .pointer("/content_block/input")
+                .is_some_and(Value::is_object),
+            "late-started tool_use content_block_start must include input"
+        );
 
         let deltas: Vec<&str> = events
             .iter()
@@ -776,6 +809,60 @@ mod tests {
             .collect();
         assert!(deltas.contains(&"{\"a\":"));
         assert!(deltas.contains(&"1}"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_drops_whitespace_only_text_before_tool_call() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_4\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"\\n\\n\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_4\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\" \"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_4\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_4\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            input.as_bytes().to_vec(),
+        ))]);
+        let converted = create_anthropic_sse_stream(upstream);
+        let chunks: Vec<_> = converted.collect().await;
+        let merged = chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+            .collect::<String>();
+
+        let events: Vec<Value> = merged
+            .split("\n\n")
+            .filter_map(|block| {
+                let data = block
+                    .lines()
+                    .find_map(|line| strip_sse_field(line, "data"))?;
+                serde_json::from_str::<Value>(data).ok()
+            })
+            .collect();
+
+        let text_starts = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
+                    && event
+                        .pointer("/content_block/type")
+                        .and_then(|v| v.as_str())
+                        == Some("text")
+            })
+            .count();
+        assert_eq!(
+            text_starts, 0,
+            "leading whitespace must not create a standalone text block before tool_use"
+        );
+
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
+                && event
+                    .pointer("/content_block/type")
+                    .and_then(|v| v.as_str())
+                    == Some("tool_use")
+        }));
     }
 
     #[tokio::test]
