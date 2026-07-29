@@ -558,6 +558,51 @@ fn codex_catalog_input_modalities(
     modalities.iter().map(|item| (*item).to_string()).collect()
 }
 
+fn codex_reasoning_level(effort: &str) -> Value {
+    let description = match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Ultra reasoning depth for the most demanding problems",
+        _ => "Reasoning effort",
+    };
+    json!({ "effort": effort, "description": description })
+}
+
+fn codex_model_reasoning_metadata(model: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-5.6-sol" => Some(("low", &["low", "medium", "high", "xhigh", "max", "ultra"])),
+        "gpt-5.6-terra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
+        "gpt-5.6-luna" => Some(("medium", &["low", "medium", "high", "xhigh", "max"])),
+        _ => None,
+    }
+}
+
+fn apply_codex_model_reasoning_metadata(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    model: &str,
+) {
+    let Some((default_effort, efforts)) = codex_model_reasoning_metadata(model) else {
+        return;
+    };
+
+    entry_obj.insert("default_reasoning_level".to_string(), json!(default_effort));
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(
+            efforts
+                .iter()
+                .map(|effort| codex_reasoning_level(effort))
+                .collect(),
+        ),
+    );
+    entry_obj.insert("reasoning_levels".to_string(), Value::Null);
+}
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -594,6 +639,8 @@ fn codex_catalog_model_entry(
             spec.input_modalities.as_deref(),
         )),
     );
+
+    apply_codex_model_reasoning_metadata(entry_obj, &spec.model);
 
     if profile != CodexCatalogToolProfile::ProxyChat {
         // Native `/responses` and Anthropic gateways reject / drop Codex's freeform
@@ -3313,6 +3360,67 @@ base_url = "https://production.api/v1"
         );
     }
 
+    #[test]
+    fn codex_model_catalog_uses_gpt_5_6_model_specific_reasoning_metadata() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "Frontier model",
+            "base_instructions": "gpt-5.5 base instructions",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                { "effort": "none", "description": "Disable Thinking" },
+                { "effort": "high", "description": "Enabled Thinking" }
+            ]
+        });
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "gpt-5.6-sol" },
+                    { "model": "gpt-5.6-terra" },
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "custom-model" }
+                ]
+            }
+        });
+        let specs = codex_catalog_model_specs(&settings, "");
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &template,
+            CodexCatalogToolProfile::ProxiedNativeResponses,
+        );
+        let models = catalog["models"].as_array().expect("models array");
+
+        let efforts = |index: usize| {
+            models[index]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .map(|level| level["effort"].as_str().expect("effort"))
+                .collect::<Vec<_>>()
+        };
+        let default = |index: usize| {
+            models[index]["default_reasoning_level"]
+                .as_str()
+                .expect("default reasoning level")
+        };
+
+        assert_eq!(default(0), "low");
+        assert_eq!(
+            efforts(0),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(default(1), "medium");
+        assert_eq!(
+            efforts(1),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(default(2), "medium");
+        assert_eq!(efforts(2), vec!["low", "medium", "high", "xhigh", "max"]);
+
+        assert_eq!(default(3), "high");
+        assert_eq!(efforts(3), vec!["none", "high"]);
+    }
     #[test]
     fn codex_model_catalog_uses_provider_models_and_context() {
         let template = json!({
