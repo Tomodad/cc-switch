@@ -40,7 +40,7 @@ use tokio_tungstenite::{
         protocol::{frame::coding::CloseCode, CloseFrame as UpstreamCloseFrame, WebSocketConfig},
         Error as WebSocketError, Message as UpstreamMessage,
     },
-    MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
 
@@ -66,6 +66,8 @@ struct TurnTransformState {
 struct WebSocketTurnAccounting {
     state: ProxyState,
     provider_id: String,
+    provider_name: String,
+    current_provider_id_at_start: String,
     used_half_open_permit: bool,
     _active_guard: Option<ActiveConnectionGuard>,
     finalized: bool,
@@ -107,6 +109,8 @@ impl WebSocketTurnAccounting {
         Ok(Self {
             state: state.clone(),
             provider_id: ctx.provider.id.clone(),
+            provider_name: ctx.provider.name.clone(),
+            current_provider_id_at_start: ctx.current_provider_id.clone(),
             used_half_open_permit,
             _active_guard: Some(active_guard),
             finalized: false,
@@ -133,9 +137,43 @@ impl WebSocketTurnAccounting {
                 error
             );
         }
-        let mut status = self.state.status.write().await;
-        status.success_requests = status.success_requests.saturating_add(1);
-        update_proxy_success_rate(&mut status);
+        {
+            let mut current_providers = self.state.current_providers.write().await;
+            current_providers.insert(
+                "codex".to_string(),
+                (self.provider_id.clone(), self.provider_name.clone()),
+            );
+        }
+
+        let should_switch = self.current_provider_id_at_start != self.provider_id;
+        {
+            let mut status = self.state.status.write().await;
+            status.success_requests = status.success_requests.saturating_add(1);
+            status.last_error = None;
+            if should_switch {
+                status.failover_count = status.failover_count.saturating_add(1);
+            }
+            update_proxy_success_rate(&mut status);
+        }
+
+        if should_switch {
+            let failover_manager = self.state.failover_manager.clone();
+            let app_handle = self.state.app_handle.clone();
+            let provider_id = self.provider_id.clone();
+            let provider_name = self.provider_name.clone();
+            tokio::spawn(async move {
+                if let Err(error) = failover_manager
+                    .try_switch(app_handle.as_ref(), "codex", &provider_id, &provider_name)
+                    .await
+                {
+                    log::warn!(
+                        "[CodexWS] Failed to synchronize successful failover (provider={}): {}",
+                        provider_id,
+                        error
+                    );
+                }
+            });
+        }
     }
 
     async fn finish_provider_failure(mut self, message: String) {
@@ -412,9 +450,7 @@ async fn handle_connection_inner(
                             )
                             .await?;
                             let next_provider = next_ctx.provider.clone();
-                            if next_provider.id != provider.id
-                                || next_provider.settings_config != provider.settings_config
-                            {
+                            if provider_snapshot_changed(&provider, &next_provider) {
                                 return Err(ProxyError::ConfigError(
                                     "selected Codex provider changed; reconnect WebSocket".to_string(),
                                 ));
@@ -700,7 +736,8 @@ fn transform_client_text(
         transform_codex_responses_namespace::namespace_restore_map(&original_body);
     let request_uses_tool_search_shim =
         transform_codex_chat::request_uses_responses_tool_search_shim(&original_body);
-    let (mut body, _, _) = super::model_mapper::apply_model_mapping(original_body, provider);
+    let (body, _, _) = super::model_mapper::apply_model_mapping(original_body, provider);
+    let mut body = super::model_mapper::strip_one_m_suffix_for_upstream_from_body(body);
 
     if rectifier_config.enabled && rectifier_config.request_media_fallback {
         let replaced = super::media_sanitizer::replace_images_for_text_only_model(
@@ -802,8 +839,28 @@ fn websocket_event_is_terminal(text: &str) -> bool {
 }
 
 fn websocket_event_is_successful_terminal(text: &str) -> bool {
-    websocket_event_is(text, "response.completed")
+    websocket_event_type(text).is_some_and(|event_type| {
+        matches!(
+            event_type.as_str(),
+            "response.completed" | "response.incomplete"
+        )
+    })
 }
+
+fn provider_snapshot_changed(current: &Provider, next: &Provider) -> bool {
+    if current.id != next.id || current.settings_config != next.settings_config {
+        return true;
+    }
+
+    match (
+        serde_json::to_value(&current.meta),
+        serde_json::to_value(&next.meta),
+    ) {
+        (Ok(current_meta), Ok(next_meta)) => current_meta != next_meta,
+        _ => true,
+    }
+}
+
 fn restore_upstream_text(text: String, state: &TurnTransformState) -> String {
     if state.namespace_restore_map.is_empty() && !state.restore_tool_search {
         return text;
@@ -944,11 +1001,14 @@ async fn connect_upstream_websocket(
         max_frame_size: Some(MAX_WEBSOCKET_MESSAGE_SIZE),
         ..Default::default()
     };
-    let (socket, _) = client_async_tls_with_config(request, stream, Some(websocket_config), None)
-        .await
-        .map_err(|error| {
-            ProxyError::ForwardFailed(format!("WebSocket protocol handshake failed: {error}"))
-        })?;
+    let connector = (target_url.scheme() == "wss")
+        .then(|| Connector::Rustls(super::hyper_client::build_tls_client_config()));
+    let (socket, _) =
+        client_async_tls_with_config(request, stream, Some(websocket_config), connector)
+            .await
+            .map_err(|error| {
+                ProxyError::ForwardFailed(format!("WebSocket protocol handshake failed: {error}"))
+            })?;
     Ok(socket)
 }
 
@@ -1143,16 +1203,48 @@ mod tests {
         database::Database,
         proxy::{server::ProxyServer, types::ProxyConfig},
     };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use rustls::{
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        ServerConfig,
+    };
     use serial_test::serial;
-    use std::sync::Arc;
+    use std::{env, ffi::OsString, fs, sync::Arc};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         sync::oneshot,
     };
+    use tokio_rustls::TlsAcceptor;
     use tokio_tungstenite::{
         accept_async_with_config, accept_hdr_async, connect_async, connect_async_with_config,
     };
+
+    const TEST_CA_DER_BASE64: &str = "MIIDETCCAfmgAwIBAgIJAJ6Bgah1Zn3AMA0GCSqGSIb3DQEBCwUAMCYxJDAiBgNVBAMTG0NDLVN3aXRjaCBXZWJTb2NrZXQgVGVzdCBDQTAeFw0yMDAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMCYxJDAiBgNVBAMTG0NDLVN3aXRjaCBXZWJTb2NrZXQgVGVzdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKp6fTz+YiwlBeJhhAycVaJ7FIgACUMW/pHAst3ktdxaSC3uC5axDxLlTBDrVXLcVMUmvSrLbDNxLRY9gfPyTmb10SJufklHXZfC7w3qTL8C+ah7QXEbpMq08KozwQxSQFm21Zm4jHeUgGwVsYwQaAUVfT6ntAUzuOPWPZiLifDwwDKBwwUOC/E1Oq1h0en9RwNq1UK/z+LKIPs7p5SgNQl+/9RwaBvtLqXiMhpXaIsntUsKqVbzZxqJqfDKdKJE5Qbl3+ZWbjFLRVJ+SgNUiViLcyS8uJpEr4ziU7c8dJQqv0pWy9lpWf4z+zMj/2NB/ixoeGq6KN2od8n4Z/zZWOECAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFAN2yJ1qTsYtvXbVRms3JkF5V5d0MA0GCSqGSIb3DQEBCwUAA4IBAQCTtGuy8Yfj2HVHVeLy6GxkqOCPQh0G/JZudJsGApOp275w1iXur6ObzDPfpmaalqCkBoGwKJbWOFyW1bRoVhSlUPgCeEgjTzpOEoJgYOurv1iJEVtKSI2r77fTiDA4WNiULeRF9tn+pL+owp9clJ8/+3Pvv4BWEDnOqyS+St/SkzW8oOfKwDUwMOy2GaYxh5+98vaPyzE7gZYr7z1VxKhz59WMh0PpRWx6Hua2KObzeASvhNpC2J1IedSXoYpD1tDv9F/ERSSeofuIM8vM3hkH/Ul9KXczW6iSG5Nm5TAWO4wPCvECK1fIqMUgiLCZOPnRl2YE+GNYkS3fFqOdcK3v";
+    const TEST_SERVER_CERT_DER_BASE64: &str = "MIIDGDCCAgCgAwIBAgIQPo6+OoGWp9S9hXSlWuTm8jANBgkqhkiG9w0BAQsFADAmMSQwIgYDVQQDExtDQy1Td2l0Y2ggV2ViU29ja2V0IFRlc3QgQ0EwHhcNMjAwMTAxMDAwMDAwWhcNNDUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDEwlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCtC+fZvyVVjsyfMurnGtdwVuzgVJApe8nd/w0E3u5E1YaZLAhMZz7FzPmqhK5E6R04yAbQFWFAMkYvJl99KAMKyRkUTw6/ojWCaB76z0MDfi62CBkRiK/Zq8+5oncen79jN6J5TAzB9fhqCPD/R6UHcvT7xZCRvWLXrAhXRu0QRg8bMcpf8Q3IiPnNvtcIdcrIE8WVrGSaRkfiOxxaKS9BRm7+ehx9nweRe5xrcOI9vSDLI/L/sGafT+Tf/pWzGwz9uiC2fqQKw860faox0Oq6Qhj5NEr1TEunaA0GEjDWJwxKWYuUFrGeruo21JP8J2G6DjsH8CErYazu/3v4tQeJAgMBAAGjVDBSMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgWgMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMBMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEAYhw4NjXQu+422MT7kH88ezNKWBUwFSWlwTHcN+nO/qWbLu8VqIQmpB/HJqjMOiSJ1dDZfVbRxvJvrr/j4iCbjtP9kdmsDvj4ISyYVUPjDlZT5vBgB774BOlaI8YHtz+xxB2lslYFhwqbqF35tYUfeVWx/c5+OQEzSOPeDP1zHNw71LK8py/af3w5qEKk95Jz6SqgSX8KFdZ4V42iwLgB4A++IOkMPxjpd4WpwWZThcPbGIyzxm1FI4pOTGLxE9SrG9gglOmHZ9QW+PbdZQQEfW3hMx+GkI3W76HrjgCualJhWP4IibxaAmAJhrto2gVE0rrwa6HevPfArwsGX3AfyQ==";
+    const TEST_SERVER_KEY_DER_BASE64: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCtC+fZvyVVjsyfMurnGtdwVuzgVJApe8nd/w0E3u5E1YaZLAhMZz7FzPmqhK5E6R04yAbQFWFAMkYvJl99KAMKyRkUTw6/ojWCaB76z0MDfi62CBkRiK/Zq8+5oncen79jN6J5TAzB9fhqCPD/R6UHcvT7xZCRvWLXrAhXRu0QRg8bMcpf8Q3IiPnNvtcIdcrIE8WVrGSaRkfiOxxaKS9BRm7+ehx9nweRe5xrcOI9vSDLI/L/sGafT+Tf/pWzGwz9uiC2fqQKw860faox0Oq6Qhj5NEr1TEunaA0GEjDWJwxKWYuUFrGeruo21JP8J2G6DjsH8CErYazu/3v4tQeJAgMBAAECggEATSCTU+/oGfwto380R5ElGMMFjO7j2jl8Pd/h05vxIujwtvBzOmqCBfNYC/JbIgesqJQuxSviTpSZx4YY5VWiFXqQHQcnka4gn2D8/djHC5WACE4Prkr35dK4IQsSgKm+yeAQIHQO85xH/irCD2XFXk6UdmsWBn8cwPfCN/Q60RdMtBW02NHtIIsnZfAFvWQhM2RQLhp5nZtj4OmXY8h1kfWl8qupS9iTKGn/rRaU8KrRmrQrBT87W6BMIzJ7PX1v7WvuW4tbHi4xqq76Bav71CnM2QN8AU8zpy4v23WJZeCXEFRELLrv08MSQNg8SGOtus87abBGfEvfcTx8pxi26QKBgQDhJgHR4/JnjHIwZmnprlGHzh8LJm5E382ASTB8nBkFGNuSzeHfjXokgCy7nACXyd0bUhydMBCBSQYLqOOyfieBB4deOuTvLfxi9D5+w0nzSIpF3hV8AEvCvUy6t7VTfrpDqt0IyOf1qbZMhsTGlbJ6CZnlXzEo3PE4S0UhwHvHewKBgQDEwjYvXFT59ojTdI2ZSrNN74xnZkwqoVhSZr12Rq36JPQkYsgOLVGcOjD94VCv6aZDcHWXG97IKZyr6L+UPgrmQnuA+/9P2ekPFscuwaVmZY6E7D81j3fJ3uzT18ocU1vF5ec36/xV6zwv7TanD3tauQ1oJLVc6dvsb3WXEFW7ywKBgQCCACES4SxpL8YLPkcvX7DB2nlARetrp1IQHbJ6cONddxHpfSlLnHQHOV8a4KPTAQLDMLFG7abKD7EG8Hiw6njC3ucBuL3RgNr3BBJFvVsotxzn5KjBFaapBgaU1VhEoqrIQZMo7GBLD7gsDbD2/R61qm+K6mEHODOsDoIXT/3omwKBgGfwICeMoucYsNbjLxnXODjnXkgQ5hNu//UniNY+KBGIC+Bcvkme7wmUQ+UZbUJALzBY7AVTF7CtKrI1VV6+F4vjetJ8TDamalMqOTYd3X3mEA9vrURh8WmWdYzC5WVpM4WrGSWVZ8sLZNP8f25o40TdlJN7MMNQVnjjuD6AxolZAoGAcy2REEDgXq39ykhMAZWWJVh1Q8gWHfkZFP+sz7U0F2nvMGEuTcLNqzQC4VlUK4QLo6O88VPPP/dKBq3Ry1C80LCqXSqBvd//jToiHMGwehCFEHV8St7+ka8rR35a8UQvxoR868Kuz0ODRwZ3gklDJY33JUaI3zCKb/S1wFnV/s0=";
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 
     fn websocket_provider(base_url: String) -> Provider {
         websocket_provider_with_id("ws-provider", base_url)
@@ -1243,6 +1335,28 @@ mod tests {
         assert!(event.get("_private").is_none());
         assert!(event.get("response").is_none());
     }
+
+    #[test]
+    fn strips_local_one_m_marker_after_websocket_model_mapping() {
+        let mut provider = websocket_provider("http://127.0.0.1:1".to_string());
+        provider.settings_config["env"]["ANTHROPIC_MODEL"] =
+            Value::String("upstream-model [1M]".to_string());
+        let input = json!({
+            "type": "response.create",
+            "model": "local-model",
+            "input": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+
+        let (encoded, _) =
+            transform_client_text(&input, &provider, &RectifierConfig::default(), true)
+                .expect("transform")
+                .expect("response.create");
+
+        let event: Value = serde_json::from_str(&encoded).expect("transformed event JSON");
+        assert_eq!(event["model"], "upstream-model");
+    }
+
     #[test]
     fn transforms_response_create_and_restores_native_events() {
         let provider = websocket_provider("http://127.0.0.1:1".to_string());
@@ -1807,6 +1921,87 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn closes_at_turn_boundary_when_provider_metadata_changes() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (old_received_tx, old_received_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp-one", "output": []}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send first completion");
+            let received_old = matches!(
+                tokio::time::timeout(Duration::from_secs(2), websocket.next()).await,
+                Ok(Some(Ok(UpstreamMessage::Text(_))))
+            );
+            let _ = old_received_tx.send(received_old);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send first turn");
+        let _ = next_text(&mut client).await;
+
+        provider.meta = Some(crate::provider::ProviderMeta {
+            custom_user_agent: Some("cc-switch-hot-edit".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &provider)
+            .expect("save provider metadata edit");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-one")).to_string(),
+            ))
+            .await
+            .expect("send second turn");
+        let error: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("provider-metadata error JSON");
+        assert_eq!(error["type"], "error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("provider changed")));
+        assert!(!old_received_rx.await.expect("old provider observation"));
+
+        upstream_task.await.expect("metadata upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn stopping_proxy_closes_active_responses_websocket() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1905,6 +2100,11 @@ mod tests {
                 .await
                 .expect("accept websocket");
             for turn in 1..=2 {
+                let terminal_type = if turn == 1 {
+                    "response.completed"
+                } else {
+                    "response.incomplete"
+                };
                 let _ = next_text(&mut websocket).await;
                 websocket
                     .send(UpstreamMessage::Text(
@@ -1923,7 +2123,7 @@ mod tests {
                 websocket
                     .send(UpstreamMessage::Text(
                         json!({
-                            "type": "response.completed",
+                            "type": terminal_type,
                             "response": {
                                 "id": format!("resp-{turn}"),
                                 "model": "upstream-model",
@@ -2130,6 +2330,24 @@ mod tests {
             serde_json::from_str(&next_text(&mut second).await).expect("healthy completion JSON");
         assert_eq!(completed["type"], "response.completed");
 
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = server.get_status().await;
+                if status.failover_count == 1
+                    && status
+                        .active_targets
+                        .iter()
+                        .any(|target| target.app_type == "codex" && target.provider_id == good.id)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("successful WebSocket failover did not update proxy routing state");
+        assert_eq!(status.failover_count, 1);
+
         drop(second);
         healthy_task.await.expect("healthy upstream task");
         server.stop().await.expect("stop proxy");
@@ -2229,6 +2447,99 @@ mod tests {
 
         drop(client);
         upstream_task.await.expect("large-message upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn trusts_ssl_cert_file_for_upstream_websocket_tls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().expect("create certificate directory");
+        let ca_path = temp.path().join("ws-test-ca.pem");
+        let ca_body = TEST_CA_DER_BASE64
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).expect("base64 UTF-8"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            &ca_path,
+            format!("-----BEGIN CERTIFICATE-----\n{ca_body}\n-----END CERTIFICATE-----\n"),
+        )
+        .expect("write test CA");
+        let _ssl_cert_file = EnvVarGuard::set("SSL_CERT_FILE", &ca_path);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let certificate = CertificateDer::from(
+            STANDARD
+                .decode(TEST_SERVER_CERT_DER_BASE64)
+                .expect("decode server certificate"),
+        );
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            STANDARD
+                .decode(TEST_SERVER_KEY_DER_BASE64)
+                .expect("decode server key"),
+        ));
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .expect("build TLS server config");
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("accept upstream TCP");
+            let stream = acceptor.accept(stream).await.expect("accept upstream TLS");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept upstream websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp-tls", "output": []}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send TLS completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("https://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let response: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("TLS response JSON");
+        assert_eq!(response["type"], "response.completed");
+
+        drop(client);
+        upstream_task.await.expect("TLS upstream task");
         server.stop().await.expect("stop proxy");
     }
 

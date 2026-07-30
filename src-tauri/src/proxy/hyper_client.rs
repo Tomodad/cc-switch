@@ -10,7 +10,7 @@ use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -568,19 +568,22 @@ pub(crate) async fn connect_via_proxy(
 /// keychain are trusted through the CONNECT tunnel.
 fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| {
-        let mut root_store = rustls::RootCertStore::empty();
-        // Baseline: Mozilla/webpki roots
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        // Native system certs (includes user-installed proxy CAs)
-        let native = rustls_native_certs::load_native_certs();
-        let (added, _errors) = root_store.add_parsable_certificates(native.certs);
-        log::debug!("[HyperClient] TLS root store: webpki + {added} native certs");
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
-    })
+    CONNECTOR.get_or_init(|| tokio_rustls::TlsConnector::from(build_tls_client_config()))
+}
+
+pub(super) fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut root_store = rustls::RootCertStore::empty();
+    // Baseline: Mozilla/webpki roots
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Native system certs (includes user-installed proxy CAs)
+    let native = rustls_native_certs::load_native_certs();
+    let (added, _errors) = root_store.add_parsable_certificates(native.certs);
+    log::debug!("[HyperClient] TLS root store: webpki + {added} native certs");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Arc::new(config)
 }
 
 /// Build raw HTTP/1.1 request bytes with original header casing.
