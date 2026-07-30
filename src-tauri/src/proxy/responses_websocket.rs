@@ -100,16 +100,6 @@ impl WebSocketTurnAccounting {
         count_request: bool,
     ) -> Result<Self, ProxyError> {
         let active_guard = ActiveConnectionGuard::acquire(state.status.clone()).await;
-        {
-            let mut status = state.status.write().await;
-            if count_request {
-                status.total_requests = status.total_requests.saturating_add(1);
-                status.last_request_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            status.current_provider = Some(provider.name.clone());
-            status.current_provider_id = Some(provider.id.clone());
-        }
-
         let used_half_open_permit = if ctx.app_config.auto_failover_enabled {
             let permit = state
                 .provider_router
@@ -123,6 +113,15 @@ impl WebSocketTurnAccounting {
         } else {
             false
         };
+        {
+            let mut status = state.status.write().await;
+            if count_request {
+                status.total_requests = status.total_requests.saturating_add(1);
+                status.last_request_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            status.current_provider = Some(provider.name.clone());
+            status.current_provider_id = Some(provider.id.clone());
+        }
 
         Ok(Self {
             state: state.clone(),
@@ -391,7 +390,7 @@ async fn handle_connection_inner(
     let mut provider_attempts = 0_usize;
     let mut original_response_create = first_text;
 
-    let mut count_request = true;
+    let count_request = true;
     let initial_accounting = loop {
         match WebSocketTurnAccounting::begin_for_provider(
             state,
@@ -408,7 +407,6 @@ async fn handle_connection_inner(
             Err(ProxyError::NoAvailableProvider)
                 if turn_context.app_config.auto_failover_enabled =>
             {
-                count_request = false;
                 let mut next_provider = None;
                 while provider_index + 1 < turn_providers.len()
                     && provider_attempts < provider_attempt_limit
@@ -438,6 +436,7 @@ async fn handle_connection_inner(
     let mut turn_accounting = Some(initial_accounting);
     let mut response_in_flight = true;
     let mut turn_started = Instant::now();
+    let mut media_rectifier_retried = false;
     let mut first_token_ms = None;
     let mut received_response_event = false;
     let mut relayed_response_event = false;
@@ -634,6 +633,7 @@ async fn handle_connection_inner(
                             turn_started = Instant::now();
                             first_token_ms = None;
                             received_response_event = false;
+                            media_rectifier_retried = false;
                             relayed_response_event = false;
                             last_response_event_at = turn_started;
                         }
@@ -831,6 +831,65 @@ async fn handle_connection_inner(
                             let event = serde_json::from_str::<Value>(&text).ok();
                             (outcome, status_code, event)
                         });
+                        if terminal
+                            && !relayed_response_event
+                            && !media_rectifier_retried
+                            && turn_context.rectifier_config.enabled
+                            && turn_context.rectifier_config.request_media_fallback
+                        {
+                            let status_code = terminal_data
+                                .as_ref()
+                                .map(|(_, status, _)| *status)
+                                .unwrap_or(500);
+                            let media_error = ProxyError::UpstreamError {
+                                status: status_code,
+                                body: Some(text.clone()),
+                            };
+                            let mut retry_event: Value = serde_json::from_str(
+                                &original_response_create,
+                            )
+                            .map_err(|error| {
+                                ProxyError::InvalidRequest(format!(
+                                    "invalid WebSocket JSON: {error}"
+                                ))
+                            })?;
+                            let mut retry_body = response_create_body(&retry_event)?;
+                            if super::media_sanitizer::contains_image_blocks(&retry_body)
+                                && super::media_sanitizer::is_unsupported_image_error(&media_error)
+                                && super::media_sanitizer::replace_image_blocks_with_marker(
+                                    &mut retry_body,
+                                ) > 0
+                            {
+                                if retry_event.get("response").is_some() {
+                                    retry_event["response"] = retry_body;
+                                } else {
+                                    retry_body["type"] = Value::String("response.create".to_string());
+                                    retry_event = retry_body;
+                                }
+                                let (retry_text, retry_state) = transform_client_text(
+                                    &retry_event.to_string(),
+                                    &provider,
+                                    &turn_context.rectifier_config,
+                                    true,
+                                )?
+                                .expect("rectified response.create");
+                                let mut retry_state = retry_state.expect("rectified turn state");
+                                retry_state.session_id = turn_context.session_id.clone();
+                                let retry_started = Instant::now();
+                                let retry_deadline = websocket_turn_timeout_deadline(
+                                    true, false, retry_started, retry_started, timeout_config,
+                                );
+                                send_upstream_message(&mut upstream, UpstreamMessage::Text(retry_text), retry_deadline, &mut shutdown_rx, "media fallback event write").await?;
+                                turn_state = retry_state;
+                                media_rectifier_retried = true;
+                                received_response_event = false;
+                                relayed_response_event = false;
+                                turn_started = retry_started;
+                                first_token_ms = None;
+                                last_response_event_at = retry_started;
+                                continue;
+                            }
+                        }
                         if terminal_data.as_ref().is_some_and(|(outcome, _, _)| {
                             *outcome == WebSocketTerminalOutcome::ProviderFailure
                         }) && !relayed_response_event
@@ -986,6 +1045,7 @@ async fn handle_connection_inner(
                                 upstream = retry_upstream;
                                 turn_state = retry_state;
                                 turn_accounting = Some(retry_accounting);
+                                media_rectifier_retried = false;
                                 response_in_flight = true;
                                 turn_started = retry_started;
                                 first_token_ms = None;
@@ -1928,7 +1988,18 @@ async fn connect_via_socks5(
     }
 
     let mut request = vec![0x05, 0x01, 0x00];
-    if proxy_url.scheme() == "socks5h" {
+    if let Ok(address) = target_host.parse::<std::net::IpAddr>() {
+        match address {
+            std::net::IpAddr::V4(ip) => {
+                request.push(0x01);
+                request.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                request.push(0x04);
+                request.extend_from_slice(&ip.octets());
+            }
+        }
+    } else if proxy_url.scheme() == "socks5h" {
         let host = target_host.as_bytes();
         if host.len() > u8::MAX as usize {
             return Err(ProxyError::ConfigError(
@@ -1939,22 +2010,16 @@ async fn connect_via_socks5(
         request.push(host.len() as u8);
         request.extend_from_slice(host);
     } else {
-        let address = if let Ok(ip) = target_host.parse::<std::net::IpAddr>() {
-            ip
-        } else {
-            tokio::net::lookup_host((target_host, target_port))
-                .await
-                .map_err(|error| {
-                    ProxyError::ForwardFailed(format!("SOCKS target DNS lookup failed: {error}"))
-                })?
-                .next()
-                .ok_or_else(|| {
-                    ProxyError::ForwardFailed(
-                        "SOCKS target DNS lookup returned no address".to_string(),
-                    )
-                })?
-                .ip()
-        };
+        let address = tokio::net::lookup_host((target_host, target_port))
+            .await
+            .map_err(|error| {
+                ProxyError::ForwardFailed(format!("SOCKS target DNS lookup failed: {error}"))
+            })?
+            .next()
+            .ok_or_else(|| {
+                ProxyError::ForwardFailed("SOCKS target DNS lookup returned no address".to_string())
+            })?
+            .ip();
         match address {
             std::net::IpAddr::V4(ip) => {
                 request.push(0x01);
@@ -2806,6 +2871,99 @@ mod tests {
         );
 
         upstream_task.await.expect("media upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retries_websocket_turn_after_reactive_unsupported_image_error() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reactive media upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (events_tx, events_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let first = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type":"response.failed",
+                        "response":{
+                            "error":{
+                                "status":400,
+                                "type":"invalid_request_error",
+                                "message":"image inputs are not supported"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send unsupported-image failure");
+            let retry = tokio::time::timeout(Duration::from_millis(500), next_text(&mut websocket))
+                .await
+                .ok();
+            if retry.is_some() {
+                websocket
+                    .send(UpstreamMessage::Text(
+                        json!({"type":"response.completed","response":{"id":"resp-media-retry","output":[]}})
+                            .to_string(),
+                    ))
+                    .await
+                    .expect("send retry completion");
+            }
+            let _ = events_tx.send((first, retry));
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        client
+            .send(UpstreamMessage::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"local-model",
+                    "input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send image turn");
+
+        let terminal: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("retry completion JSON");
+        let (first, retry) = events_rx.await.expect("upstream events");
+        let first: Value = serde_json::from_str(&first).expect("first event JSON");
+        let retry = retry.expect("rectified retry reached upstream");
+        let retry: Value = serde_json::from_str(&retry).expect("retry event JSON");
+        assert_eq!(first["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(retry["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            retry["input"][0]["content"][0]["text"],
+            crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+        );
+        assert_eq!(terminal["type"], "response.completed");
+
+        upstream_task.await.expect("reactive media upstream task");
         server.stop().await.expect("stop proxy");
     }
 
@@ -3995,6 +4153,94 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn all_initial_half_open_permit_denials_do_not_count_a_request() {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("configure half-open breaker");
+        let mut primary =
+            websocket_provider_with_id("ws-primary-denied", "http://127.0.0.1:1".to_string());
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-fallback-denied", "http://127.0.0.1:1".to_string());
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &primary.id)
+            .expect("select primary provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        for provider in [&primary, &fallback] {
+            router
+                .record_result(
+                    &provider.id,
+                    "codex",
+                    false,
+                    false,
+                    Some("prime half-open state".to_string()),
+                )
+                .await
+                .expect("open provider breaker");
+        }
+        let primary_permit = router.allow_provider_request(&primary.id, "codex").await;
+        let fallback_permit = router.allow_provider_request(&fallback.id, "codex").await;
+        assert!(primary_permit.allowed && primary_permit.used_half_open_permit);
+        assert!(fallback_permit.allowed && fallback_permit.used_half_open_permit);
+
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let terminal: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("permit-denial error JSON");
+
+        let status = server.get_status().await;
+        assert_eq!(terminal["type"], "error");
+        assert_eq!(status.total_requests, 0);
+
+        router
+            .release_permit_neutral(&primary.id, "codex", primary_permit.used_half_open_permit)
+            .await;
+        router
+            .release_permit_neutral(&fallback.id, "codex", fallback_permit.used_half_open_permit)
+            .await;
+        drop(client);
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn upstream_heartbeats_refresh_active_turn_idle_deadline() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4632,6 +4878,73 @@ mod tests {
 
         assert_eq!(username, b"user@name");
         assert_eq!(password, "päss".as_bytes());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn socks5h_encodes_ipv6_literal_with_ipv6_address_type() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SOCKS proxy");
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.expect("accept SOCKS client");
+            let mut greeting = [0u8; 2];
+            client
+                .read_exact(&mut greeting)
+                .await
+                .expect("read SOCKS greeting");
+            let mut methods = vec![0u8; greeting[1] as usize];
+            client
+                .read_exact(&mut methods)
+                .await
+                .expect("read SOCKS methods");
+            client.write_all(&[5, 0]).await.expect("select no-auth");
+
+            let mut request_head = [0u8; 4];
+            client
+                .read_exact(&mut request_head)
+                .await
+                .expect("read SOCKS connect head");
+            let mut address = match request_head[3] {
+                1 => vec![0u8; 4],
+                3 => {
+                    let mut length = [0u8; 1];
+                    client
+                        .read_exact(&mut length)
+                        .await
+                        .expect("read SOCKS domain length");
+                    vec![0u8; length[0] as usize]
+                }
+                4 => vec![0u8; 16],
+                other => panic!("unexpected SOCKS address type {other}"),
+            };
+            client
+                .read_exact(&mut address)
+                .await
+                .expect("read SOCKS target address");
+            let mut port = [0u8; 2];
+            client.read_exact(&mut port).await.expect("read SOCKS port");
+            let _ = request_tx.send((request_head, address, u16::from_be_bytes(port)));
+            client
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("accept SOCKS connect");
+        });
+
+        let proxy_url =
+            Url::parse(&format!("socks5h://{proxy_addr}")).expect("parse SOCKS proxy URL");
+        let stream = connect_via_socks5(&proxy_url, "::1", 443)
+            .await
+            .expect("connect IPv6 literal through SOCKS proxy");
+        drop(stream);
+        let (request_head, address, port) = request_rx.await.expect("SOCKS request");
+        proxy_task.await.expect("SOCKS proxy task");
+
+        assert_eq!(request_head, [5, 1, 0, 4]);
+        assert_eq!(address, std::net::Ipv6Addr::LOCALHOST.octets().to_vec());
+        assert_eq!(port, 443);
     }
 
     async fn run_proxy_routing_case(proxy_scheme: &str) {
