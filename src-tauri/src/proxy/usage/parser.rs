@@ -376,9 +376,12 @@ impl TokenUsage {
         // 先尝试 Codex Responses API 格式 (response.completed 事件)
         for event in events {
             if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
-                if event_type == "response.completed" {
+                if matches!(
+                    event_type,
+                    "response.completed" | "response.incomplete" | "response.failed"
+                ) {
                     if let Some(response) = event.get("response") {
-                        log::debug!("[Codex] 找到 response.completed 事件");
+                        log::debug!("[Codex] 找到 {event_type} 事件");
                         return Self::from_codex_response_auto(response);
                     }
                 }
@@ -1210,6 +1213,31 @@ mod tests {
         assert_eq!(usage.output_tokens, 500);
         assert_eq!(usage.cache_read_tokens, 200);
         assert_eq!(usage.model, Some("o3".to_string()));
+    }
+
+    #[test]
+    fn test_codex_stream_events_auto_accepts_incomplete_and_failed_terminals() {
+        for event_type in ["response.incomplete", "response.failed"] {
+            let events = vec![json!({
+                "type": event_type,
+                "response": {
+                    "id": format!("resp-{event_type}"),
+                    "model": "o3",
+                    "usage": {
+                        "input_tokens": 321,
+                        "output_tokens": 45,
+                        "input_tokens_details": {"cached_tokens": 67}
+                    }
+                }
+            })];
+
+            let usage = TokenUsage::from_codex_stream_events_auto(&events)
+                .unwrap_or_else(|| panic!("parse {event_type} usage"));
+            assert_eq!(usage.input_tokens, 321);
+            assert_eq!(usage.output_tokens, 45);
+            assert_eq!(usage.cache_read_tokens, 67);
+            assert_eq!(usage.model.as_deref(), Some("o3"));
+        }
     }
 
     #[test]

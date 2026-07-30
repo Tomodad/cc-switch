@@ -619,6 +619,7 @@ pub(crate) async fn log_codex_websocket_usage(
     request_model: &str,
     outbound_model: &str,
     event: &Value,
+    status_code: u16,
     latency_ms: u64,
     first_token_ms: Option<u64>,
     session_id: &str,
@@ -654,7 +655,7 @@ pub(crate) async fn log_codex_websocket_usage(
         latency_ms,
         first_token_ms,
         true,
-        200,
+        status_code,
         Some(session_id.to_string()),
     )
     .await;

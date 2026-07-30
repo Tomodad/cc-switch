@@ -9,7 +9,7 @@ use super::{
         apply_local_proxy_body_overrides, apply_local_proxy_header_overrides,
         prepare_upstream_request_body, ActiveConnectionGuard,
     },
-    handler_context::RequestContext,
+    handler_context::{RequestContext, StreamingTimeoutConfig},
     providers::{
         codex_provider_supports_responses_websocket, should_inject_codex_tool_search_shim,
         should_restore_codex_native_tool_search, transform_codex_chat,
@@ -52,6 +52,19 @@ trait AsyncIo: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncIo for T {}
 type BoxedIo = Box<dyn AsyncIo + Send + Unpin>;
 type UpstreamSocket = WebSocketStream<MaybeTlsStream<BoxedIo>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSocketTerminalOutcome {
+    Success,
+    NeutralFailure,
+    ProviderFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamSendOutcome {
+    Sent,
+    Shutdown,
+}
 
 #[derive(Default)]
 struct TurnTransformState {
@@ -333,12 +346,26 @@ async fn handle_connection_inner(
         ProxyError::ForwardFailed(format!("upstream WebSocket handshake failed: {error}"))
     })?;
 
-    upstream
-        .send(UpstreamMessage::Text(first_text))
-        .await
-        .map_err(|error| {
-            ProxyError::ForwardFailed(format!("failed to send initial WebSocket event: {error}"))
-        })?;
+    let initial_deadline = websocket_turn_timeout_deadline(
+        response_in_flight,
+        received_response_event,
+        turn_started,
+        last_response_event_at,
+        timeout_config,
+    );
+    if send_upstream_message(
+        &mut upstream,
+        UpstreamMessage::Text(first_text),
+        initial_deadline,
+        &mut shutdown_rx,
+        "initial event write",
+    )
+    .await?
+        == UpstreamSendOutcome::Shutdown
+    {
+        finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+        return Ok(());
+    }
 
     log::info!(
         "[CodexWS] Connected protocol-aware Responses WebSocket (provider={})",
@@ -346,23 +373,13 @@ async fn handle_connection_inner(
     );
 
     loop {
-        let timeout_deadline = if response_in_flight {
-            let timeout_secs = if received_response_event {
-                timeout_config.idle_timeout
-            } else {
-                timeout_config.first_byte_timeout
-            };
-            (timeout_secs > 0).then(|| {
-                let anchor = if received_response_event {
-                    last_response_event_at
-                } else {
-                    turn_started
-                };
-                anchor + Duration::from_secs(timeout_secs)
-            })
-        } else {
-            None
-        };
+        let timeout_deadline = websocket_turn_timeout_deadline(
+            response_in_flight,
+            received_response_event,
+            turn_started,
+            last_response_event_at,
+            timeout_config,
+        );
 
         tokio::select! {
             _ = async {
@@ -379,13 +396,7 @@ async fn handle_connection_inner(
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    if let Some(accounting) = turn_accounting.take() {
-                        accounting
-                            .finish_neutral_failure("CC-Switch proxy stopping".to_string())
-                            .await;
-                    }
-                    let _ = upstream.close(None).await;
-                    send_proxy_shutdown_close(downstream).await;
+                    finish_websocket_shutdown(downstream, &mut turn_accounting).await;
                     break;
                 }
             }
@@ -398,7 +409,21 @@ async fn handle_connection_inner(
                             )
                             .await;
                     }
-                    let _ = upstream.close(None).await;
+                    let close_deadline = websocket_turn_timeout_deadline(
+                        response_in_flight,
+                        received_response_event,
+                        turn_started,
+                        last_response_event_at,
+                        timeout_config,
+                    );
+                    let _ = send_upstream_message(
+                        &mut upstream,
+                        UpstreamMessage::Close(None),
+                        close_deadline,
+                        &mut shutdown_rx,
+                        "close frame write",
+                    )
+                    .await;
                     break;
                 };
                 let downstream_message = match downstream_message {
@@ -481,24 +506,92 @@ async fn handle_connection_inner(
                             received_response_event = false;
                             last_response_event_at = turn_started;
                         }
-                        upstream.send(UpstreamMessage::Text(text)).await.map_err(|error| {
-                            ProxyError::ForwardFailed(format!("upstream WebSocket write failed: {error}"))
-                        })?;
+                        let write_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        if send_upstream_message(
+                            &mut upstream,
+                            UpstreamMessage::Text(text),
+                            write_deadline,
+                            &mut shutdown_rx,
+                            "text frame write",
+                        )
+                        .await?
+                            == UpstreamSendOutcome::Shutdown
+                        {
+                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                            break;
+                        }
                     }
                     DownstreamMessage::Binary(data) => {
-                        upstream.send(UpstreamMessage::Binary(data)).await.map_err(|error| {
-                            ProxyError::ForwardFailed(format!("upstream WebSocket write failed: {error}"))
-                        })?;
+                        let write_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        if send_upstream_message(
+                            &mut upstream,
+                            UpstreamMessage::Binary(data),
+                            write_deadline,
+                            &mut shutdown_rx,
+                            "binary frame write",
+                        )
+                        .await?
+                            == UpstreamSendOutcome::Shutdown
+                        {
+                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                            break;
+                        }
                     }
                     DownstreamMessage::Ping(data) => {
-                        upstream.send(UpstreamMessage::Ping(data)).await.map_err(|error| {
-                            ProxyError::ForwardFailed(format!("upstream WebSocket ping failed: {error}"))
-                        })?;
+                        let write_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        if send_upstream_message(
+                            &mut upstream,
+                            UpstreamMessage::Ping(data),
+                            write_deadline,
+                            &mut shutdown_rx,
+                            "ping frame write",
+                        )
+                        .await?
+                            == UpstreamSendOutcome::Shutdown
+                        {
+                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                            break;
+                        }
                     }
                     DownstreamMessage::Pong(data) => {
-                        upstream.send(UpstreamMessage::Pong(data)).await.map_err(|error| {
-                            ProxyError::ForwardFailed(format!("upstream WebSocket pong failed: {error}"))
-                        })?;
+                        let write_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        if send_upstream_message(
+                            &mut upstream,
+                            UpstreamMessage::Pong(data),
+                            write_deadline,
+                            &mut shutdown_rx,
+                            "pong frame write",
+                        )
+                        .await?
+                            == UpstreamSendOutcome::Shutdown
+                        {
+                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                            break;
+                        }
                     }
                     DownstreamMessage::Close(frame) => {
                         if let Some(accounting) = turn_accounting.take() {
@@ -512,7 +605,21 @@ async fn handle_connection_inner(
                             code: CloseCode::from(frame.code),
                             reason: Cow::Owned(frame.reason.into_owned()),
                         });
-                        let _ = upstream.send(UpstreamMessage::Close(frame)).await;
+                        let close_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        let _ = send_upstream_message(
+                            &mut upstream,
+                            UpstreamMessage::Close(frame),
+                            close_deadline,
+                            &mut shutdown_rx,
+                            "close frame write",
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -546,6 +653,8 @@ async fn handle_connection_inner(
                             first_token_ms = Some(turn_started.elapsed().as_millis() as u64);
                         }
                         if terminal {
+                            let outcome = websocket_terminal_outcome(&text);
+                            let status_code = websocket_terminal_status_code(&text, outcome);
                             if let Ok(event) = serde_json::from_str::<Value>(&text) {
                                 log_codex_websocket_usage(
                                     state,
@@ -553,6 +662,7 @@ async fn handle_connection_inner(
                                     &turn_state.request_model,
                                     &turn_state.outbound_model,
                                     &event,
+                                    status_code,
                                     turn_started.elapsed().as_millis() as u64,
                                     first_token_ms,
                                     &turn_state.session_id,
@@ -560,17 +670,22 @@ async fn handle_connection_inner(
                                 .await;
                             }
                             if let Some(accounting) = turn_accounting.take() {
-                                if websocket_event_is_successful_terminal(&text) {
-                                    accounting.finish_success().await;
-                                } else {
-                                    accounting
-                                        .finish_provider_failure(format!(
-                                            "upstream WebSocket terminal event: {}",
-                                            websocket_event_type(&text)
-                                                .as_deref()
-                                                .unwrap_or("unknown")
-                                        ))
-                                        .await;
+                                let message = format!(
+                                    "upstream WebSocket terminal event: {}",
+                                    websocket_event_type(&text)
+                                        .as_deref()
+                                        .unwrap_or("unknown")
+                                );
+                                match outcome {
+                                    WebSocketTerminalOutcome::Success => {
+                                        accounting.finish_success().await;
+                                    }
+                                    WebSocketTerminalOutcome::NeutralFailure => {
+                                        accounting.finish_neutral_failure(message).await;
+                                    }
+                                    WebSocketTerminalOutcome::ProviderFailure => {
+                                        accounting.finish_provider_failure(message).await;
+                                    }
                                 }
                             }
                             response_in_flight = false;
@@ -615,6 +730,77 @@ async fn handle_connection_inner(
     }
 
     Ok(())
+}
+
+fn websocket_turn_timeout_deadline(
+    response_in_flight: bool,
+    received_response_event: bool,
+    turn_started: Instant,
+    last_response_event_at: Instant,
+    timeout_config: StreamingTimeoutConfig,
+) -> Option<Instant> {
+    if !response_in_flight {
+        return None;
+    }
+    let (timeout_secs, anchor) = if received_response_event {
+        (timeout_config.idle_timeout, last_response_event_at)
+    } else {
+        (timeout_config.first_byte_timeout, turn_started)
+    };
+    (timeout_secs > 0).then(|| anchor + Duration::from_secs(timeout_secs))
+}
+
+async fn send_upstream_message(
+    upstream: &mut UpstreamSocket,
+    message: UpstreamMessage,
+    deadline: Option<Instant>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    description: &str,
+) -> Result<UpstreamSendOutcome, ProxyError> {
+    let send = upstream.send(message);
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(UpstreamSendOutcome::Shutdown);
+                }
+            }
+            _ = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err(ProxyError::Timeout(format!(
+                    "upstream WebSocket {description} timed out"
+                )));
+            }
+            result = &mut send => {
+                return result
+                    .map(|_| UpstreamSendOutcome::Sent)
+                    .map_err(|error| {
+                        ProxyError::ForwardFailed(format!(
+                            "upstream WebSocket {description} failed: {error}"
+                        ))
+                    });
+            }
+        }
+    }
+}
+
+async fn finish_websocket_shutdown(
+    downstream: &mut WebSocket,
+    turn_accounting: &mut Option<WebSocketTurnAccounting>,
+) {
+    if let Some(accounting) = turn_accounting.take() {
+        accounting
+            .finish_neutral_failure("CC-Switch proxy stopping".to_string())
+            .await;
+    }
+    send_proxy_shutdown_close(downstream).await;
 }
 
 async fn receive_first_text_or_shutdown(
@@ -838,13 +1024,88 @@ fn websocket_event_is_terminal(text: &str) -> bool {
     })
 }
 
-fn websocket_event_is_successful_terminal(text: &str) -> bool {
-    websocket_event_type(text).is_some_and(|event_type| {
-        matches!(
-            event_type.as_str(),
-            "response.completed" | "response.incomplete"
-        )
-    })
+fn websocket_terminal_outcome(text: &str) -> WebSocketTerminalOutcome {
+    match websocket_event_type(text).as_deref() {
+        Some("response.completed" | "response.incomplete") => WebSocketTerminalOutcome::Success,
+        Some("response.failed" | "error") if websocket_event_is_client_error(text) => {
+            WebSocketTerminalOutcome::NeutralFailure
+        }
+        _ => WebSocketTerminalOutcome::ProviderFailure,
+    }
+}
+
+fn websocket_event_is_client_error(text: &str) -> bool {
+    const NON_RETRYABLE_STATUSES: &[u16] = &[400, 405, 406, 413, 414, 415, 422, 501];
+    const CLIENT_ERROR_MARKERS: &[&str] = &[
+        "invalid_request_error",
+        "invalid_request",
+        "bad_request",
+        "unprocessable_entity",
+        "invalid_prompt",
+        "context_length_exceeded",
+        "invalid_parameter",
+        "invalid_parameters",
+        "invalid_tool_schema",
+        "unsupported_value",
+        "missing_required_parameter",
+        "unknown_parameter",
+    ];
+
+    let Ok(event) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if websocket_error_status(&event).is_some_and(|status| NON_RETRYABLE_STATUSES.contains(&status))
+    {
+        return true;
+    }
+
+    let client_error = websocket_error_values(&event).any(|value| {
+        value
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|value| CLIENT_ERROR_MARKERS.contains(&value.as_str()))
+    });
+    client_error
+}
+
+fn websocket_terminal_status_code(text: &str, outcome: WebSocketTerminalOutcome) -> u16 {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|event| websocket_error_status(&event))
+        .unwrap_or(match outcome {
+            WebSocketTerminalOutcome::Success => 200,
+            WebSocketTerminalOutcome::NeutralFailure => 400,
+            WebSocketTerminalOutcome::ProviderFailure => 500,
+        })
+}
+
+fn websocket_error_status(event: &Value) -> Option<u16> {
+    let error = event
+        .get("error")
+        .or_else(|| event.pointer("/response/error"));
+    [error, Some(event)]
+        .into_iter()
+        .flatten()
+        .flat_map(|value| [value.get("status"), value.get("status_code")])
+        .flatten()
+        .find_map(|value| {
+            value
+                .as_u64()
+                .and_then(|status| u16::try_from(status).ok())
+                .or_else(|| value.as_str().and_then(|status| status.parse().ok()))
+                .filter(|status| (100..=599).contains(status))
+        })
+}
+
+fn websocket_error_values(event: &Value) -> impl Iterator<Item = &Value> {
+    let error = event
+        .get("error")
+        .or_else(|| event.pointer("/response/error"));
+    [error, Some(event)]
+        .into_iter()
+        .flatten()
+        .flat_map(|value| [value.get("type"), value.get("code")])
+        .flatten()
 }
 
 fn provider_snapshot_changed(current: &Provider, next: &Provider) -> bool {
@@ -1212,7 +1473,7 @@ mod tests {
     use std::{env, ffi::OsString, fs, sync::Arc};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, TcpSocket},
         sync::oneshot,
     };
     use tokio_rustls::TlsAcceptor;
@@ -2178,12 +2439,18 @@ mod tests {
                     let conn = db_for_assert.conn.lock().expect("lock database");
                     let mut statement = conn
                         .prepare(
-                            "SELECT session_id, first_token_ms FROM proxy_request_logs WHERE provider_id = 'ws-provider' AND app_type = 'codex' ORDER BY session_id",
+                            "SELECT session_id, first_token_ms, input_tokens, output_tokens, status_code FROM proxy_request_logs WHERE provider_id = 'ws-provider' AND app_type = 'codex' ORDER BY session_id",
                         )
                         .expect("prepare usage query");
                     statement
                         .query_map([], |row| {
-                            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<i64>>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
                         })
                         .expect("query usage rows")
                         .collect::<rusqlite::Result<Vec<_>>>()
@@ -2204,6 +2471,7 @@ mod tests {
         assert_eq!(status.active_connections, 0);
 
         assert!(rows.iter().all(|row| row.1.is_some_and(|ttft| ttft >= 40)));
+        assert!(rows.iter().all(|row| (row.2, row.3, row.4) == (10, 2, 200)));
         assert_eq!(
             rows[0].0.as_deref(),
             Some("codex_019fb240-1234-7000-8000-000000000011")
@@ -2215,6 +2483,109 @@ mod tests {
 
         drop(client);
         upstream_task.await.expect("accounting upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn client_error_terminal_is_neutral_and_logged_as_failed() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind client-error upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp-client-error",
+                            "model": "upstream-model",
+                            "status": "failed",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "invalid_parameter",
+                                "message": "invalid tool schema"
+                            },
+                            "usage": {
+                                "input_tokens": 7,
+                                "output_tokens": 1
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send client error");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        db.add_to_failover_queue("codex", &provider.id)
+            .expect("queue provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let failed: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("failed response JSON");
+        assert_eq!(failed["type"], "response.failed");
+
+        let health = db
+            .get_provider_health(&provider.id, "codex")
+            .await
+            .expect("load provider health");
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.is_healthy);
+
+        let row = {
+            let conn = db.conn.lock().expect("lock database");
+            conn.query_row(
+                "SELECT status_code, input_tokens, output_tokens FROM proxy_request_logs WHERE provider_id = ?1 AND app_type = 'codex'",
+                [&provider.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .expect("load failed usage row")
+        };
+        assert_eq!(row, (400, 7, 1));
+        let status = server.get_status().await;
+        assert_eq!(status.failed_requests, 1);
+
+        drop(client);
+        upstream_task.await.expect("client-error upstream task");
         server.stop().await.expect("stop proxy");
     }
 
@@ -2351,6 +2722,98 @@ mod tests {
         drop(second);
         healthy_task.await.expect("healthy upstream task");
         server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn proxy_stop_interrupts_stalled_upstream_websocket_write() {
+        const BINARY_FRAME_BYTES: usize = 16 * 1024 * 1024;
+        const EXPECTED_LIMIT: usize = 200 * 1024 * 1024;
+        let large_config = WebSocketConfig {
+            max_message_size: Some(EXPECTED_LIMIT),
+            max_frame_size: Some(EXPECTED_LIMIT),
+            ..Default::default()
+        };
+        let upstream_socket = TcpSocket::new_v4().expect("create stalled-write socket");
+        upstream_socket
+            .set_recv_buffer_size(1024)
+            .expect("shrink stalled-write receive buffer");
+        upstream_socket
+            .bind("127.0.0.1:0".parse().expect("parse stalled-write address"))
+            .expect("bind stalled-write upstream");
+        let upstream_listener = upstream_socket
+            .listen(1)
+            .expect("listen for stalled-write upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let websocket = accept_async_with_config(stream, Some(large_config))
+                .await
+                .expect("accept stalled-write websocket");
+            let _ = ready_tx.send(());
+            let _ = release_rx.await;
+            drop(websocket);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async_with_config(
+            format!("ws://127.0.0.1:{}/v1/responses", info.port),
+            Some(large_config),
+            false,
+        )
+        .await
+        .expect("connect large-message client");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send initial response.create");
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("upstream websocket handshake timed out")
+            .expect("upstream readiness sender dropped");
+
+        let flood_task = tokio::spawn(async move {
+            let payload = vec![0_u8; BINARY_FRAME_BYTES];
+            loop {
+                client
+                    .send(UpstreamMessage::Binary(payload.clone()))
+                    .await
+                    .expect("send binary flood frame");
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !flood_task.is_finished(),
+            "binary flood ended before backpressure"
+        );
+
+        let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
+        let _ = release_tx.send(());
+        flood_task.abort();
+        let _ = flood_task.await;
+        upstream_task.await.expect("stalled-write upstream task");
+
+        stop_result
+            .expect("proxy stop waited on a stalled upstream WebSocket write")
+            .expect("stop proxy");
     }
 
     #[tokio::test]
