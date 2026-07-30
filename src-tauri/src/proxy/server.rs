@@ -327,6 +327,10 @@ impl ProxyServer {
     }
 
     #[cfg(test)]
+    pub(crate) fn state_for_tests(&self) -> ProxyState {
+        self.state.clone()
+    }
+    #[cfg(test)]
     pub(crate) fn provider_router_for_tests(&self) -> Arc<ProviderRouter> {
         self.state.provider_router.clone()
     }
