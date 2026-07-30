@@ -26,9 +26,10 @@ use axum::{
         State, WebSocketUpgrade,
     },
     http::{HeaderMap, HeaderName},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
+use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use std::{borrow::Cow, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -288,11 +289,40 @@ async fn record_websocket_status_failure(state: &ProxyState, message: String) {
     update_proxy_success_rate(&mut status);
 }
 
+fn websocket_origin_is_trusted(headers: &HeaderMap) -> bool {
+    let origins = headers.get_all(http::header::ORIGIN);
+    if origins.iter().next().is_none() {
+        return true;
+    }
+
+    origins.iter().all(|origin| {
+        let Ok(origin) = origin.to_str() else {
+            return false;
+        };
+        let Ok(origin) = Url::parse(origin) else {
+            return false;
+        };
+        if !matches!(origin.scheme(), "http" | "https") {
+            return false;
+        }
+        match origin.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        }
+    })
+}
+
 pub async fn handle_responses_websocket(
     State(state): State<ProxyState>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if !websocket_origin_is_trusted(&headers) {
+        return http::StatusCode::FORBIDDEN.into_response();
+    }
+
     let connection_guard = state.track_websocket_connection();
     upgrade
         .max_message_size(MAX_WEBSOCKET_MESSAGE_SIZE)
@@ -377,15 +407,8 @@ async fn handle_connection_inner(
     let mut received_response_event = false;
     let mut last_response_event_at = turn_started;
     let mut timeout_config = turn_context.streaming_timeout_config();
+    let mut upstream_proxy_url = super::http_client::get_current_proxy_url();
     let request = build_upstream_request(&provider, headers)?;
-    let mut upstream = match connect_upstream_with_shutdown(request, &mut shutdown_rx).await? {
-        Some(upstream) => upstream,
-        None => {
-            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
-            return Ok(());
-        }
-    };
-
     let initial_deadline = websocket_turn_timeout_deadline(
         response_in_flight,
         received_response_event,
@@ -393,6 +416,20 @@ async fn handle_connection_inner(
         last_response_event_at,
         timeout_config,
     );
+    let mut upstream = match connect_upstream_with_shutdown(
+        request,
+        upstream_proxy_url.as_deref(),
+        initial_deadline,
+        &mut shutdown_rx,
+    )
+    .await?
+    {
+        Some(upstream) => upstream,
+        None => {
+            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+            return Ok(());
+        }
+    };
     if send_upstream_message(
         &mut upstream,
         UpstreamMessage::Text(first_text),
@@ -516,6 +553,12 @@ async fn handle_connection_inner(
                             )
                             .await?;
                             let next_provider = next_ctx.provider.clone();
+                            let current_proxy_url = super::http_client::get_current_proxy_url();
+                            if current_proxy_url.as_deref() != upstream_proxy_url.as_deref() {
+                                return Err(ProxyError::ConfigError(
+                                    "global proxy changed; reconnect WebSocket".to_string(),
+                                ));
+                            }
                             if provider_snapshot_changed(&provider, &next_provider) {
                                 return Err(ProxyError::ConfigError(
                                     "selected Codex provider changed; reconnect WebSocket".to_string(),
@@ -828,8 +871,19 @@ async fn handle_connection_inner(
                                         continue;
                                     }
                                 };
+                                let retry_started = Instant::now();
+                                let retry_deadline = websocket_turn_timeout_deadline(
+                                    true,
+                                    false,
+                                    retry_started,
+                                    retry_started,
+                                    timeout_config,
+                                );
+                                let retry_proxy_url = super::http_client::get_current_proxy_url();
                                 let mut retry_upstream = match connect_upstream_with_shutdown(
                                     request,
+                                    retry_proxy_url.as_deref(),
+                                    retry_deadline,
                                     &mut shutdown_rx,
                                 )
                                 .await
@@ -851,14 +905,6 @@ async fn handle_connection_inner(
                                         continue;
                                     }
                                 };
-                                let retry_started = Instant::now();
-                                let retry_deadline = websocket_turn_timeout_deadline(
-                                    true,
-                                    false,
-                                    retry_started,
-                                    retry_started,
-                                    timeout_config,
-                                );
                                 match send_upstream_message(
                                     &mut retry_upstream,
                                     UpstreamMessage::Text(retry_text),
@@ -898,6 +944,7 @@ async fn handle_connection_inner(
                                     );
                                 }
                                 provider = candidate;
+                                upstream_proxy_url = retry_proxy_url;
                                 upstream = retry_upstream;
                                 turn_state = retry_state;
                                 turn_accounting = Some(retry_accounting);
@@ -1132,15 +1179,18 @@ fn spawn_codex_websocket_usage(
 }
 async fn connect_upstream_with_shutdown(
     request: http::Request<()>,
+    proxy_url: Option<&str>,
+    configured_deadline: Option<Instant>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<UpstreamSocket>, ProxyError> {
     if *shutdown_rx.borrow() {
         return Ok(None);
     }
-    let connect = tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        connect_upstream_websocket(request),
-    );
+    let hard_deadline = Instant::now() + UPSTREAM_CONNECT_TIMEOUT;
+    let handshake_deadline = configured_deadline
+        .map(|deadline| deadline.min(hard_deadline))
+        .unwrap_or(hard_deadline);
+    let connect = connect_upstream_websocket(request, proxy_url);
     tokio::pin!(connect);
     loop {
         tokio::select! {
@@ -1150,9 +1200,13 @@ async fn connect_upstream_with_shutdown(
                     return Ok(None);
                 }
             }
+            _ = tokio::time::sleep_until(handshake_deadline) => {
+                return Err(ProxyError::Timeout(
+                    "upstream WebSocket handshake timed out".to_string(),
+                ));
+            }
             result = &mut connect => {
                 return result
-                    .map_err(|_| ProxyError::Timeout("upstream WebSocket handshake timed out".to_string()))?
                     .map(Some)
                     .map_err(|error| {
                         ProxyError::ForwardFailed(format!(
@@ -1703,6 +1757,7 @@ fn build_upstream_request(
 
 async fn connect_upstream_websocket(
     request: http::Request<()>,
+    proxy_url: Option<&str>,
 ) -> Result<UpstreamSocket, ProxyError> {
     let target_url = Url::parse(&request.uri().to_string()).map_err(|error| {
         ProxyError::ConfigError(format!("invalid upstream WebSocket URL: {error}"))
@@ -1714,14 +1769,14 @@ async fn connect_upstream_websocket(
         .port_or_known_default()
         .ok_or_else(|| ProxyError::ConfigError("upstream WebSocket URL has no port".to_string()))?;
 
-    let stream: BoxedIo = match super::http_client::get_current_proxy_url() {
+    let stream: BoxedIo = match proxy_url {
         Some(proxy_url) => {
-            let parsed = Url::parse(&proxy_url).map_err(|error| {
+            let parsed = Url::parse(proxy_url).map_err(|error| {
                 ProxyError::ConfigError(format!("invalid configured proxy URL: {error}"))
             })?;
             match parsed.scheme() {
                 "http" | "https" => Box::new(
-                    super::hyper_client::connect_via_proxy(&proxy_url, target_host, target_port)
+                    super::hyper_client::connect_via_proxy(proxy_url, target_host, target_port)
                         .await?,
                 ),
                 "socks5" | "socks5h" => {
@@ -1795,17 +1850,17 @@ async fn connect_via_socks5(
         ));
     }
     if selection[1] == 0x02 {
-        let username = proxy_url.username().as_bytes();
-        let password = proxy_url.password().unwrap_or("").as_bytes();
+        let username = percent_decode_str(proxy_url.username()).collect::<Vec<_>>();
+        let password = percent_decode_str(proxy_url.password().unwrap_or("")).collect::<Vec<_>>();
         if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
             return Err(ProxyError::ConfigError(
                 "SOCKS proxy credentials are too long".to_string(),
             ));
         }
         let mut auth = vec![0x01, username.len() as u8];
-        auth.extend_from_slice(username);
+        auth.extend_from_slice(&username);
         auth.push(password.len() as u8);
-        auth.extend_from_slice(password);
+        auth.extend_from_slice(&password);
         stream.write_all(&auth).await.map_err(|error| {
             ProxyError::ForwardFailed(format!("SOCKS authentication write failed: {error}"))
         })?;
@@ -2409,6 +2464,45 @@ mod tests {
         upstream_task.await.expect("mock upstream task");
         server.stop().await.expect("stop proxy");
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejects_non_loopback_browser_origin_before_websocket_upgrade() {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let mut request = format!("ws://127.0.0.1:{}/v1/responses", info.port)
+            .into_client_request()
+            .expect("build local websocket request");
+        request.headers_mut().insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://attacker.example"),
+        );
+
+        let status = match connect_async(request).await {
+            Err(WebSocketError::Http(response)) => response.status(),
+            Err(error) => panic!("expected HTTP origin rejection, got {error}"),
+            Ok((socket, _)) => {
+                drop(socket);
+                panic!("untrusted browser origin completed the websocket upgrade")
+            }
+        };
+
+        assert_eq!(status, http::StatusCode::FORBIDDEN);
+        server.stop().await.expect("stop proxy");
+    }
     #[tokio::test]
     #[serial]
     async fn upstream_connect_failure_emits_error_and_close_for_sse_fallback() {
@@ -2460,6 +2554,78 @@ mod tests {
         }
 
         server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_first_byte_timeout_bounds_upstream_websocket_handshake() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled-handshake upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("accept upstream TCP");
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut provider = websocket_provider(format!("http://{upstream_addr}"));
+        provider.in_failover_queue = true;
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load app proxy config");
+        app_config.enabled = true;
+        app_config.auto_failover_enabled = true;
+        app_config.streaming_first_byte_timeout = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("set websocket first-byte timeout");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        accepted_rx.await.expect("upstream TCP accept signal");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), next_text(&mut client)).await;
+        drop(client);
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        server.stop().await.expect("stop proxy");
+
+        let error: Value = serde_json::from_str(
+            &result.expect("configured first-byte timeout did not bound websocket handshake"),
+        )
+        .expect("timeout error event JSON");
+        assert_eq!(error["type"], "error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("handshake timed out")));
     }
     #[tokio::test]
     #[serial]
@@ -3930,6 +4096,188 @@ mod tests {
         fn drop(&mut self) {
             let _ = crate::proxy::http_client::apply_proxy(None);
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconnects_when_global_proxy_changes_between_websocket_turns() {
+        crate::proxy::http_client::apply_proxy(None).expect("start with direct routing");
+        let _reset = GlobalProxyReset;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind direct upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (second_turn_tx, second_turn_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-one","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send first completion");
+
+            let second_turn = match tokio::time::timeout(Duration::from_secs(2), websocket.next())
+                .await
+            {
+                Ok(Some(Ok(UpstreamMessage::Text(_)))) => {
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-two","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .expect("send second completion");
+                    true
+                }
+                _ => false,
+            };
+            let _ = second_turn_tx.send(second_turn);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send first response.create");
+        let first: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("first completion JSON");
+        assert_eq!(first["type"], "response.completed");
+
+        crate::proxy::http_client::apply_proxy(Some("http://127.0.0.1:9"))
+            .expect("change global proxy");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-one")).to_string(),
+            ))
+            .await
+            .expect("send second response.create");
+        let second: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("proxy reconnect response JSON");
+        let second_reached_upstream = second_turn_rx.await.expect("second turn observation");
+
+        drop(client);
+        upstream_task.await.expect("direct upstream task");
+        server.stop().await.expect("stop proxy");
+
+        assert_eq!(second["type"], "error");
+        assert!(second["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("global proxy changed")));
+        assert!(!second_reached_upstream);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn decodes_percent_encoded_socks5_credentials_before_authentication() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authenticated SOCKS proxy");
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let (credentials_tx, credentials_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.expect("accept SOCKS client");
+            let mut greeting = [0u8; 2];
+            client
+                .read_exact(&mut greeting)
+                .await
+                .expect("read SOCKS greeting");
+            let mut methods = vec![0u8; greeting[1] as usize];
+            client
+                .read_exact(&mut methods)
+                .await
+                .expect("read SOCKS methods");
+            assert!(methods.contains(&2));
+            client
+                .write_all(&[5, 2])
+                .await
+                .expect("select username/password auth");
+
+            let mut auth_head = [0u8; 2];
+            client
+                .read_exact(&mut auth_head)
+                .await
+                .expect("read SOCKS auth head");
+            assert_eq!(auth_head[0], 1);
+            let mut username = vec![0u8; auth_head[1] as usize];
+            client
+                .read_exact(&mut username)
+                .await
+                .expect("read SOCKS username");
+            let mut password_len = [0u8; 1];
+            client
+                .read_exact(&mut password_len)
+                .await
+                .expect("read SOCKS password length");
+            let mut password = vec![0u8; password_len[0] as usize];
+            client
+                .read_exact(&mut password)
+                .await
+                .expect("read SOCKS password");
+            let _ = credentials_tx.send((username, password));
+            client
+                .write_all(&[1, 0])
+                .await
+                .expect("accept SOCKS credentials");
+
+            let mut request_head = [0u8; 4];
+            client
+                .read_exact(&mut request_head)
+                .await
+                .expect("read SOCKS connect head");
+            assert_eq!(request_head[3], 3);
+            let mut host_len = [0u8; 1];
+            client
+                .read_exact(&mut host_len)
+                .await
+                .expect("read SOCKS target length");
+            let mut target = vec![0u8; host_len[0] as usize + 2];
+            client
+                .read_exact(&mut target)
+                .await
+                .expect("read SOCKS target and port");
+            client
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("accept SOCKS connect");
+        });
+
+        let proxy_url = Url::parse(&format!("socks5h://user%40name:p%C3%A4ss@{proxy_addr}"))
+            .expect("parse authenticated SOCKS URL");
+        let stream = connect_via_socks5(&proxy_url, "example.com", 443)
+            .await
+            .expect("connect through authenticated SOCKS proxy");
+        drop(stream);
+        let (username, password) = credentials_rx.await.expect("SOCKS credentials");
+        proxy_task.await.expect("authenticated SOCKS proxy task");
+
+        assert_eq!(username, b"user@name");
+        assert_eq!(password, "päss".as_bytes());
     }
 
     async fn run_proxy_routing_case(proxy_scheme: &str) {
