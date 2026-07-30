@@ -6,7 +6,7 @@
 //!
 //! 支持从客户端请求中提取 Session ID，用于关联同一对话的多个请求：
 //! - Claude: 从 `metadata.user_id` (格式: `user_xxx_session_yyy`) 或 `metadata.session_id` 提取
-//! - Codex: 从 headers 中的 `session_id` / `x-session-id` 或 `metadata.session_id` 提取
+//! - Codex: 从 `session-id` / `session_id` / `x-session-id` 或 Responses metadata 提取
 //! - 其他: 生成新的 UUID
 
 use axum::http::HeaderMap;
@@ -224,9 +224,10 @@ pub struct SessionIdResult {
 /// 3. 生成新 UUID
 ///
 /// ### Codex 请求
-/// 1. Headers: `session_id` 或 `x-session-id`
-/// 2. `metadata.session_id`
-/// 3. 生成新 UUID
+/// 1. Headers: `session-id`、`session_id` 或 `x-session-id`
+/// 2. `client_metadata.session_id`
+/// 3. `metadata.session_id`
+/// 4. 生成新 UUID
 ///
 /// ## 示例
 ///
@@ -286,7 +287,7 @@ fn extract_claude_session(
 /// 提取 Codex Session ID
 fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Option<SessionIdResult> {
     // 1. 从 headers 提取
-    for header_name in &["session_id", "x-session-id"] {
+    for header_name in &["session-id", "session_id", "x-session-id"] {
         if let Some(value) = headers.get(*header_name) {
             if let Ok(session_id) = value.to_str() {
                 // Codex Session ID 通常较长（UUID 格式）
@@ -301,11 +302,26 @@ fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Optio
         }
     }
 
-    // 2. 从 body.metadata.session_id 提取
+    // 2. 从 Responses WebSocket client_metadata.session_id 提取
+    if let Some(session_id) = body
+        .get("client_metadata")
+        .and_then(|metadata| metadata.get("session_id"))
+        .and_then(|value| value.as_str())
+    {
+        if session_id.len() > 10 {
+            return Some(SessionIdResult {
+                session_id: format!("codex_{session_id}"),
+                source: SessionIdSource::MetadataSessionId,
+                client_provided: true,
+            });
+        }
+    }
+
+    // 3. 从 body.metadata.session_id 提取
     if let Some(session_id) = body
         .get("metadata")
         .and_then(|m| m.get("session_id"))
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
     {
         if session_id.len() > 10 {
             return Some(SessionIdResult {
@@ -587,6 +603,45 @@ mod tests {
         assert!(!result.session_id.is_empty());
         assert_eq!(result.source, SessionIdSource::Generated);
         assert!(!result.client_provided);
+    }
+
+    #[test]
+    fn test_codex_current_session_id_header_is_recognized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session-id",
+            "019fb240-1234-7000-8000-000000000001".parse().unwrap(),
+        );
+        let body = json!({"model": "gpt-5.6"});
+
+        let result = extract_session_id(&headers, &body, "codex");
+
+        assert_eq!(
+            result.session_id,
+            "codex_019fb240-1234-7000-8000-000000000001"
+        );
+        assert_eq!(result.source, SessionIdSource::Header);
+        assert!(result.client_provided);
+    }
+
+    #[test]
+    fn test_codex_current_client_metadata_session_id_is_recognized() {
+        let headers = HeaderMap::new();
+        let body = json!({
+            "model": "gpt-5.6",
+            "client_metadata": {
+                "session_id": "019fb240-1234-7000-8000-000000000002"
+            }
+        });
+
+        let result = extract_session_id(&headers, &body, "codex");
+
+        assert_eq!(
+            result.session_id,
+            "codex_019fb240-1234-7000-8000-000000000002"
+        );
+        assert_eq!(result.source, SessionIdSource::MetadataSessionId);
+        assert!(result.client_provided);
     }
 
     #[test]
