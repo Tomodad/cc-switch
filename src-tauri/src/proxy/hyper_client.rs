@@ -10,6 +10,7 @@ use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use percent_encoding::percent_decode_str;
 use std::sync::{Arc, OnceLock};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
@@ -470,8 +471,9 @@ pub(crate) async fn connect_via_proxy(
 
     // Build Proxy-Authorization header if credentials are present
     let proxy_auth = if !parsed.username().is_empty() {
-        let password = parsed.password().unwrap_or("");
-        let credentials = format!("{}:{}", parsed.username(), password);
+        let mut credentials = percent_decode_str(parsed.username()).collect::<Vec<_>>();
+        credentials.push(b':');
+        credentials.extend(percent_decode_str(parsed.password().unwrap_or("")));
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
         Some(format!("Proxy-Authorization: Basic {encoded}\r\n"))
     } else {
@@ -771,6 +773,7 @@ impl<S: Unpin> tokio::io::AsyncWrite for WriteFilter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn buffered_with_content_type(content_type: Option<&str>) -> ProxyResponse {
@@ -790,6 +793,44 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[tokio::test]
+    async fn connect_proxy_decodes_percent_encoded_basic_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let address = listener.local_addr().expect("proxy address");
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept proxy client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read CONNECT request");
+                assert!(read > 0, "proxy client closed before CONNECT headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write CONNECT response");
+            String::from_utf8(request).expect("CONNECT request UTF-8")
+        });
+
+        let proxy_url = format!("http://user%40name:p%C3%A4ss@{address}");
+        let stream = connect_via_proxy(&proxy_url, "example.com", 443)
+            .await
+            .expect("establish authenticated proxy tunnel");
+        drop(stream);
+        let request = proxy_task.await.expect("proxy task");
+        let expected = base64::engine::general_purpose::STANDARD.encode("user@name:päss");
+        assert!(request.contains(&format!("Proxy-Authorization: Basic {expected}\r\n")));
     }
 
     #[tokio::test]

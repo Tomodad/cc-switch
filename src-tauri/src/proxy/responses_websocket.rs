@@ -89,10 +89,6 @@ struct WebSocketTurnAccounting {
 }
 
 impl WebSocketTurnAccounting {
-    async fn begin(state: &ProxyState, ctx: &RequestContext) -> Result<Self, ProxyError> {
-        Self::begin_for_provider(state, ctx, &ctx.provider, true).await
-    }
-
     async fn begin_for_provider(
         state: &ProxyState,
         ctx: &RequestContext,
@@ -423,6 +419,7 @@ async fn handle_connection_inner(
             Err(error) => return Err(error),
         }
     };
+    let mut retain_fallback_provider = false;
 
     let transformed = match transform_client_text(
         &original_response_create,
@@ -595,38 +592,129 @@ async fn handle_connection_inner(
                                 "codex",
                             )
                             .await?;
-                            let next_provider = next_ctx.provider.clone();
                             let current_proxy_url = super::http_client::get_current_proxy_url();
                             if current_proxy_url.as_deref() != upstream_proxy_url.as_deref() {
                                 return Err(ProxyError::ConfigError(
                                     "global proxy changed; reconnect WebSocket".to_string(),
                                 ));
                             }
-                            if provider_snapshot_changed(&provider, &next_provider) {
+                            let next_turn_providers = next_ctx.get_providers();
+                            if next_ctx.current_provider_id == provider.id {
+                                retain_fallback_provider = false;
+                            }
+                            let retained_index = retain_fallback_provider.then(|| {
+                                next_turn_providers.iter().position(|candidate| {
+                                    candidate.id == provider.id
+                                        && !provider_snapshot_changed(&provider, candidate)
+                                })
+                            });
+                            let mut next_index = retained_index.flatten().unwrap_or_else(|| {
+                                next_turn_providers
+                                    .iter()
+                                    .position(|candidate| candidate.id == next_ctx.provider.id)
+                                    .unwrap_or(0)
+                            });
+                            if !retain_fallback_provider
+                                && provider_snapshot_changed(
+                                    &provider,
+                                    &next_turn_providers[next_index],
+                                )
+                            {
                                 return Err(ProxyError::ConfigError(
                                     "selected Codex provider changed; reconnect WebSocket".to_string(),
                                 ));
                             }
-                            let (text, mut next_state) = transform_client_text(
-                                &text,
-                                &provider,
-                                &next_ctx.rectifier_config,
-                                false,
-                            )?
-                            .unwrap_or((text, None));
+
+                            let (next_provider, text, mut next_state, next_accounting) = loop {
+                                let candidate = next_turn_providers[next_index].clone();
+                                if codex_provider_supports_responses_websocket(&candidate) {
+                                    match WebSocketTurnAccounting::begin_for_provider(
+                                        state,
+                                        &next_ctx,
+                                        &candidate,
+                                        true,
+                                    )
+                                    .await
+                                    {
+                                        Ok(accounting) => {
+                                            let transformed = match transform_client_text(
+                                                &text,
+                                                &candidate,
+                                                &next_ctx.rectifier_config,
+                                                false,
+                                            ) {
+                                                Ok(transformed) => transformed,
+                                                Err(error) => {
+                                                    accounting
+                                                        .finish_neutral_failure(error.to_string())
+                                                        .await;
+                                                    return Err(error);
+                                                }
+                                            };
+                                            let (text, next_state) =
+                                                transformed.unwrap_or((text.clone(), None));
+                                            break (candidate, text, next_state, accounting);
+                                        }
+                                        Err(ProxyError::NoAvailableProvider)
+                                            if next_ctx.app_config.auto_failover_enabled => {}
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                next_index += 1;
+                                if next_index >= next_turn_providers.len() {
+                                    return Err(ProxyError::NoAvailableProvider);
+                                }
+                            };
                             if let Some(state) = next_state.as_mut() {
                                 state.session_id = next_ctx.session_id.clone();
                             }
-                            timeout_config = next_ctx.streaming_timeout_config();
-                            turn_accounting = Some(
-                                WebSocketTurnAccounting::begin(state, &next_ctx).await?,
-                            );
+                            let next_timeout_config = next_ctx.streaming_timeout_config();
+                            if next_provider.id != provider.id {
+                                let request = build_upstream_request(&next_provider, headers)?;
+                                let reconnect_started = Instant::now();
+                                let reconnect_deadline = websocket_turn_timeout_deadline(
+                                    true,
+                                    false,
+                                    reconnect_started,
+                                    reconnect_started,
+                                    next_timeout_config,
+                                );
+                                let next_upstream = match connect_upstream_with_shutdown(
+                                    request,
+                                    current_proxy_url.as_deref(),
+                                    reconnect_deadline,
+                                    &mut shutdown_rx,
+                                )
+                                .await
+                                {
+                                    Ok(Some(upstream)) => upstream,
+                                    Ok(None) => {
+                                        turn_accounting = Some(next_accounting);
+                                        finish_websocket_shutdown(
+                                            downstream,
+                                            &mut turn_accounting,
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                    Err(error) => {
+                                        next_accounting
+                                            .finish_provider_failure(error.to_string())
+                                            .await;
+                                        return Err(error);
+                                    }
+                                };
+                                provider = next_provider.clone();
+                                upstream_proxy_url = current_proxy_url;
+                                upstream = next_upstream;
+                            }
+                            retain_fallback_provider =
+                                provider.id != next_ctx.current_provider_id;
+                            timeout_config = next_timeout_config;
+                            turn_accounting = Some(next_accounting);
                             turn_context = next_ctx;
-                            turn_providers = turn_context.get_providers();
-                            provider_index = turn_providers
-                                .iter()
-                                .position(|candidate| candidate.id == provider.id)
-                                .unwrap_or(0);
+                            turn_providers = next_turn_providers;
+                            provider_index = next_index;
                             provider_attempt_limit =
                                 websocket_provider_attempt_limit(&turn_context);
                             provider_attempts = 1;
@@ -868,6 +956,17 @@ async fn handle_connection_inner(
                                     &mut retry_body,
                                 ) > 0
                             {
+                                if let Some((_, status_code, Some(event))) = terminal_data.as_ref() {
+                                    spawn_codex_websocket_usage(
+                                        state,
+                                        &provider,
+                                        &turn_state,
+                                        event.clone(),
+                                        *status_code,
+                                        turn_started.elapsed().as_millis() as u64,
+                                        first_token_ms,
+                                    );
+                                }
                                 if retry_event.get("response").is_some() {
                                     retry_event["response"] = retry_body;
                                 } else {
@@ -1049,6 +1148,8 @@ async fn handle_connection_inner(
                                     );
                                 }
                                 provider = candidate;
+                                retain_fallback_provider =
+                                    provider.id != turn_context.current_provider_id;
                                 upstream_proxy_url = retry_proxy_url;
                                 upstream = retry_upstream;
                                 turn_state = retry_state;
@@ -2901,11 +3002,14 @@ mod tests {
                     json!({
                         "type":"response.failed",
                         "response":{
+                            "id":"resp-media-failed",
+                            "model":"upstream-model",
                             "error":{
                                 "status":400,
                                 "type":"invalid_request_error",
                                 "message":"image inputs are not supported"
-                            }
+                            },
+                            "usage":{"input_tokens":5,"output_tokens":1}
                         }
                     })
                     .to_string(),
@@ -2918,7 +3022,7 @@ mod tests {
             if retry.is_some() {
                 websocket
                     .send(UpstreamMessage::Text(
-                        json!({"type":"response.completed","response":{"id":"resp-media-retry","output":[]}})
+                        json!({"type":"response.completed","response":{"id":"resp-media-retry","model":"upstream-model","output":[],"usage":{"input_tokens":7,"output_tokens":3}}})
                             .to_string(),
                     ))
                     .await
@@ -2928,6 +3032,7 @@ mod tests {
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let db_for_assert = db.clone();
         let provider = websocket_provider(format!("http://{upstream_addr}"));
         db.save_provider("codex", &provider).expect("save provider");
         db.set_current_provider("codex", &provider.id)
@@ -2970,6 +3075,38 @@ mod tests {
             crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
         );
         assert_eq!(terminal["type"], "response.completed");
+
+        let rows = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = {
+                    let conn = db_for_assert.conn.lock().expect("lock database");
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT status_code, input_tokens, output_tokens FROM proxy_request_logs WHERE provider_id = 'ws-provider' AND app_type = 'codex'",
+                        )
+                        .expect("prepare usage query");
+                    statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .expect("query usage rows")
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .expect("collect usage rows")
+                };
+                if rows.len() == 2 {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for both media-attempt usage rows");
+        assert!(rows.contains(&(400, 5, 1)));
+        assert!(rows.contains(&(200, 7, 3)));
 
         upstream_task.await.expect("reactive media upstream task");
         server.stop().await.expect("stop proxy");
@@ -3956,6 +4093,16 @@ mod tests {
                 ))
                 .await
                 .expect("send fallback completion");
+            let _ = tokio::time::timeout(Duration::from_secs(2), next_text(&mut websocket))
+                .await
+                .expect("second turn did not stay on fallback socket");
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-good-2","model":"upstream-model","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send second fallback completion");
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
@@ -3979,7 +4126,7 @@ mod tests {
             .expect("load codex proxy config");
         app_config.auto_failover_enabled = true;
         app_config.max_retries = 1;
-        app_config.circuit_failure_threshold = 1;
+        app_config.circuit_failure_threshold = 4;
         db.update_proxy_config_for_app(app_config)
             .await
             .expect("enable failover");
@@ -4021,6 +4168,17 @@ mod tests {
         assert_eq!(status.success_requests, 1);
         assert_eq!(status.failed_requests, 0);
         assert_eq!(status.failover_count, 1);
+
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-good")).to_string(),
+            ))
+            .await
+            .expect("send immediate second turn");
+        let second: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("second fallback terminal JSON");
+        assert_eq!(second["type"], "response.completed");
+        assert_eq!(second["response"]["id"], "resp-good-2");
 
         drop(client);
         bad_task.await.expect("bad upstream task");
@@ -4333,6 +4491,148 @@ mod tests {
             .release_permit_neutral(&fallback.id, "codex", fallback_permit.used_half_open_permit)
             .await;
         drop(client);
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn later_turn_half_open_permit_denial_reconnects_to_fallback() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary upstream");
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.expect("accept primary");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept primary websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-primary","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send primary completion");
+            let _ = websocket.next().await;
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback upstream");
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let accepted = tokio::time::timeout(Duration::from_secs(2), fallback_listener.accept())
+                .await
+                .expect("fallback was not connected");
+            let (stream, _) = accepted.expect("accept fallback");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept fallback websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-later-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send later-turn fallback completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("configure half-open breaker");
+        let mut primary =
+            websocket_provider_with_id("ws-later-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-later-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &primary.id)
+            .expect("select primary provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send first turn");
+        let first: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("first completion JSON");
+        assert_eq!(first["type"], "response.completed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.get_status().await.success_requests == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first turn accounting did not finish");
+
+        router
+            .record_result(
+                &primary.id,
+                "codex",
+                false,
+                false,
+                Some("prime later-turn half-open state".to_string()),
+            )
+            .await
+            .expect("open primary breaker");
+        let held_permit = router.allow_provider_request(&primary.id, "codex").await;
+        assert!(held_permit.allowed && held_permit.used_half_open_permit);
+
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-primary")).to_string(),
+            ))
+            .await
+            .expect("send second turn");
+        let second: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("later-turn fallback completion JSON");
+        assert_eq!(second["type"], "response.completed");
+        assert_eq!(second["response"]["id"], "resp-later-fallback");
+
+        router
+            .release_permit_neutral(&primary.id, "codex", held_permit.used_half_open_permit)
+            .await;
+        drop(client);
+        primary_task.await.expect("primary upstream task");
+        fallback_task.await.expect("fallback upstream task");
         server.stop().await.expect("stop proxy");
     }
 
