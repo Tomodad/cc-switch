@@ -424,13 +424,21 @@ async fn handle_connection_inner(
         }
     };
 
-    let (first_text, turn_state) = transform_client_text(
+    let transformed = match transform_client_text(
         &original_response_create,
         &provider,
         &turn_context.rectifier_config,
         true,
-    )?
-    .expect("validated response.create");
+    ) {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            initial_accounting
+                .finish_neutral_failure(error.to_string())
+                .await;
+            return Err(error);
+        }
+    };
+    let (first_text, turn_state) = transformed.expect("validated response.create");
     let mut turn_state = turn_state.expect("response.create transform state");
     turn_state.session_id = turn_context.session_id.clone();
     let mut turn_accounting = Some(initial_accounting);
@@ -3361,6 +3369,95 @@ mod tests {
 
         drop(client);
         upstream_task.await.expect("accounting upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_response_create_does_not_trip_provider_breaker() {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("configure circuit breaker");
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider).expect("save provider");
+        db.add_to_failover_queue("codex", &provider.id)
+            .expect("queue provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable circuit breaker routing");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "local-model",
+                    "input": [{"role": "user", "content": "hello"}],
+                    "tools": [
+                        {"type": "function", "name": "mcp__files____read", "parameters": {}},
+                        {
+                            "type": "namespace",
+                            "name": "mcp__files__",
+                            "tools": [{"type": "function", "name": "read", "parameters": {}}]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send malformed response.create");
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("transform error event JSON");
+        assert_eq!(terminal["type"], "error");
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(stats) = router
+                    .get_circuit_breaker_stats(&provider.id, "codex")
+                    .await
+                {
+                    break stats;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for provider breaker stats");
+        assert_eq!(
+            stats.state,
+            crate::proxy::circuit_breaker::CircuitState::Closed
+        );
+        assert_eq!(stats.consecutive_failures, 0);
+        assert_eq!(stats.failed_requests, 0);
+        let status = server.get_status().await;
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+
+        drop(client);
         server.stop().await.expect("stop proxy");
     }
 
