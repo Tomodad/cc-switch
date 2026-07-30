@@ -497,10 +497,17 @@ pub(crate) async fn connect_via_proxy(
         ProxyStream::Tcp(tcp)
     };
 
+    // RFC 3986 requires brackets around IPv6 literals in an authority.
+    let target_authority = if target_host.contains(':') {
+        format!("[{target_host}]:{target_port}")
+    } else {
+        format!("{target_host}:{target_port}")
+    };
+
     // Send CONNECT request
     let mut connect_req = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
-         Host: {target_host}:{target_port}\r\n"
+        "CONNECT {target_authority} HTTP/1.1\r\n\
+         Host: {target_authority}\r\n"
     );
     if let Some(auth) = &proxy_auth {
         connect_req.push_str(auth);
@@ -764,6 +771,7 @@ impl<S: Unpin> tokio::io::AsyncWrite for WriteFilter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn buffered_with_content_type(content_type: Option<&str>) -> ProxyResponse {
         let mut headers = http::HeaderMap::new();
@@ -782,5 +790,42 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[tokio::test]
+    async fn connect_proxy_brackets_ipv6_target_authority() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let address = listener.local_addr().expect("proxy address");
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept proxy client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("read CONNECT request");
+                assert!(read > 0, "proxy client closed before CONNECT headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write CONNECT response");
+            String::from_utf8(request).expect("CONNECT request UTF-8")
+        });
+
+        let stream = connect_via_proxy(&format!("http://{address}"), "::1", 443)
+            .await
+            .expect("establish proxy tunnel");
+        drop(stream);
+        let request = proxy_task.await.expect("proxy task");
+        assert!(request.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nHost: [::1]:443\r\n"));
     }
 }

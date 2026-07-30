@@ -120,7 +120,7 @@ impl ProxyServer {
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
-        let _ = self.state.websocket_shutdown_tx.send(false);
+        self.state.websocket_shutdown_tx.send_replace(false);
         // 检查是否已在运行
         if self.shutdown_tx.read().await.is_some() {
             return Err(ProxyError::AlreadyRunning);
@@ -254,7 +254,7 @@ impl ProxyServer {
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
         // Close upgraded WebSocket connections before the listener is marked stopped.
-        let _ = self.state.websocket_shutdown_tx.send(true);
+        self.state.websocket_shutdown_tx.send_replace(true);
 
         // 1. 发送关闭信号
         if let Some(tx) = self.shutdown_tx.write().await.take() {
@@ -539,5 +539,27 @@ mod tests {
                 "{path} must accept a valid WebSocket Upgrade request"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_retains_websocket_shutdown_state_without_subscribers() {
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+        server.start().await.expect("start test proxy");
+
+        assert_eq!(server.state.websocket_shutdown_tx.receiver_count(), 0);
+        server.stop().await.expect("stop test proxy");
+        assert!(
+            *server.state.websocket_shutdown_tx.borrow(),
+            "shutdown state was lost when no upgraded socket had subscribed"
+        );
     }
 }
