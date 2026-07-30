@@ -371,17 +371,22 @@ async fn handle_connection_inner(
         "codex",
     )
     .await?;
-    let mut provider = turn_context.provider.clone();
-    if !codex_provider_supports_responses_websocket(&provider) {
-        return Err(ProxyError::ConfigError(
-            "selected Codex provider does not support native Responses WebSocket".to_string(),
-        ));
-    }
     let mut turn_providers = turn_context.get_providers();
     let mut provider_index = turn_providers
         .iter()
-        .position(|candidate| candidate.id == provider.id)
+        .position(|candidate| candidate.id == turn_context.provider.id)
         .unwrap_or(0);
+    while provider_index < turn_providers.len()
+        && !codex_provider_supports_responses_websocket(&turn_providers[provider_index])
+    {
+        provider_index += 1;
+    }
+    let mut provider = turn_providers.get(provider_index).cloned().ok_or_else(|| {
+        ProxyError::ConfigError(
+            "selected Codex provider chain does not include a native Responses WebSocket provider"
+                .to_string(),
+        )
+    })?;
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
     let mut provider_attempts = 0_usize;
     let mut original_response_create = first_text;
@@ -507,9 +512,11 @@ async fn handle_connection_inner(
                 }
             } => {
                 let kind = if received_response_event { "idle" } else { "first response event" };
-                return Err(ProxyError::Timeout(format!(
-                    "upstream WebSocket {kind} timed out"
-                )));
+                let message = format!("upstream WebSocket {kind} timed out");
+                if let Some(accounting) = turn_accounting.take() {
+                    accounting.finish_provider_failure(message.clone()).await;
+                }
+                return Err(ProxyError::Timeout(message));
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -986,7 +993,19 @@ async fn handle_connection_inner(
                                 let retry_deadline = websocket_turn_timeout_deadline(
                                     true, false, retry_started, retry_started, timeout_config,
                                 );
-                                send_upstream_message(&mut upstream, UpstreamMessage::Text(retry_text), retry_deadline, &mut shutdown_rx, "media fallback event write").await?;
+                                if send_upstream_message(
+                                    &mut upstream,
+                                    UpstreamMessage::Text(retry_text),
+                                    retry_deadline,
+                                    &mut shutdown_rx,
+                                    "media fallback event write",
+                                )
+                                .await?
+                                    == WebSocketSendOutcome::Shutdown
+                                {
+                                    finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                                    return Ok(());
+                                }
                                 turn_state = retry_state;
                                 media_rectifier_retried = true;
                                 received_response_event = false;
@@ -2848,23 +2867,26 @@ mod tests {
             .as_str()
             .is_some_and(|message| message.contains("handshake timed out")));
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn times_out_when_upstream_never_emits_first_response_event() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stalled upstream");
         let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
         let upstream_task = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
             let mut websocket = tokio_tungstenite::accept_async(stream)
                 .await
                 .expect("accept websocket");
             let _ = next_text(&mut websocket).await;
+            let _ = request_tx.send(());
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let db_for_lock = db.clone();
         let mut provider = websocket_provider(format!("http://{upstream_addr}"));
         provider.in_failover_queue = true;
         db.save_provider("codex", &provider).expect("save provider");
@@ -2878,6 +2900,7 @@ mod tests {
         app_config.auto_failover_enabled = true;
         app_config.streaming_first_byte_timeout = 1;
         app_config.streaming_idle_timeout = 1;
+        app_config.circuit_failure_threshold = 1;
         db.update_proxy_config_for_app(app_config)
             .await
             .expect("set websocket timeouts");
@@ -2891,6 +2914,7 @@ mod tests {
             db,
             None,
         );
+        let router = server.provider_router_for_tests();
         let info = server.start().await.expect("start proxy");
         let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
             .await
@@ -2902,8 +2926,31 @@ mod tests {
             .await
             .expect("send response.create");
 
-        let error: Value =
-            serde_json::from_str(&next_text(&mut client).await).expect("timeout error event JSON");
+        request_rx.await.expect("upstream received request");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_task = std::thread::spawn(move || {
+            let _guard = db_for_lock.conn.lock().expect("lock database");
+            locked_tx.send(()).expect("signal database lock");
+            release_rx.recv().expect("release database lock");
+        });
+        locked_rx.recv().expect("wait for database lock");
+
+        let read_task = tokio::spawn(async move { next_text(&mut client).await });
+        std::thread::sleep(Duration::from_millis(1500));
+        let delivered_early = read_task.is_finished();
+        release_tx.send(()).expect("release database lock");
+        lock_task.join().expect("database lock task");
+        assert!(
+            !delivered_early,
+            "timeout error was delivered before provider failure finalization"
+        );
+
+        let error_text = tokio::time::timeout(Duration::from_secs(2), read_task)
+            .await
+            .expect("timeout error was not delivered after finalization")
+            .expect("timeout reader task");
+        let error: Value = serde_json::from_str(&error_text).expect("timeout error event JSON");
         assert_eq!(error["type"], "error");
         assert!(
             error["error"]["message"]
@@ -2911,6 +2958,16 @@ mod tests {
                 .is_some_and(|message| message.contains("first response event timed out")),
             "unexpected timeout error: {error}"
         );
+        let stats = router
+            .get_circuit_breaker_stats(&provider.id, "codex")
+            .await
+            .expect("provider breaker finalized before timeout delivery");
+        assert_eq!(
+            stats.state,
+            crate::proxy::circuit_breaker::CircuitState::Open
+        );
+        let status = server.get_status().await;
+        assert_eq!(status.failed_requests, 1);
 
         upstream_task.abort();
         server.stop().await.expect("stop proxy");
@@ -3110,6 +3167,96 @@ mod tests {
 
         upstream_task.await.expect("reactive media upstream task");
         server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn proxy_stop_interrupts_stalled_reactive_media_retry_write() {
+        const LARGE_FIELD_BYTES: usize = 16 * 1024 * 1024;
+        const EXPECTED_LIMIT: usize = 200 * 1024 * 1024;
+        let large_config = WebSocketConfig {
+            max_message_size: Some(EXPECTED_LIMIT),
+            max_frame_size: Some(EXPECTED_LIMIT),
+            ..Default::default()
+        };
+        let upstream_socket = TcpSocket::new_v4().expect("create media-retry socket");
+        upstream_socket
+            .set_recv_buffer_size(1024)
+            .expect("shrink media-retry receive buffer");
+        upstream_socket
+            .bind("127.0.0.1:0".parse().expect("parse media-retry address"))
+            .expect("bind media-retry upstream");
+        let upstream_listener = upstream_socket
+            .listen(1)
+            .expect("listen for media-retry upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (failure_tx, failure_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = accept_async_with_config(stream, Some(large_config))
+                .await
+                .expect("accept media-retry websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type":"response.failed",
+                        "response":{"error":{"status":400,"type":"invalid_request_error","message":"image inputs are not supported"}}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send unsupported-image failure");
+            let _ = failure_tx.send(());
+            let _ = release_rx.await;
+            drop(websocket);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async_with_config(
+            format!("ws://127.0.0.1:{}/v1/responses", info.port),
+            Some(large_config),
+            false,
+        )
+        .await
+        .expect("connect large-message client");
+        client
+            .send(UpstreamMessage::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"local-model",
+                    "instructions":"x".repeat(LARGE_FIELD_BYTES),
+                    "input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send large media turn");
+        tokio::time::timeout(Duration::from_secs(5), failure_rx)
+            .await
+            .expect("unsupported-image failure timed out")
+            .expect("failure sender dropped");
+        let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
+        let _ = release_tx.send(());
+        upstream_task.await.expect("media-retry upstream task");
+        stop_result
+            .expect("proxy stop waited on a stalled media-retry write")
+            .expect("stop proxy");
     }
 
     #[tokio::test]
@@ -4304,6 +4451,95 @@ mod tests {
         drop(client);
         bad_task.await.expect("partial-response upstream task");
         good_task.await.expect("fallback upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn initial_chain_skips_non_websocket_provider_after_open_breaker() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket fallback");
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.expect("accept fallback");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept fallback websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-capable-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send fallback completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut original =
+            websocket_provider_with_id("ws-open-original", "http://127.0.0.1:1".to_string());
+        original.sort_index = Some(0);
+        let mut chat =
+            non_websocket_provider_with_id("chat-first-fallback", "http://127.0.0.1:1".to_string());
+        chat.sort_index = Some(1);
+        let mut fallback =
+            websocket_provider_with_id("ws-capable-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(2);
+        for provider in [&original, &chat, &fallback] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &original.id)
+            .expect("select original provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        server
+            .provider_router_for_tests()
+            .record_result(
+                &original.id,
+                "codex",
+                false,
+                false,
+                Some("open original provider".to_string()),
+            )
+            .await
+            .expect("open original breaker");
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let terminal: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("fallback completion JSON");
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(terminal["response"]["id"], "resp-capable-fallback");
+
+        drop(client);
+        fallback_task.await.expect("fallback upstream task");
         server.stop().await.expect("stop proxy");
     }
 
