@@ -2740,6 +2740,11 @@ impl ProxyService {
         let mut updated =
             crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
                 .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
+        let supports_websockets = provider
+            .is_some_and(crate::proxy::providers::codex_provider_supports_responses_websocket);
+        updated =
+            crate::codex_config::update_codex_supports_websockets(&updated, supports_websockets)
+                .map_err(|e| format!("更新 Codex WebSocket capability 失败: {e}"))?;
 
         if let Some(upstream_model) =
             provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
@@ -5125,6 +5130,71 @@ wire_api = "chat"
         );
     }
 
+    #[test]
+    fn apply_codex_proxy_toml_config_disables_unverified_custom_websocket_capability() {
+        let input = r#"
+model_provider = "custom_native"
+
+[model_providers.custom_native]
+name = "Custom Native"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+supports_websockets = true
+custom_field = "preserved"
+"#;
+
+        let proxy_url = "http://127.0.0.1:5000/v1";
+        let output =
+            ProxyService::apply_codex_proxy_toml_config_for_provider(input, proxy_url, None)
+                .expect("apply proxy config");
+        let parsed: toml::Value =
+            toml::from_str(&output).expect("updated config should be valid TOML");
+        let provider = &parsed["model_providers"]["custom_native"];
+
+        assert_eq!(provider["base_url"].as_str(), Some(proxy_url));
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(
+            provider["supports_websockets"].as_bool(),
+            Some(false),
+            "CC Switch must not advertise a local WebSocket route until the selected provider and local transport are verified"
+        );
+        assert_eq!(provider["custom_field"].as_str(), Some("preserved"));
+    }
+
+    #[test]
+    fn apply_codex_proxy_toml_config_preserves_verified_custom_websocket_capability() {
+        let input = r#"
+model_provider = "custom_native"
+
+[model_providers.custom_native]
+name = "Custom Native"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+supports_websockets = false
+"#;
+        let provider = Provider::with_id(
+            "custom-native".to_string(),
+            "Custom Native".to_string(),
+            serde_json::json!({
+                "base_url": "https://custom.example/v1",
+                "supports_websockets": true
+            }),
+            None,
+        );
+
+        let output = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            input,
+            "http://127.0.0.1:5000/v1",
+            Some(&provider),
+        )
+        .expect("apply proxy config");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid TOML");
+
+        assert_eq!(
+            parsed["model_providers"]["custom_native"]["supports_websockets"].as_bool(),
+            Some(true)
+        );
+    }
     #[test]
     fn apply_codex_proxy_toml_config_routes_builtin_official_with_native_auth() {
         let mut provider = Provider::with_id(

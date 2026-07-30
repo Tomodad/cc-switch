@@ -1971,6 +1971,39 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
     Ok(doc.to_string())
 }
 
+/// Project the active Codex provider's WebSocket capability while preserving
+/// the rest of the user's TOML document.
+pub fn update_codex_supports_websockets(
+    toml_str: &str,
+    supports_websockets: bool,
+) -> Result<String, String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("TOML parse error: {e}"))?;
+
+    if let Some(provider_key) = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+    {
+        let provider_table = doc
+            .get_mut("model_providers")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .and_then(|providers| providers.get_mut(&provider_key))
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| {
+                format!(
+                    "model_providers.{provider_key} must be a table before projecting supports_websockets"
+                )
+            })?;
+        provider_table.insert("supports_websockets", toml_edit::value(supports_websockets));
+        return Ok(doc.to_string());
+    }
+
+    doc["supports_websockets"] = toml_edit::value(supports_websockets);
+    Ok(doc.to_string())
+}
+
 /// Remove `base_url` from the active model_provider section only if it matches `predicate`.
 /// Also removes top-level `base_url` if it matches.
 /// Used by proxy cleanup to strip local proxy URLs without touching user-configured URLs.
