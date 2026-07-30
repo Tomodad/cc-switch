@@ -25,8 +25,11 @@ use axum::{
 };
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::sync::{oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 
 /// 代理服务器状态（共享）
@@ -48,6 +51,28 @@ pub struct ProxyState {
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
+    /// Notifies upgraded WebSocket connections that proxy shutdown has begun.
+    pub websocket_shutdown_tx: watch::Sender<bool>,
+    pub(crate) websocket_active: Arc<AtomicUsize>,
+}
+
+pub(crate) struct WebSocketConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for WebSocketConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ProxyState {
+    pub(crate) fn track_websocket_connection(&self) -> WebSocketConnectionGuard {
+        self.websocket_active.fetch_add(1, Ordering::AcqRel);
+        WebSocketConnectionGuard {
+            active: self.websocket_active.clone(),
+        }
+    }
 }
 
 /// 代理HTTP服务器
@@ -70,6 +95,7 @@ impl ProxyServer {
         // 创建故障转移切换管理器
         let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
 
+        let (websocket_shutdown_tx, _) = watch::channel(false);
         let state = ProxyState {
             db,
             config: Arc::new(RwLock::new(config.clone())),
@@ -81,6 +107,8 @@ impl ProxyServer {
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
             failover_manager,
+            websocket_shutdown_tx,
+            websocket_active: Arc::new(AtomicUsize::new(0)),
         };
 
         Self {
@@ -92,6 +120,7 @@ impl ProxyServer {
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
+        let _ = self.state.websocket_shutdown_tx.send(false);
         // 检查是否已在运行
         if self.shutdown_tx.read().await.is_some() {
             return Err(ProxyError::AlreadyRunning);
@@ -224,6 +253,9 @@ impl ProxyServer {
     }
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
+        // Close upgraded WebSocket connections before the listener is marked stopped.
+        let _ = self.state.websocket_shutdown_tx.send(true);
+
         // 1. 发送关闭信号
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
@@ -234,25 +266,42 @@ impl ProxyServer {
         // 2. 等待服务器任务结束（带 5 秒超时保护）
         if let Some(handle) = self.server_handle.write().await.take() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {
-                    log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
-                    Ok(())
-                }
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
-                    Err(ProxyError::StopFailed(e.to_string()))
+                    return Err(ProxyError::StopFailed(e.to_string()));
                 }
                 Err(_) => {
                     log::warn!(
                         "[{}] 代理服务器停止超时（5秒），强制继续",
                         log_srv::STOP_TIMEOUT
                     );
-                    Err(ProxyError::StopTimeout)
+                    return Err(ProxyError::StopTimeout);
                 }
             }
-        } else {
-            Ok(())
         }
+
+        // 3. Upgraded connections are detached from hyper's listener task. Wait
+        // until their shutdown branch has sent close frames and dropped guards.
+        let active = self.state.websocket_active.clone();
+        let wait_for_websockets = async move {
+            while active.load(Ordering::Acquire) > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_websockets)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[{}] WebSocket connections did not drain before stop timeout",
+                log_srv::STOP_TIMEOUT
+            );
+            return Err(ProxyError::StopTimeout);
+        }
+
+        log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
+        Ok(())
     }
 
     pub async fn get_status(&self) -> ProxyStatus {

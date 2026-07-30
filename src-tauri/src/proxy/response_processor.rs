@@ -610,6 +610,56 @@ pub(crate) fn usage_logging_enabled(state: &ProxyState) -> bool {
         .unwrap_or(true)
 }
 
+/// Record a terminal Codex Responses WebSocket event through the same usage
+/// pipeline used by HTTP/SSE responses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn log_codex_websocket_usage(
+    state: &ProxyState,
+    provider_id: &str,
+    request_model: &str,
+    outbound_model: &str,
+    event: &Value,
+    latency_ms: u64,
+    first_token_ms: Option<u64>,
+    session_id: &str,
+) {
+    if !usage_logging_enabled(state) {
+        return;
+    }
+
+    let events = [event.clone()];
+    let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
+    let model = usage
+        .model
+        .as_deref()
+        .filter(|model| !model.is_empty())
+        .or_else(|| {
+            event
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+        })
+        .unwrap_or(outbound_model)
+        .to_string();
+
+    log_usage_internal(
+        state,
+        provider_id,
+        "codex",
+        &model,
+        request_model,
+        outbound_model,
+        usage,
+        latency_ms,
+        first_token_ms,
+        true,
+        200,
+        Some(session_id.to_string()),
+    )
+    .await;
+}
+
 /// 内部使用量记录函数
 ///
 /// `outbound_model` 是「按请求计价」模式的锚点：实际发往上游的模型
@@ -1001,6 +1051,8 @@ mod tests {
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            websocket_shutdown_tx: tokio::sync::watch::channel(false).0,
+            websocket_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 

@@ -319,7 +319,7 @@ pub async fn send_request(
 /// When the proxy URL uses `https://`, the connection to the proxy itself is
 /// TLS-wrapped before sending the CONNECT request.  The enum lets
 /// `send_raw_request` work with either variant generically.
-enum ProxyStream {
+pub(crate) enum ProxyStream {
     Tcp(tokio::net::TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
@@ -450,7 +450,7 @@ async fn send_raw_request(
 /// 2. Send `CONNECT host:port HTTP/1.1` with optional `Proxy-Authorization`
 /// 3. Read the proxy's 200 response (407 → `AuthError`)
 /// 4. Return the tunneled stream (ready for target TLS handshake + raw write)
-async fn connect_via_proxy(
+pub(crate) async fn connect_via_proxy(
     proxy_url: &str,
     target_host: &str,
     target_port: u16,
