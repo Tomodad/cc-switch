@@ -357,8 +357,8 @@ async fn handle_connection_inner(
         .iter()
         .position(|candidate| candidate.id == provider.id)
         .unwrap_or(0);
-    let mut provider_attempt_limit =
-        websocket_provider_attempt_limit(&turn_context, &turn_providers);
+    let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
+    let mut provider_attempts = 1_usize;
     let mut original_response_create = first_text;
 
     let (first_text, turn_state) = transform_client_text(
@@ -542,7 +542,8 @@ async fn handle_connection_inner(
                                 .position(|candidate| candidate.id == provider.id)
                                 .unwrap_or(0);
                             provider_attempt_limit =
-                                websocket_provider_attempt_limit(&turn_context, &turn_providers);
+                                websocket_provider_attempt_limit(&turn_context);
+                            provider_attempts = 1;
                             original_response_create = next_original_response_create;
                             (text, next_state)
                         } else {
@@ -676,6 +677,13 @@ async fn handle_connection_inner(
             }
             upstream_message = upstream.next() => {
                 let Some(upstream_message) = upstream_message else {
+                    if response_in_flight {
+                        return Err(premature_upstream_close_error(
+                            &mut turn_accounting,
+                            "upstream WebSocket ended before a terminal response",
+                        )
+                        .await);
+                    }
                     let close_deadline = websocket_turn_timeout_deadline(
                         response_in_flight,
                         received_response_event,
@@ -696,6 +704,13 @@ async fn handle_connection_inner(
                 let upstream_message = match upstream_message {
                     Ok(message) => message,
                     Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
+                        if response_in_flight {
+                            return Err(premature_upstream_close_error(
+                                &mut turn_accounting,
+                                "upstream WebSocket closed before a terminal response",
+                            )
+                            .await);
+                        }
                         let close_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -738,8 +753,7 @@ async fn handle_connection_inner(
                         });
                         if terminal_data.as_ref().is_some_and(|(outcome, _, _)| {
                             *outcome == WebSocketTerminalOutcome::ProviderFailure
-                        }) && provider_index + 1 < provider_attempt_limit
-                        {
+                        }) {
                             let failure_message = format!(
                                 "upstream WebSocket terminal event: {}",
                                 websocket_event_type(&text)
@@ -758,7 +772,9 @@ async fn handle_connection_inner(
                             }
 
                             let mut retried = false;
-                            while provider_index + 1 < provider_attempt_limit {
+                            while provider_index + 1 < turn_providers.len()
+                                && provider_attempts < provider_attempt_limit
+                            {
                                 provider_index += 1;
                                 let candidate = turn_providers[provider_index].clone();
                                 if !codex_provider_supports_responses_websocket(&candidate) {
@@ -776,6 +792,7 @@ async fn handle_connection_inner(
                                     Err(ProxyError::NoAvailableProvider) => continue,
                                     Err(error) => return Err(error),
                                 };
+                                provider_attempts += 1;
                                 let (retry_text, retry_state) = match transform_client_text(
                                     &original_response_create,
                                     &candidate,
@@ -869,13 +886,13 @@ async fn handle_connection_inner(
                                     }
                                 }
 
-                                if let Some((status_code, event)) = failed_usage {
+                                if let Some((status_code, event)) = failed_usage.as_ref() {
                                     spawn_codex_websocket_usage(
                                         state,
                                         &provider,
                                         &turn_state,
-                                        event,
-                                        status_code,
+                                        event.clone(),
+                                        *status_code,
                                         turn_started.elapsed().as_millis() as u64,
                                         first_token_ms,
                                     );
@@ -895,7 +912,21 @@ async fn handle_connection_inner(
                             if retried {
                                 continue;
                             }
-                            record_websocket_status_failure(state, failure_message).await;
+                            if let Some((status_code, event)) = failed_usage {
+                                spawn_codex_websocket_usage(
+                                    state,
+                                    &provider,
+                                    &turn_state,
+                                    event,
+                                    status_code,
+                                    turn_started.elapsed().as_millis() as u64,
+                                    first_token_ms,
+                                );
+                            }
+                            record_websocket_status_failure(state, failure_message.clone()).await;
+                            return Err(ProxyError::ForwardFailed(format!(
+                                "{failure_message}; no eligible Responses WebSocket fallback remains"
+                            )));
                         }
                         let text = restore_upstream_text(text, &turn_state);
                         let write_deadline = websocket_turn_timeout_deadline(
@@ -1022,6 +1053,13 @@ async fn handle_connection_inner(
                         }
                     }
                     UpstreamMessage::Close(frame) => {
+                        if response_in_flight {
+                            return Err(premature_upstream_close_error(
+                                &mut turn_accounting,
+                                "upstream WebSocket sent a close frame before a terminal response",
+                            )
+                            .await);
+                        }
                         let frame = frame.map(|frame| DownstreamCloseFrame {
                             code: u16::from(frame.code),
                             reason: Cow::Owned(frame.reason.into_owned()),
@@ -1044,13 +1082,25 @@ async fn handle_connection_inner(
                         break;
                     }
                     UpstreamMessage::Frame(_) => {}
-                }            }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
+async fn premature_upstream_close_error(
+    turn_accounting: &mut Option<WebSocketTurnAccounting>,
+    message: &str,
+) -> ProxyError {
+    if let Some(accounting) = turn_accounting.take() {
+        accounting
+            .finish_provider_failure(message.to_string())
+            .await;
+    }
+    ProxyError::ForwardFailed(format!("{message}; falling back to HTTP/SSE"))
+}
 fn spawn_codex_websocket_usage(
     state: &ProxyState,
     provider: &Provider,
@@ -1539,12 +1589,9 @@ fn websocket_error_values(event: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
 }
 
-fn websocket_provider_attempt_limit(ctx: &RequestContext, providers: &[Provider]) -> usize {
-    if providers.is_empty() {
-        return 0;
-    }
+fn websocket_provider_attempt_limit(ctx: &RequestContext) -> usize {
     if ctx.app_config.auto_failover_enabled {
-        providers.len().min(ctx.app_config.max_retries as usize + 1)
+        ctx.app_config.max_retries as usize + 1
     } else {
         1
     }
@@ -1975,6 +2022,20 @@ mod tests {
         provider
     }
 
+    fn non_websocket_provider_with_id(id: &str, base_url: String) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Non-WebSocket Provider {id}"),
+            json!({
+                "base_url": base_url,
+                "supports_websockets": false,
+                "env": {"OPENAI_API_KEY": "provider-secret"}
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+        provider
+    }
     fn response_create(model: &str, previous_response_id: Option<&str>) -> Value {
         let mut response = json!({
             "type": "response.create",
@@ -3308,6 +3369,75 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn premature_upstream_close_forces_sse_fallback_close() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind premature-close upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Close(None))
+                .await
+                .expect("send premature close");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+
+        let error = client
+            .next()
+            .await
+            .expect("client closed before fallback error")
+            .expect("fallback error frame");
+        let error = match error {
+            UpstreamMessage::Text(text) => {
+                serde_json::from_str::<Value>(&text).expect("fallback error JSON")
+            }
+            other => panic!("expected fallback error event, got {other:?}"),
+        };
+        assert_eq!(error["type"], "error");
+        let close = client
+            .next()
+            .await
+            .expect("client closed before fallback close")
+            .expect("fallback close frame");
+        match close {
+            UpstreamMessage::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1011),
+            other => panic!("expected 1011 fallback close, got {other:?}"),
+        }
+
+        upstream_task.await.expect("premature-close upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+    #[tokio::test]
+    #[serial]
     async fn provider_terminal_failure_retries_same_turn_on_fallback() {
         let bad_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3361,13 +3491,18 @@ mod tests {
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
-        let bad = websocket_provider_with_id("ws-bad", format!("http://{bad_addr}"));
-        let good = websocket_provider_with_id("ws-good", format!("http://{good_addr}"));
+        let bad = websocket_provider_with_id("ws-1-bad", format!("http://{bad_addr}"));
+        let chat = non_websocket_provider_with_id("ws-2-chat", "http://127.0.0.1:1".to_string());
+        let good = websocket_provider_with_id("ws-3-good", format!("http://{good_addr}"));
         db.save_provider("codex", &bad).expect("save bad provider");
+        db.save_provider("codex", &chat)
+            .expect("save chat-only provider");
         db.save_provider("codex", &good)
             .expect("save good provider");
         db.add_to_failover_queue("codex", &bad.id)
             .expect("queue bad provider");
+        db.add_to_failover_queue("codex", &chat.id)
+            .expect("queue chat-only provider");
         db.add_to_failover_queue("codex", &good.id)
             .expect("queue good provider");
         let mut app_config = db
