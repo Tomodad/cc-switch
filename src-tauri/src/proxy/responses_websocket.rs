@@ -388,8 +388,43 @@ async fn handle_connection_inner(
         .position(|candidate| candidate.id == provider.id)
         .unwrap_or(0);
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
-    let mut provider_attempts = 1_usize;
+    let mut provider_attempts = 0_usize;
     let mut original_response_create = first_text;
+
+    let mut count_request = true;
+    let initial_accounting = loop {
+        match WebSocketTurnAccounting::begin_for_provider(
+            state,
+            &turn_context,
+            &provider,
+            count_request,
+        )
+        .await
+        {
+            Ok(accounting) => {
+                provider_attempts += 1;
+                break accounting;
+            }
+            Err(ProxyError::NoAvailableProvider)
+                if turn_context.app_config.auto_failover_enabled =>
+            {
+                count_request = false;
+                let mut next_provider = None;
+                while provider_index + 1 < turn_providers.len()
+                    && provider_attempts < provider_attempt_limit
+                {
+                    provider_index += 1;
+                    let candidate = turn_providers[provider_index].clone();
+                    if codex_provider_supports_responses_websocket(&candidate) {
+                        next_provider = Some(candidate);
+                        break;
+                    }
+                }
+                provider = next_provider.ok_or(ProxyError::NoAvailableProvider)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
 
     let (first_text, turn_state) = transform_client_text(
         &original_response_create,
@@ -400,11 +435,12 @@ async fn handle_connection_inner(
     .expect("validated response.create");
     let mut turn_state = turn_state.expect("response.create transform state");
     turn_state.session_id = turn_context.session_id.clone();
-    let mut turn_accounting = Some(WebSocketTurnAccounting::begin(state, &turn_context).await?);
+    let mut turn_accounting = Some(initial_accounting);
     let mut response_in_flight = true;
     let mut turn_started = Instant::now();
     let mut first_token_ms = None;
     let mut received_response_event = false;
+    let mut relayed_response_event = false;
     let mut last_response_event_at = turn_started;
     let mut timeout_config = turn_context.streaming_timeout_config();
     let mut upstream_proxy_url = super::http_client::get_current_proxy_url();
@@ -598,6 +634,7 @@ async fn handle_connection_inner(
                             turn_started = Instant::now();
                             first_token_ms = None;
                             received_response_event = false;
+                            relayed_response_event = false;
                             last_response_event_at = turn_started;
                         }
                         let write_deadline = websocket_turn_timeout_deadline(
@@ -796,7 +833,8 @@ async fn handle_connection_inner(
                         });
                         if terminal_data.as_ref().is_some_and(|(outcome, _, _)| {
                             *outcome == WebSocketTerminalOutcome::ProviderFailure
-                        }) {
+                        }) && !relayed_response_event
+                        {
                             let failure_message = format!(
                                 "upstream WebSocket terminal event: {}",
                                 websocket_event_type(&text)
@@ -952,6 +990,7 @@ async fn handle_connection_inner(
                                 turn_started = retry_started;
                                 first_token_ms = None;
                                 received_response_event = false;
+                                relayed_response_event = false;
                                 last_response_event_at = retry_started;
                                 retried = true;
                                 break;
@@ -996,6 +1035,7 @@ async fn handle_connection_inner(
                             finish_websocket_shutdown(downstream, &mut turn_accounting).await;
                             break;
                         }
+                        relayed_response_event = true;
                         if let Some((outcome, status_code, event)) = terminal_data {
                             if let Some(event) = event {
                                 spawn_codex_websocket_usage(
@@ -1054,8 +1094,12 @@ async fn handle_connection_inner(
                             finish_websocket_shutdown(downstream, &mut turn_accounting).await;
                             break;
                         }
+                        relayed_response_event = true;
                     }
                     UpstreamMessage::Ping(data) => {
+                        if response_in_flight && received_response_event {
+                            last_response_event_at = Instant::now();
+                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -1078,6 +1122,9 @@ async fn handle_connection_inner(
                         }
                     }
                     UpstreamMessage::Pong(data) => {
+                        if response_in_flight && received_response_event {
+                            last_response_event_at = Instant::now();
+                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -3723,6 +3770,313 @@ mod tests {
         drop(client);
         bad_task.await.expect("bad upstream task");
         good_task.await.expect("good upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn provider_failure_after_relayed_events_is_not_retried() {
+        let bad_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial-response upstream");
+        let bad_addr = bad_listener.local_addr().unwrap();
+        let bad_task = tokio::spawn(async move {
+            let (stream, _) = bad_listener.accept().await.expect("accept bad upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept bad websocket");
+            let _ = next_text(&mut websocket).await;
+            for event in [
+                json!({"type":"response.created","response":{"id":"resp-partial"}}),
+                json!({"type":"response.output_text.delta","delta":"partial"}),
+                json!({
+                    "type":"response.failed",
+                    "response": {
+                        "id":"resp-partial",
+                        "status":"failed",
+                        "error":{"type":"server_error","code":"internal_error"}
+                    }
+                }),
+            ] {
+                websocket
+                    .send(UpstreamMessage::Text(event.to_string()))
+                    .await
+                    .expect("send partial response event");
+            }
+        });
+
+        let good_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback upstream");
+        let good_addr = good_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let good_task = tokio::spawn(async move {
+            let accepted = match tokio::time::timeout(
+                Duration::from_secs(2),
+                good_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("accept fallback websocket");
+                    let _ = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-duplicate","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .expect("send duplicate completion");
+                    true
+                }
+                _ => false,
+            };
+            let _ = fallback_tx.send(accepted);
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut bad = websocket_provider_with_id("ws-partial", format!("http://{bad_addr}"));
+        bad.sort_index = Some(0);
+        let mut good = websocket_provider_with_id("ws-fallback", format!("http://{good_addr}"));
+        good.sort_index = Some(1);
+        for provider in [&bad, &good] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &bad.id)
+            .expect("select bad provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+
+        let created: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let delta: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let fallback_used = fallback_rx.await.expect("fallback observation");
+
+        assert_eq!(created["type"], "response.created");
+        assert_eq!(delta["type"], "response.output_text.delta");
+        assert_eq!(terminal["type"], "response.failed");
+        assert!(!fallback_used);
+
+        drop(client);
+        bad_task.await.expect("partial-response upstream task");
+        good_task.await.expect("fallback upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn initial_half_open_permit_denial_uses_healthy_fallback() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback upstream");
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.expect("accept fallback");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept fallback websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send fallback completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("configure half-open breaker");
+        let mut primary =
+            websocket_provider_with_id("ws-primary", "http://127.0.0.1:1".to_string());
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &primary.id)
+            .expect("select primary provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        router
+            .record_result(
+                &primary.id,
+                "codex",
+                false,
+                false,
+                Some("prime half-open state".to_string()),
+            )
+            .await
+            .expect("open primary breaker");
+        let held_permit = router.allow_provider_request(&primary.id, "codex").await;
+        assert!(held_permit.allowed && held_permit.used_half_open_permit);
+
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let terminal: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("fallback completion JSON");
+
+        router
+            .release_permit_neutral(&primary.id, "codex", held_permit.used_half_open_permit)
+            .await;
+        assert_eq!(terminal["type"], "response.completed");
+
+        drop(client);
+        fallback_task.await.expect("fallback upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upstream_heartbeats_refresh_active_turn_idle_deadline() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept heartbeat websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.created","response":{"id":"resp-heartbeat"}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send response.created");
+            for heartbeat in 0..4_u8 {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                if websocket
+                    .send(UpstreamMessage::Ping(vec![heartbeat]))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-heartbeat","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send heartbeat completion");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut provider = websocket_provider(format!("http://{upstream_addr}"));
+        provider.in_failover_queue = true;
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.streaming_first_byte_timeout = 1;
+        app_config.streaming_idle_timeout = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("set websocket idle timeout");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let created: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+
+        assert_eq!(created["type"], "response.created");
+        assert_eq!(terminal["type"], "response.completed", "{terminal}");
+
+        drop(client);
+        upstream_task.await.expect("heartbeat upstream task");
         server.stop().await.expect("stop proxy");
     }
 
