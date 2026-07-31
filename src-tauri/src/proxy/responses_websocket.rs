@@ -316,6 +316,9 @@ static REQUEST_CONTEXT_LOADS_STARTED: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static PAUSE_REQUEST_CONTEXT_LOAD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TRANSFORM_CLIENT_TEXT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl Drop for WebSocketTurnAccounting {
     fn drop(&mut self) {
@@ -728,9 +731,20 @@ async fn handle_connection_inner(
         ) {
             Ok(transformed) => transformed,
             Err(error) => {
-                initial_accounting
-                    .finish_neutral_failure(error.to_string())
-                    .await;
+                finish_fallback_transform_error(initial_accounting, &error).await;
+                if turn_context.app_config.auto_failover_enabled && initial_allows_provider_fallback
+                {
+                    if let Some(next) = next_websocket_provider(
+                        &turn_providers,
+                        &mut provider_index,
+                        provider_attempts,
+                        provider_attempt_limit,
+                    ) {
+                        provider = next;
+                        continue;
+                    }
+                }
+                record_websocket_status_failure(state, error.to_string()).await;
                 return Err(error);
             }
         };
@@ -1923,6 +1937,12 @@ async fn handle_connection_inner(
                         }
                     }
                     UpstreamMessage::Binary(data) => {
+                        if !response_in_flight {
+                            return Err(ProxyError::ForwardFailed(
+                                "upstream WebSocket sent binary data while no response was in flight"
+                                    .to_string(),
+                            ));
+                        }
                         received_response_event = true;
                         last_response_event_at = Instant::now();
                         if first_token_ms.is_none() {
@@ -2434,6 +2454,8 @@ fn transform_client_text(
     rectifier_config: &RectifierConfig,
     require_response_create: bool,
 ) -> Result<Option<(String, Option<TurnTransformState>)>, ProxyError> {
+    #[cfg(test)]
+    TRANSFORM_CLIENT_TEXT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut event: Value = match serde_json::from_str(text) {
         Ok(event) => event,
         Err(error) if require_response_create => {
@@ -7509,6 +7531,144 @@ mod tests {
 
         drop(client);
         upstream_task.await.expect("upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejects_binary_data_between_turns() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-terminal","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send terminal response");
+            websocket
+                .send(UpstreamMessage::Binary(vec![1, 2, 3]))
+                .await
+                .expect("send unsolicited binary data");
+            let _ = tokio::time::timeout(Duration::from_secs(1), websocket.next()).await;
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+
+        let first: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("completion JSON");
+        assert_eq!(first["type"], "response.completed");
+        let second = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("proxy did not reject unsolicited binary data")
+            .expect("proxy closed without an error event")
+            .expect("websocket read failed");
+        let UpstreamMessage::Text(second) = second else {
+            panic!("expected proxy error event, got {second:?}");
+        };
+        let second: Value = serde_json::from_str(&second).expect("proxy error JSON");
+        assert_eq!(second["type"], "error");
+        assert!(second["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no response was in flight")));
+
+        drop(client);
+        upstream_task.await.expect("upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn initial_transform_collision_continues_to_later_provider() {
+        TRANSFORM_CLIENT_TEXT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let mut flattening =
+            websocket_provider_with_id("flattening-provider", "http://127.0.0.1:9".to_string());
+        flattening.sort_index = Some(1);
+        let mut later =
+            websocket_provider_with_id("later-provider", "http://127.0.0.1:10".to_string());
+        later.sort_index = Some(2);
+        db.save_provider("codex", &flattening)
+            .expect("save flattening provider");
+        db.save_provider("codex", &later)
+            .expect("save later provider");
+        db.set_current_provider("codex", &flattening.id)
+            .expect("select flattening provider");
+        db.add_to_failover_queue("codex", &flattening.id)
+            .expect("queue flattening provider");
+        db.add_to_failover_queue("codex", &later.id)
+            .expect("queue later provider");
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        let mut request = response_create("local-model", None);
+        request["tools"] = json!([
+            {"type":"function","name":"mcp__files____read","parameters":{}},
+            {"type":"namespace","name":"mcp__files__","tools":[
+                {"type":"function","name":"read","parameters":{}}
+            ]}
+        ]);
+        client
+            .send(UpstreamMessage::Text(request.to_string()))
+            .await
+            .expect("send colliding response.create");
+
+        let response: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("proxy error JSON");
+        assert_eq!(response["type"], "error");
+        assert_eq!(
+            TRANSFORM_CLIENT_TEXT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "provider-specific transform failure must continue to the next eligible provider"
+        );
+
+        drop(client);
         server.stop().await.expect("stop proxy");
     }
 

@@ -656,6 +656,65 @@ impl Database {
         Ok(())
     }
 
+    /// Apply a compact sequence of detached results without losing final health state.
+    pub async fn update_provider_health_coalesced_with_threshold(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        saw_success: bool,
+        trailing_failures: u32,
+        error_msg: Option<String>,
+        failure_threshold: u32,
+    ) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        let now = chrono::Utc::now().to_rfc3339();
+        let current_failures = conn
+            .query_row(
+                "SELECT consecutive_failures FROM provider_health
+                 WHERE provider_id = ?1 AND app_type = ?2",
+                rusqlite::params![provider_id, app_type],
+                |row| Ok(row.get::<_, i64>(0)? as u32),
+            )
+            .unwrap_or(0);
+        let consecutive_failures = if saw_success {
+            trailing_failures
+        } else {
+            current_failures.saturating_add(trailing_failures)
+        };
+        let is_healthy = consecutive_failures < failure_threshold;
+        let last_success_at = saw_success.then(|| now.clone());
+        let last_failure_at = (trailing_failures > 0).then(|| now.clone());
+        let last_error = if trailing_failures > 0 {
+            error_msg
+        } else {
+            None
+        };
+
+        conn.execute(
+            "INSERT OR REPLACE INTO provider_health
+             (provider_id, app_type, is_healthy, consecutive_failures,
+              last_success_at, last_failure_at, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4,
+                     COALESCE(?5, (SELECT last_success_at FROM provider_health
+                                   WHERE provider_id = ?1 AND app_type = ?2)),
+                     COALESCE(?6, (SELECT last_failure_at FROM provider_health
+                                   WHERE provider_id = ?1 AND app_type = ?2)),
+                     ?7, ?8)",
+            rusqlite::params![
+                provider_id,
+                app_type,
+                i64::from(is_healthy),
+                i64::from(consecutive_failures),
+                last_success_at,
+                last_failure_at,
+                last_error,
+                &now,
+            ],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// 重置Provider健康状态
     pub async fn reset_provider_health(
         &self,

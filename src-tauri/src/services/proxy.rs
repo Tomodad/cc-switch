@@ -362,6 +362,23 @@ impl ProxyService {
         Ok(())
     }
 
+    async fn codex_effective_chain_supports_websockets(&self, provider: &Provider) -> bool {
+        let auto_failover_enabled = self
+            .db
+            .get_proxy_config_for_app("codex")
+            .await
+            .map(|config| config.auto_failover_enabled)
+            .unwrap_or(false);
+        if !auto_failover_enabled {
+            return crate::proxy::providers::codex_provider_supports_responses_websocket(provider);
+        }
+        self.db
+            .get_failover_providers("codex")
+            .unwrap_or_default()
+            .iter()
+            .any(crate::proxy::providers::codex_provider_supports_responses_websocket)
+    }
+
     pub async fn sync_codex_live_from_provider_while_proxy_active(
         &self,
         provider: &Provider,
@@ -381,10 +398,14 @@ impl ProxyService {
         }
         let (_, proxy_codex_base_url) = self.build_proxy_urls().await?;
 
+        let supports_websockets = self
+            .codex_effective_chain_supports_websockets(provider)
+            .await;
         Self::apply_codex_takeover_fields_for_provider(
             &mut effective_settings,
             &proxy_codex_base_url,
             provider,
+            supports_websockets,
         )?;
 
         self.write_codex_takeover_live_for_provider(&effective_settings, Some(provider))?;
@@ -1597,10 +1618,14 @@ impl ProxyService {
         // Codex: project the selected provider through the local Responses endpoint.
         if let Ok(mut live_config) = self.read_codex_live() {
             let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
+            let supports_websockets = self
+                .codex_effective_chain_supports_websockets(&codex_provider)
+                .await;
             Self::apply_codex_takeover_fields_for_provider(
                 &mut live_config,
                 &proxy_codex_base_url,
                 &codex_provider,
+                supports_websockets,
             )?;
 
             self.write_codex_takeover_live_for_provider(&live_config, Some(&codex_provider))?;
@@ -1659,10 +1684,14 @@ impl ProxyService {
             AppType::Codex => {
                 let mut live_config = self.read_codex_live()?;
                 let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
+                let supports_websockets = self
+                    .codex_effective_chain_supports_websockets(&codex_provider)
+                    .await;
                 Self::apply_codex_takeover_fields_for_provider(
                     &mut live_config,
                     &proxy_codex_base_url,
                     &codex_provider,
+                    supports_websockets,
                 )?;
 
                 self.write_codex_takeover_live_for_provider(&live_config, Some(&codex_provider))?;
@@ -1736,10 +1765,14 @@ impl ProxyService {
             AppType::Codex => {
                 if let Ok(mut live_config) = self.read_codex_live() {
                     let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
+                    let supports_websockets = self
+                        .codex_effective_chain_supports_websockets(&codex_provider)
+                        .await;
                     Self::apply_codex_takeover_fields_for_provider(
                         &mut live_config,
                         &proxy_codex_base_url,
                         &codex_provider,
+                        supports_websockets,
                     )?;
 
                     self.write_codex_takeover_live_for_provider(
@@ -2761,10 +2794,27 @@ impl ProxyService {
 
     /// 接管 Codex 时，本地客户端必须继续以 Responses wire API 访问代理。
     /// 真实上游是否走 Chat Completions 由 provider 配置决定，并在代理内部转换。
+    #[cfg(test)]
     fn apply_codex_proxy_toml_config_for_provider(
         toml_str: &str,
         proxy_url: &str,
         provider: Option<&Provider>,
+    ) -> Result<String, String> {
+        let supports_websockets = provider
+            .is_some_and(crate::proxy::providers::codex_provider_supports_responses_websocket);
+        Self::apply_codex_proxy_toml_config_with_websocket_capability(
+            toml_str,
+            proxy_url,
+            provider,
+            supports_websockets,
+        )
+    }
+
+    fn apply_codex_proxy_toml_config_with_websocket_capability(
+        toml_str: &str,
+        proxy_url: &str,
+        provider: Option<&Provider>,
+        supports_websockets: bool,
     ) -> Result<String, String> {
         if provider.is_some_and(crate::proxy::providers::is_codex_official_provider) {
             return crate::codex_config::apply_codex_official_proxy_route(toml_str, proxy_url)
@@ -2776,8 +2826,6 @@ impl ProxyService {
         let mut updated =
             crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
                 .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
-        let supports_websockets = provider
-            .is_some_and(crate::proxy::providers::codex_provider_supports_responses_websocket);
         updated =
             crate::codex_config::update_codex_supports_websockets(&updated, supports_websockets)
                 .map_err(|e| format!("更新 Codex WebSocket capability 失败: {e}"))?;
@@ -2812,6 +2860,7 @@ impl ProxyService {
         settings: &mut Value,
         proxy_base_url: &str,
         provider: &Provider,
+        supports_websockets: bool,
     ) -> Result<(), String> {
         Self::apply_codex_takeover_auth_placeholder(settings, Some(provider));
         let config_text = settings
@@ -2819,10 +2868,11 @@ impl ProxyService {
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string();
-        let projected = Self::apply_codex_proxy_toml_config_for_provider(
+        let projected = Self::apply_codex_proxy_toml_config_with_websocket_capability(
             &config_text,
             proxy_base_url,
             Some(provider),
+            supports_websockets,
         )?;
         settings["config"] = json!(projected);
         Self::attach_codex_model_catalog_from_provider(settings, Some(provider));
@@ -5237,6 +5287,41 @@ supports_websockets = false
             Some(true)
         );
     }
+    #[tokio::test]
+    async fn codex_websocket_capability_uses_effective_failover_chain() {
+        let db = Arc::new(Database::memory().unwrap());
+        let mut current = Provider::with_id(
+            "non-websocket-current".to_string(),
+            "Non-WebSocket Current".to_string(),
+            json!({"base_url":"https://current.example/v1","supports_websockets":false}),
+            None,
+        );
+        current.sort_index = Some(1);
+        let mut fallback = Provider::with_id(
+            "websocket-fallback".to_string(),
+            "WebSocket Fallback".to_string(),
+            json!({"base_url":"https://fallback.example/v1","supports_websockets":true}),
+            None,
+        );
+        fallback.sort_index = Some(2);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &fallback).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &fallback.id).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let service = ProxyService::new(db);
+
+        assert!(
+            service
+                .codex_effective_chain_supports_websockets(&current)
+                .await,
+            "a later WebSocket-capable failover provider must advertise the local WebSocket route"
+        );
+    }
+
     #[test]
     fn apply_codex_proxy_toml_config_routes_builtin_official_with_native_auth() {
         let mut provider = Provider::with_id(
