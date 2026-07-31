@@ -30,7 +30,28 @@ use std::sync::{
     Arc,
 };
 use tokio::sync::{oneshot, watch, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+
+#[cfg(test)]
+static PENDING_CONNECTION_PEEKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct PendingConnectionPeekGuard;
+
+#[cfg(test)]
+impl PendingConnectionPeekGuard {
+    fn new() -> Self {
+        PENDING_CONNECTION_PEEKS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingConnectionPeekGuard {
+    fn drop(&mut self) {
+        PENDING_CONNECTION_PEEKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// 代理服务器状态（共享）
 #[derive(Clone)]
@@ -169,8 +190,13 @@ impl ProxyServer {
         let state = self.state.clone();
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
                     result = listener.accept() => {
                         let (stream, _remote_addr) = match result {
                             Ok(v) => v,
@@ -182,7 +208,10 @@ impl ProxyServer {
                         };
 
                         let app = app.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
+                            #[cfg(test)]
+                            let _pending_peek_guard = PendingConnectionPeekGuard::new();
+
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
                             let original_cases = {
@@ -231,11 +260,19 @@ impl ProxyServer {
                             }
                         });
                     }
-                    _ = &mut shutdown_rx => {
-                        break;
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = completed {
+                            log::debug!(
+                                "[{SRV}] connection task ended unexpectedly: {error}",
+                                SRV = log_srv::CONN_ERR
+                            );
+                        }
                     }
                 }
             }
+
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
 
             // 服务器停止后更新状态
             state.status.write().await.running = false;
@@ -569,6 +606,63 @@ mod tests {
         assert!(
             *server.state.websocket_shutdown_tx.borrow(),
             "shutdown state was lost when no upgraded socket had subscribed"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_cancels_connections_waiting_for_upgrade_bytes() {
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+        let info = server.start().await.expect("start test proxy");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", info.port))
+            .await
+            .expect("connect test proxy");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while PENDING_CONNECTION_PEEKS.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted connection did not reach header peek");
+
+        server.stop().await.expect("stop test proxy");
+
+        let request = format!(
+            "GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            info.port
+        );
+        let write_result = stream.write_all(request.as_bytes()).await;
+        let mut response = [0u8; 1024];
+        let status = if write_result.is_ok() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read(&mut response),
+            )
+            .await
+            {
+                Ok(Ok(read)) => String::from_utf8_lossy(&response[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        assert_ne!(
+            status, "HTTP/1.1 101 Switching Protocols",
+            "an accepted connection completed its WebSocket upgrade after stop returned"
         );
     }
 }

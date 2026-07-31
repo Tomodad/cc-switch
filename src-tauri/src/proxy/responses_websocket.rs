@@ -264,6 +264,14 @@ impl WebSocketTurnAccounting {
         record_websocket_status_failure(&self.state, message).await;
     }
 
+    async fn finish_neutral_attempt(mut self) {
+        self.finalized = true;
+        self.state
+            .provider_router
+            .release_permit_neutral(&self.provider_id, "codex", self.used_half_open_permit)
+            .await;
+    }
+
     async fn finish_neutral_failure(mut self, message: String) {
         self.finalized = true;
         self.state
@@ -1645,6 +1653,17 @@ async fn handle_connection_inner(
                                 "{failure_message}; no eligible Responses WebSocket fallback remains"
                             )));
                         }
+                        if let Some((_, status_code, Some(event))) = terminal_data.as_ref() {
+                            spawn_codex_websocket_usage(
+                                state,
+                                &provider,
+                                &turn_state,
+                                event.clone(),
+                                *status_code,
+                                turn_started.elapsed().as_millis() as u64,
+                                first_token_ms,
+                            );
+                        }
                         let text = restore_upstream_text(text, &turn_state);
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
@@ -1668,18 +1687,7 @@ async fn handle_connection_inner(
                             break;
                         }
                         relayed_response_event = true;
-                        if let Some((outcome, status_code, event)) = terminal_data {
-                            if let Some(event) = event {
-                                spawn_codex_websocket_usage(
-                                    state,
-                                    &provider,
-                                    &turn_state,
-                                    event,
-                                    status_code,
-                                    turn_started.elapsed().as_millis() as u64,
-                                    first_token_ms,
-                                );
-                            }
+                        if let Some((outcome, _, _)) = terminal_data {
                             if let Some(accounting) = turn_accounting.take() {
                                 let message = format!(
                                     "upstream WebSocket terminal event: {}",
@@ -1916,6 +1924,15 @@ async fn send_downstream_message(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     description: &str,
 ) -> Result<WebSocketSendOutcome, ProxyError> {
+    #[cfg(test)]
+    if description == "text frame write"
+        && FAIL_NEXT_DOWNSTREAM_TERMINAL_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ProxyError::ForwardFailed(
+            "downstream WebSocket text frame write failed: injected terminal relay failure"
+                .to_string(),
+        ));
+    }
     let send = downstream.send(message);
     tokio::pin!(send);
     loop {
@@ -1949,8 +1966,8 @@ async fn send_downstream_message(
         }
     }
 }
-async fn finish_fallback_transform_error(accounting: WebSocketTurnAccounting, error: &ProxyError) {
-    accounting.finish_neutral_failure(error.to_string()).await;
+async fn finish_fallback_transform_error(accounting: WebSocketTurnAccounting, _error: &ProxyError) {
+    accounting.finish_neutral_attempt().await;
 }
 
 async fn finish_downstream_write_failure(
@@ -2000,6 +2017,9 @@ static FAIL_NEXT_REUSED_TURN_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static FAIL_NEXT_RELAY_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_NEXT_DOWNSTREAM_TERMINAL_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static FAIL_NEXT_MEDIA_RETRY_WRITE: std::sync::atomic::AtomicBool =
@@ -2921,11 +2941,15 @@ mod tests {
         let server = ProxyServer::new(ProxyConfig::default(), db, None);
         let router = server.provider_router_for_tests();
 
-        finish_fallback_transform_error(
-            accounting_for_tests(&server, &provider),
-            &ProxyError::InvalidRequest("namespace collision".to_string()),
-        )
-        .await;
+        server.state_for_tests().status.write().await.total_requests = 1;
+
+        for message in ["namespace collision", "tool collision"] {
+            finish_fallback_transform_error(
+                accounting_for_tests(&server, &provider),
+                &ProxyError::InvalidRequest(message.to_string()),
+            )
+            .await;
+        }
 
         let stats = router
             .get_circuit_breaker_stats(&provider.id, "codex")
@@ -2936,6 +2960,17 @@ mod tests {
                     |stats| stats.state == crate::proxy::circuit_breaker::CircuitState::Closed
                 )
         );
+
+        let state = server.state_for_tests();
+        assert_eq!(
+            state.status.read().await.failed_requests,
+            0,
+            "fallback transform attempts must not update request-level failure counters"
+        );
+        record_websocket_status_failure(&state, "fallbacks exhausted".to_string()).await;
+        let status = state.status.read().await;
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.failed_requests, 1);
     }
 
     #[tokio::test]
@@ -6376,6 +6411,99 @@ mod tests {
             .expect("stop proxy");
         upstream_task.await.expect("terminal upstream task");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn terminal_usage_is_logged_when_downstream_relay_fails() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (send_tx, send_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            let _ = request_tx.send(());
+            let _ = send_rx.await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-relay-failed-usage",
+                            "model": "upstream-model",
+                            "usage": {"input_tokens": 4, "output_tokens": 2}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        request_rx.await.expect("upstream request signal");
+
+        FAIL_NEXT_DOWNSTREAM_TERMINAL_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = send_tx.send(());
+
+        let usage = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let usage = db
+                    .conn
+                    .lock()
+                    .expect("lock usage database")
+                    .query_row(
+                        "SELECT status_code, input_tokens, output_tokens FROM proxy_request_logs WHERE provider_id = 'ws-provider' AND app_type = 'codex'",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                    )
+                    .ok();
+                if let Some(usage) = usage {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        drop(client);
+        server.stop().await.expect("stop proxy");
+        upstream_task.await.expect("terminal upstream task");
+
+        assert_eq!(
+            usage.expect("timed out waiting for usage after downstream relay failure"),
+            (200, 4, 2)
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn proxy_stop_interrupts_stalled_upstream_websocket_write() {
