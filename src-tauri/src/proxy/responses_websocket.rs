@@ -379,6 +379,8 @@ async fn finalize_later_turn_provider_exhaustion(
 ) -> ProxyError {
     if provider_attempts > 0 {
         record_websocket_status_failure(state, error.to_string()).await;
+    } else {
+        record_rejected_later_turn_failure(state, error.to_string()).await;
     }
     error
 }
@@ -640,12 +642,26 @@ async fn handle_connection_inner(
         send_proxy_shutdown_close(downstream).await;
         return Ok(());
     };
+    let mut original_response_create = first_text;
+    let initial_allows_provider_fallback =
+        !response_create_has_provider_cursor(&original_response_create);
     let mut turn_providers = turn_context.get_providers();
     let mut provider_index = turn_providers
         .iter()
         .position(|candidate| candidate.id == turn_context.provider.id)
         .unwrap_or(0);
     let selected_provider_id = turn_context.provider.id.clone();
+    if !initial_allows_provider_fallback
+        && turn_providers
+            .get(provider_index)
+            .is_some_and(|provider| !codex_provider_supports_responses_websocket(provider))
+    {
+        let message =
+            "selected Codex provider does not support native Responses WebSocket; reconnect without provider cursor"
+                .to_string();
+        record_rejected_later_turn_failure(state, message.clone()).await;
+        return Err(ProxyError::ConfigError(message));
+    }
     while provider_index < turn_providers.len()
         && !codex_provider_supports_responses_websocket(&turn_providers[provider_index])
     {
@@ -659,9 +675,6 @@ async fn handle_connection_inner(
     })?;
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
     let mut provider_attempts = 0_usize;
-    let mut original_response_create = first_text;
-    let initial_allows_provider_fallback =
-        !response_create_has_provider_cursor(&original_response_create);
 
     let mut count_request = true;
     let mut upstream_proxy_url = super::http_client::get_current_proxy_url();
@@ -1600,6 +1613,13 @@ async fn handle_connection_inner(
                     UpstreamMessage::Text(text) if !websocket_text_is_responses_event(&text) => {
                         websocket_transport_failure_event(
                             "upstream WebSocket sent an invalid Responses event".to_string(),
+                        )
+                    }
+                    UpstreamMessage::Binary(_)
+                        if response_in_flight && !relayed_response_event =>
+                    {
+                        websocket_transport_failure_event(
+                            "upstream WebSocket sent a binary Responses event".to_string(),
                         )
                     }
                     message => message,
@@ -2569,7 +2589,7 @@ fn websocket_terminal_outcome(text: &str) -> WebSocketTerminalOutcome {
 }
 
 fn websocket_event_is_client_error(text: &str) -> bool {
-    const NON_RETRYABLE_STATUSES: &[u16] = &[400, 405, 406, 413, 414, 415, 422, 501];
+    const NON_RETRYABLE_STATUSES: &[u16] = &[400, 405, 406, 413, 414, 415, 422];
     const CLIENT_ERROR_MARKERS: &[&str] = &[
         "invalid_request_error",
         "invalid_request",
@@ -3277,6 +3297,40 @@ mod tests {
         assert!(websocket_text_is_responses_event(
             &json!({"type": "response.completed"}).to_string()
         ));
+    }
+
+    #[test]
+    fn status_501_terminal_event_is_a_provider_failure() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"status_code": 501, "message": "not implemented"}
+            }
+        })
+        .to_string();
+        assert_eq!(
+            websocket_terminal_outcome(&event),
+            WebSocketTerminalOutcome::ProviderFailure
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_attempt_later_turn_exhaustion_counts_rejected_request() {
+        let db = Arc::new(Database::memory().unwrap());
+        let server = ProxyServer::new(ProxyConfig::default(), db, None);
+        let state = server.state_for_tests();
+
+        let error =
+            finalize_later_turn_provider_exhaustion(&state, ProxyError::NoAvailableProvider, 0)
+                .await;
+        let status = state.status.read().await;
+
+        assert!(matches!(error, ProxyError::NoAvailableProvider));
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+        assert!(status.last_request_at.is_some());
+        assert!(status.last_error.is_some());
     }
 
     #[test]
@@ -5801,6 +5855,91 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn initial_cursor_does_not_skip_selected_non_websocket_provider() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let used = match tokio::time::timeout(
+                Duration::from_secs(2),
+                fallback_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-crossed-capability-boundary","output":[]}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            };
+            let _ = fallback_tx.send(used);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut selected = non_websocket_provider_with_id(
+            "chat-selected-cursor",
+            "http://127.0.0.1:1".to_string(),
+        );
+        selected.sort_index = Some(0);
+        let mut fallback = websocket_provider_with_id(
+            "ws-capable-cursor-fallback",
+            format!("http://{fallback_addr}"),
+        );
+        fallback.sort_index = Some(1);
+        for provider in [&selected, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &selected.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-selected-provider")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let fallback_used = fallback_rx.await.unwrap();
+        let status = server.get_status().await;
+
+        assert_eq!(terminal["type"], "error", "{terminal}");
+        assert!(
+            !fallback_used,
+            "cursor request skipped the selected provider"
+        );
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+
+        drop(client);
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn initial_chain_skips_non_websocket_provider_after_open_breaker() {
         let fallback_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -7925,6 +8064,79 @@ mod tests {
 
         drop(client);
         closing_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upstream_binary_before_relay_retries_fallback() {
+        let binary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let binary_addr = binary_listener.local_addr().unwrap();
+        let binary_task = tokio::spawn(async move {
+            let (stream, _) = binary_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Binary(vec![0x01, 0x02, 0x03]))
+                .await
+                .unwrap();
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-binary-fallback","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut binary = websocket_provider_with_id("ws-binary", format!("http://{binary_addr}"));
+        binary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-binary-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&binary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &binary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("upstream binary frame must not be relayed");
+        assert_eq!(response["response"]["id"], "resp-binary-fallback");
+
+        drop(client);
+        binary_task.await.unwrap();
         fallback_task.await.unwrap();
         server.stop().await.unwrap();
     }
