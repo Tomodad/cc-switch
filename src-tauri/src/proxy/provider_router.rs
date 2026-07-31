@@ -40,6 +40,7 @@ struct ProviderResultPersistence {
     app_type: String,
     success: bool,
     error_msg: Option<String>,
+    failure_threshold: u32,
     completion: Option<oneshot::Sender<Result<(), AppError>>>,
 }
 
@@ -56,6 +57,7 @@ impl ProviderRouter {
                     app_type,
                     success,
                     error_msg,
+                    failure_threshold,
                     completion,
                 } = result;
                 let job_db = persistence_db.clone();
@@ -63,11 +65,6 @@ impl ProviderRouter {
                 let job_app_type = app_type.clone();
                 let persisted = tokio::task::spawn_blocking(move || {
                     futures::executor::block_on(async move {
-                        let failure_threshold = job_db
-                            .get_proxy_config_for_app(&job_app_type)
-                            .await
-                            .map(|config| config.circuit_failure_threshold)
-                            .unwrap_or(5);
                         job_db
                             .update_provider_health_with_threshold(
                                 &job_provider_id,
@@ -238,7 +235,8 @@ impl ProviderRouter {
     ) -> Result<(), AppError> {
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
-        self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
+        let failure_threshold = self
+            .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
         #[cfg(test)]
         {
@@ -255,6 +253,7 @@ impl ProviderRouter {
             app_type,
             success,
             error_msg,
+            failure_threshold,
             Some(completion_tx),
         )?;
         #[cfg(test)]
@@ -276,10 +275,17 @@ impl ProviderRouter {
     ) -> Result<(), AppError> {
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
-        self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
+        let failure_threshold = self
+            .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
-        let result =
-            self.enqueue_result_persistence(provider_id, app_type, success, error_msg, None);
+        let result = self.enqueue_result_persistence(
+            provider_id,
+            app_type,
+            success,
+            error_msg,
+            failure_threshold,
+            None,
+        );
         drop(ordering_guard);
         result
     }
@@ -290,13 +296,13 @@ impl ProviderRouter {
         app_type: &str,
         used_half_open_permit: bool,
         success: bool,
-    ) {
+    ) -> u32 {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         if success {
-            breaker.record_success(used_half_open_permit).await;
+            breaker.record_success(used_half_open_permit).await
         } else {
-            breaker.record_failure(used_half_open_permit).await;
+            breaker.record_failure(used_half_open_permit).await
         }
     }
 
@@ -306,6 +312,7 @@ impl ProviderRouter {
         app_type: &str,
         success: bool,
         error_msg: Option<String>,
+        failure_threshold: u32,
         completion: Option<oneshot::Sender<Result<(), AppError>>>,
     ) -> Result<(), AppError> {
         self.result_persistence_tx
@@ -314,6 +321,7 @@ impl ProviderRouter {
                 app_type: app_type.to_string(),
                 success,
                 error_msg,
+                failure_threshold,
                 completion,
             })
             .map_err(|_| {
@@ -760,5 +768,75 @@ mod tests {
         );
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.last_error.as_deref(), Some("later failure"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn queued_result_uses_the_breaker_threshold_from_result_time() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "threshold-provider".to_string(),
+            "Threshold Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(config.clone())
+            .await
+            .unwrap();
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+
+        RESULT_PAUSED_BEFORE_ENQUEUE.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_RESULT_ENQUEUE.store(false, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_RESULT_BEFORE_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result_router = router.clone();
+        let result = tokio::spawn(async move {
+            result_router
+                .record_result(
+                    "threshold-provider",
+                    "codex",
+                    false,
+                    false,
+                    Some("threshold-one failure".to_string()),
+                )
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !RESULT_PAUSED_BEFORE_ENQUEUE.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("result did not pause before persistence enqueue");
+
+        let stats = router
+            .get_circuit_breaker_stats("threshold-provider", "codex")
+            .await
+            .expect("breaker stats");
+        assert_eq!(
+            stats.state,
+            crate::proxy::circuit_breaker::CircuitState::Open
+        );
+
+        config.circuit_failure_threshold = 5;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        RELEASE_RESULT_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
+        result.await.unwrap();
+
+        let health = db
+            .get_provider_health("threshold-provider", "codex")
+            .await
+            .unwrap();
+        assert!(
+            !health.is_healthy,
+            "persistence re-evaluated the result with the later threshold"
+        );
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_error.as_deref(), Some("threshold-one failure"));
     }
 }

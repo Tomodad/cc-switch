@@ -200,9 +200,10 @@ impl CircuitBreaker {
     }
 
     /// 记录成功
-    pub async fn record_success(&self, used_half_open_permit: bool) {
+    pub async fn record_success(&self, used_half_open_permit: bool) -> u32 {
         let state = *self.state.read().await;
         let config = self.config.read().await;
+        let failure_threshold = config.failure_threshold;
 
         if used_half_open_permit {
             self.release_half_open_permit();
@@ -224,12 +225,14 @@ impl CircuitBreaker {
                 self.transition_to_closed().await;
             }
         }
+        failure_threshold
     }
 
     /// 记录失败
-    pub async fn record_failure(&self, used_half_open_permit: bool) {
+    pub async fn record_failure(&self, used_half_open_permit: bool) -> u32 {
         let state = *self.state.read().await;
         let config = self.config.read().await;
+        let failure_threshold = config.failure_threshold;
 
         if used_half_open_permit {
             self.release_half_open_permit();
@@ -285,6 +288,7 @@ impl CircuitBreaker {
             }
             _ => {}
         }
+        failure_threshold
     }
 
     /// 获取当前状态

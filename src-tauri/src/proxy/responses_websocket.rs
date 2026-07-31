@@ -338,6 +338,15 @@ async fn record_websocket_status_failure(state: &ProxyState, message: String) {
     update_proxy_success_rate(&mut status);
 }
 
+async fn record_rejected_later_turn_failure(state: &ProxyState, message: String) {
+    let mut status = state.status.write().await;
+    status.total_requests = status.total_requests.saturating_add(1);
+    status.failed_requests = status.failed_requests.saturating_add(1);
+    status.last_request_at = Some(chrono::Utc::now().to_rfc3339());
+    status.last_error = Some(message);
+    update_proxy_success_rate(&mut status);
+}
+
 async fn finalize_later_turn_provider_exhaustion(
     state: &ProxyState,
     error: ProxyError,
@@ -1071,7 +1080,18 @@ async fn handle_connection_inner(
                                             }
                                         }
                                         Err(ProxyError::NoAvailableProvider)
-                                            if next_ctx.app_config.auto_failover_enabled => {}
+                                            if next_ctx.app_config.auto_failover_enabled =>
+                                        {
+                                            if response_create_has_provider_cursor(&text) {
+                                                let error = ProxyError::NoAvailableProvider;
+                                                record_rejected_later_turn_failure(
+                                                    state,
+                                                    error.to_string(),
+                                                )
+                                                .await;
+                                                return Err(error);
+                                            }
+                                        }
                                         Err(error) => return Err(error),
                                     }
                                 }
@@ -5751,7 +5771,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn later_turn_half_open_permit_denial_reconnects_to_fallback() {
+    async fn later_turn_cursor_permit_denial_does_not_reconnect_to_fallback() {
         let primary_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind primary upstream");
@@ -5775,22 +5795,19 @@ mod tests {
             .await
             .expect("bind fallback upstream");
         let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_check_tx, fallback_check_rx) = oneshot::channel();
         let fallback_task = tokio::spawn(async move {
-            let accepted = tokio::time::timeout(Duration::from_secs(2), fallback_listener.accept())
-                .await
-                .expect("fallback was not connected");
-            let (stream, _) = accepted.expect("accept fallback");
+            let _ = fallback_check_rx.await;
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), fallback_listener.accept()).await;
+            let Ok(Ok((stream, _))) = accepted else {
+                return false;
+            };
             let mut websocket = tokio_tungstenite::accept_async(stream)
                 .await
                 .expect("accept fallback websocket");
             let _ = next_text(&mut websocket).await;
-            websocket
-                .send(UpstreamMessage::Text(
-                    json!({"type":"response.completed","response":{"id":"resp-later-fallback","output":[]}})
-                        .to_string(),
-                ))
-                .await
-                .expect("send later-turn fallback completion");
+            true
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
@@ -5871,6 +5888,7 @@ mod tests {
         let held_permit = router.allow_provider_request(&primary.id, "codex").await;
         assert!(held_permit.allowed && held_permit.used_half_open_permit);
 
+        let _ = fallback_check_tx.send(());
         client
             .send(UpstreamMessage::Text(
                 response_create("local-model", Some("resp-primary")).to_string(),
@@ -5878,16 +5896,22 @@ mod tests {
             .await
             .expect("send second turn");
         let second: Value = serde_json::from_str(&next_text(&mut client).await)
-            .expect("later-turn fallback completion JSON");
-        assert_eq!(second["type"], "response.completed");
-        assert_eq!(second["response"]["id"], "resp-later-fallback");
+            .expect("later-turn affinity error JSON");
+        let fallback_connected = fallback_task.await.expect("fallback task");
+        let status = server.get_status().await;
+        assert_eq!(second["type"], "error", "{second}");
+        assert!(
+            !fallback_connected,
+            "provider cursor was replayed on fallback"
+        );
+        assert_eq!(status.total_requests, 2);
+        assert_eq!(status.failed_requests, 1);
 
         router
             .release_permit_neutral(&primary.id, "codex", held_permit.used_half_open_permit)
             .await;
         drop(client);
         primary_task.await.expect("primary upstream task");
-        fallback_task.await.expect("fallback upstream task");
         server.stop().await.expect("stop proxy");
     }
 
@@ -7194,7 +7218,7 @@ mod tests {
     }
     #[tokio::test]
     #[serial]
-    async fn later_turn_reconnect_failure_retries_remaining_websocket_provider() {
+    async fn later_turn_without_cursor_retries_remaining_websocket_provider() {
         let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary_listener.local_addr().unwrap();
         let primary_task = tokio::spawn(async move {
@@ -7305,7 +7329,7 @@ mod tests {
         assert!(held_permit.allowed && held_permit.used_half_open_permit);
         client
             .send(UpstreamMessage::Text(
-                response_create("local-model", Some("resp-primary")).to_string(),
+                response_create("local-model", None).to_string(),
             ))
             .await
             .unwrap();
@@ -8292,7 +8316,7 @@ mod tests {
 
         client
             .send(UpstreamMessage::Text(
-                response_create("local-model", Some("resp-deadline-primary")).to_string(),
+                response_create("local-model", None).to_string(),
             ))
             .await
             .unwrap();
