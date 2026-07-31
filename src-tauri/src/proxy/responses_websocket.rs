@@ -478,6 +478,7 @@ async fn handle_connection_inner(
         .iter()
         .position(|candidate| candidate.id == turn_context.provider.id)
         .unwrap_or(0);
+    let selected_provider_id = turn_context.provider.id.clone();
     while provider_index < turn_providers.len()
         && !codex_provider_supports_responses_websocket(&turn_providers[provider_index])
     {
@@ -489,7 +490,6 @@ async fn handle_connection_inner(
                 .to_string(),
         )
     })?;
-    let selected_provider_id = provider.id.clone();
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
     let mut provider_attempts = 0_usize;
     let mut original_response_create = first_text;
@@ -785,7 +785,7 @@ async fn handle_connection_inner(
                                 ));
                             }
                             let next_turn_providers = next_ctx.get_providers();
-                            if next_ctx.current_provider_id == provider.id {
+                            if next_ctx.provider.id == provider.id {
                                 retain_fallback_provider = false;
                             }
                             let retained_index = retain_fallback_provider.then(|| {
@@ -1075,8 +1075,7 @@ async fn handle_connection_inner(
                                 upstream_proxy_url = current_proxy_url;
                                 upstream = next_upstream;
                             }
-                            retain_fallback_provider =
-                                provider.id != next_ctx.current_provider_id;
+                            retain_fallback_provider = provider.id != next_ctx.provider.id;
                             timeout_config = next_timeout_config;
                             turn_accounting = Some(next_accounting);
                             turn_context = next_ctx;
@@ -1328,6 +1327,8 @@ async fn handle_connection_inner(
                             let event = serde_json::from_str::<Value>(&text).ok();
                             (outcome, status_code, event)
                         });
+                        let mut media_retry_write_failure = None;
+                        let mut terminal_usage_already_logged = false;
                         if terminal
                             && !relayed_response_event
                             && !media_rectifier_retried
@@ -1367,6 +1368,7 @@ async fn handle_connection_inner(
                                         turn_started.elapsed().as_millis() as u64,
                                         first_token_ms,
                                     );
+                                    terminal_usage_already_logged = true;
                                 }
                                 if retry_event.get("response").is_some() {
                                     retry_event["response"] = retry_body;
@@ -1374,8 +1376,9 @@ async fn handle_connection_inner(
                                     retry_body["type"] = Value::String("response.create".to_string());
                                     retry_event = retry_body;
                                 }
+                                original_response_create = retry_event.to_string();
                                 let (retry_text, retry_state) = transform_client_text(
-                                    &retry_event.to_string(),
+                                    &original_response_create,
                                     &provider,
                                     &turn_context.rectifier_config,
                                     true,
@@ -1387,44 +1390,68 @@ async fn handle_connection_inner(
                                 let retry_deadline = websocket_turn_timeout_deadline(
                                     true, false, retry_started, retry_started, timeout_config,
                                 );
-                                if send_upstream_message(
+                                match send_upstream_message(
                                     &mut upstream,
                                     UpstreamMessage::Text(retry_text),
                                     retry_deadline,
                                     &mut shutdown_rx,
                                     "media fallback event write",
                                 )
-                                .await?
-                                    == WebSocketSendOutcome::Shutdown
+                                .await
                                 {
-                                    finish_websocket_shutdown(downstream, &mut turn_accounting).await;
-                                    return Ok(());
+                                    Ok(WebSocketSendOutcome::Sent) => {
+                                        turn_state = retry_state;
+                                        media_rectifier_retried = true;
+                                        received_response_event = false;
+                                        relayed_response_event = false;
+                                        turn_started = retry_started;
+                                        first_token_ms = None;
+                                        last_response_event_at = retry_started;
+                                        continue;
+                                    }
+                                    Ok(WebSocketSendOutcome::Shutdown) => {
+                                        finish_websocket_shutdown(
+                                            downstream,
+                                            &mut turn_accounting,
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                    Err(error) => {
+                                        let failure_message = error.to_string();
+                                        if let Some(accounting) = turn_accounting.take() {
+                                            accounting
+                                                .finish_provider_attempt_failure(
+                                                    failure_message.clone(),
+                                                )
+                                                .await;
+                                        }
+                                        media_retry_write_failure = Some(failure_message);
+                                    }
                                 }
-                                turn_state = retry_state;
-                                media_rectifier_retried = true;
-                                received_response_event = false;
-                                relayed_response_event = false;
-                                turn_started = retry_started;
-                                first_token_ms = None;
-                                last_response_event_at = retry_started;
-                                continue;
                             }
                         }
-                        if terminal_data.as_ref().is_some_and(|(outcome, _, _)| {
-                            *outcome == WebSocketTerminalOutcome::ProviderFailure
-                        }) && !relayed_response_event
+                        if (media_retry_write_failure.is_some()
+                            || terminal_data.as_ref().is_some_and(|(outcome, _, _)| {
+                                *outcome == WebSocketTerminalOutcome::ProviderFailure
+                            }))
+                            && !relayed_response_event
                         {
-                            let failure_message = format!(
-                                "upstream WebSocket terminal event: {}",
-                                websocket_event_type(&text)
-                                    .as_deref()
-                                    .unwrap_or("provider failure")
-                            );
-                            let mut failed_usage = terminal_data
-                                .as_ref()
-                                .and_then(|(_, status_code, event)| {
+                            let failure_message = media_retry_write_failure.take().unwrap_or_else(|| {
+                                format!(
+                                    "upstream WebSocket terminal event: {}",
+                                    websocket_event_type(&text)
+                                        .as_deref()
+                                        .unwrap_or("provider failure")
+                                )
+                            });
+                            let mut failed_usage = if terminal_usage_already_logged {
+                                None
+                            } else {
+                                terminal_data.as_ref().and_then(|(_, status_code, event)| {
                                     event.clone().map(|event| (*status_code, event))
-                                });
+                                })
+                            };
                             if let Some(accounting) = turn_accounting.take() {
                                 accounting
                                     .finish_provider_attempt_failure(failure_message.clone())
@@ -1573,8 +1600,7 @@ async fn handle_connection_inner(
                                     );
                                 }
                                 provider = candidate;
-                                retain_fallback_provider =
-                                    provider.id != turn_context.current_provider_id;
+                                retain_fallback_provider = provider.id != turn_context.provider.id;
                                 upstream_proxy_url = retry_proxy_url;
                                 upstream = retry_upstream;
                                 turn_state = retry_state;
@@ -1970,6 +1996,9 @@ static FAIL_NEXT_REUSED_TURN_WRITE: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static FAIL_NEXT_RELAY_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_NEXT_MEDIA_RETRY_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 async fn send_upstream_turn_message(
     upstream: &mut UpstreamSocket,
     message: UpstreamMessage,
@@ -2010,6 +2039,15 @@ async fn send_upstream_message(
     {
         return Err(ProxyError::ForwardFailed(
             "upstream WebSocket ping frame write failed: injected relay failure".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    if description == "media fallback event write"
+        && FAIL_NEXT_MEDIA_RETRY_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ProxyError::ForwardFailed(
+            "upstream WebSocket media fallback event write failed: injected stale socket"
+                .to_string(),
         ));
     }
 
@@ -3760,6 +3798,159 @@ mod tests {
         upstream_task.await.expect("reactive media upstream task");
         server.stop().await.expect("stop proxy");
     }
+    #[tokio::test]
+    #[serial]
+    async fn media_retry_write_failure_uses_next_provider_after_sync_accounting() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary media upstream");
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.expect("accept primary");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept primary websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type":"response.failed",
+                        "response":{
+                            "id":"resp-media-write-failed",
+                            "model":"primary-model",
+                            "error":{
+                                "status":400,
+                                "type":"invalid_request_error",
+                                "message":"image inputs are not supported"
+                            },
+                            "usage":{"input_tokens":5,"output_tokens":1}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send unsupported-image failure");
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback media upstream");
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_received_tx, fallback_received_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.expect("accept fallback");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept fallback websocket");
+            let retry = next_text(&mut websocket).await;
+            let _ = fallback_received_tx.send(retry);
+            let _ = release_rx.await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-media-fallback","model":"fallback-model","output":[],"usage":{"input_tokens":7,"output_tokens":3}}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send fallback completion");
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let db_for_assert = db.clone();
+        let mut primary =
+            websocket_provider_with_id("ws-media-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-media-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).expect("save provider");
+            db.add_to_failover_queue("codex", &provider.id)
+                .expect("queue provider");
+        }
+        db.set_current_provider("codex", &primary.id)
+            .expect("select primary provider");
+        let mut app_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("load codex proxy config");
+        app_config.auto_failover_enabled = true;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config)
+            .await
+            .expect("enable failover");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        FAIL_NEXT_MEDIA_RETRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"local-model",
+                    "input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send image turn");
+
+        let retry = tokio::time::timeout(Duration::from_secs(2), fallback_received_rx)
+            .await
+            .expect("media retry did not reach fallback")
+            .expect("fallback retry sender dropped");
+        let retry: Value = serde_json::from_str(&retry).expect("fallback retry JSON");
+        assert_eq!(retry["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            retry["input"][0]["content"][0]["text"],
+            crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+        );
+        let stats = router
+            .get_circuit_breaker_stats(&primary.id, "codex")
+            .await
+            .expect("primary breaker finalized before fallback replay");
+        assert_eq!(
+            stats.state,
+            crate::proxy::circuit_breaker::CircuitState::Open
+        );
+        let _ = release_tx.send(());
+        let terminal: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("fallback completion JSON");
+        assert_eq!(terminal["response"]["id"], "resp-media-fallback");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rows = {
+            let conn = db_for_assert.conn.lock().expect("lock database");
+            let mut statement = conn
+                .prepare("SELECT status_code FROM proxy_request_logs WHERE provider_id IN ('ws-media-primary', 'ws-media-fallback') AND app_type = 'codex'")
+                .expect("prepare usage query");
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query usage rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect usage rows")
+        };
+        assert_eq!(rows.len(), 2, "media failure usage must not be duplicated");
+        assert!(rows.contains(&400));
+        assert!(rows.contains(&200));
+
+        drop(client);
+        primary_task.await.expect("primary media upstream task");
+        fallback_task.await.expect("fallback media upstream task");
+        server.stop().await.expect("stop proxy");
+    }
 
     #[tokio::test]
     #[serial]
@@ -5244,6 +5435,14 @@ mod tests {
                 ))
                 .await
                 .expect("send fallback completion");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-capable-fallback-second","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send second fallback completion");
         });
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
@@ -5307,6 +5506,16 @@ mod tests {
             serde_json::from_str(&next_text(&mut client).await).expect("fallback completion JSON");
         assert_eq!(terminal["type"], "response.completed");
         assert_eq!(terminal["response"]["id"], "resp-capable-fallback");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send second response.create");
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("second fallback completion JSON");
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(terminal["response"]["id"], "resp-capable-fallback-second");
 
         drop(client);
         fallback_task.await.expect("fallback upstream task");
