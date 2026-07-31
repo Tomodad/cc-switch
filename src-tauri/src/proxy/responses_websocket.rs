@@ -199,7 +199,7 @@ impl WebSocketTurnAccounting {
         if let Err(error) = self
             .state
             .provider_router
-            .record_result(
+            .record_result_detached(
                 &self.provider_id,
                 "codex",
                 self.used_half_open_permit,
@@ -1733,7 +1733,7 @@ async fn premature_upstream_close_error(
 ) -> ProxyError {
     if let Some(accounting) = turn_accounting.take() {
         accounting
-            .finish_provider_failure(message.to_string())
+            .finish_provider_failure_detached(message.to_string())
             .await;
     }
     ProxyError::ForwardFailed(format!("{message}; falling back to HTTP/SSE"))
@@ -2464,7 +2464,7 @@ async fn connect_upstream_websocket(
         ..Default::default()
     };
     let connector = (target_url.scheme() == "wss")
-        .then(|| Connector::Rustls(super::hyper_client::build_tls_client_config()));
+        .then(|| Connector::Rustls(super::hyper_client::global_tls_client_config()));
     let (socket, _) =
         client_async_tls_with_config(request, stream, Some(websocket_config), connector)
             .await
@@ -5436,6 +5436,124 @@ mod tests {
         server.stop().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn initial_handshake_failure_does_not_block_fallback_on_health_persistence() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let (handshake_started_tx, handshake_started_rx) = oneshot::channel();
+        let (fail_handshake_tx, fail_handshake_rx) = oneshot::channel();
+        let primary_task = tokio::spawn(async move {
+            let (mut stream, _) = primary_listener.accept().await.unwrap();
+            let _ = handshake_started_tx.send(());
+            let _ = fail_handshake_rx.await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let mut fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-detached-handshake-fallback","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut primary = websocket_provider_with_id(
+            "ws-detached-handshake-primary",
+            format!("http://{primary_addr}"),
+        );
+        primary.sort_index = Some(0);
+        let mut fallback = websocket_provider_with_id(
+            "ws-detached-handshake-fallback",
+            format!("http://{fallback_addr}"),
+        );
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        handshake_started_rx.await.unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_db = db.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = locked_db.conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let _ = fail_handshake_tx.send(());
+
+        let accepted_result = tokio::time::timeout(Duration::from_millis(750), accepted_rx).await;
+        let _ = release_tx.send(());
+        lock_thread.join().unwrap();
+
+        if accepted_result.is_err() {
+            drop(client);
+            if tokio::time::timeout(Duration::from_secs(2), &mut fallback_task)
+                .await
+                .is_err()
+            {
+                fallback_task.abort();
+                let _ = fallback_task.await;
+            }
+            primary_task.await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
+            panic!("provider health persistence blocked WebSocket fallback");
+        }
+
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(
+            terminal["response"]["id"],
+            "resp-detached-handshake-fallback"
+        );
+
+        drop(client);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn provider_cursor_turn_does_not_replay_on_fallback() {
@@ -7214,6 +7332,78 @@ mod tests {
             .expect("relayed provider failure blocked shutdown")
             .unwrap();
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn partial_response_clean_close_does_not_block_shutdown_on_health_persistence() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (created_tx, created_rx) = oneshot::channel();
+        let (close_tx, close_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.created","response":{"id":"resp-partial-clean-close"}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = created_tx.send(());
+            let _ = close_rx.await;
+            websocket.close(None).await.unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".into(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(created["type"], "response.created");
+        created_rx.await.unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_db = db.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = locked_db.conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let _ = close_tx.send(());
+        upstream_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(client);
+
+        let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
+        let _ = release_tx.send(());
+        lock_thread.join().unwrap();
+        stop_result
+            .expect("partial-response clean close blocked shutdown")
+            .unwrap();
     }
 
     #[tokio::test]

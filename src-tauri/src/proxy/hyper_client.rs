@@ -577,10 +577,21 @@ pub(crate) async fn connect_via_proxy(
 /// keychain are trusted through the CONNECT tunnel.
 fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| tokio_rustls::TlsConnector::from(build_tls_client_config()))
+    CONNECTOR.get_or_init(|| tokio_rustls::TlsConnector::from(global_tls_client_config()))
 }
 
-pub(super) fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
+pub(super) fn global_tls_client_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    cached_tls_client_config(&CONFIG)
+}
+
+fn cached_tls_client_config(
+    cache: &OnceLock<Arc<rustls::ClientConfig>>,
+) -> Arc<rustls::ClientConfig> {
+    cache.get_or_init(build_tls_client_config).clone()
+}
+
+fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut root_store = rustls::RootCertStore::empty();
     // Baseline: Mozilla/webpki roots
@@ -793,6 +804,15 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[test]
+    fn tls_client_config_is_cached() {
+        let cache = OnceLock::new();
+        let first = cached_tls_client_config(&cache);
+        let second = cached_tls_client_config(&cache);
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]
