@@ -1628,6 +1628,13 @@ async fn handle_connection_inner(
 
                 match upstream_message {
                     UpstreamMessage::Text(text) => {
+                        if !response_in_flight {
+                            let event_type = websocket_event_type(&text)
+                                .unwrap_or_else(|| "Responses event".to_string());
+                            return Err(ProxyError::ForwardFailed(format!(
+                                "upstream WebSocket sent {event_type} while no response was in flight"
+                            )));
+                        }
                         received_response_event = true;
                         last_response_event_at = Instant::now();
                         let terminal = websocket_event_is_terminal(&text);
@@ -7419,6 +7426,89 @@ mod tests {
 
         drop(client);
         upstream_task.await.expect("TLS upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejects_duplicate_terminal_event_between_turns() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-terminal","output":[]}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send terminal response");
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-terminal-duplicate","output":[]}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("send duplicate terminal response");
+            let _ = tokio::time::timeout(Duration::from_secs(1), websocket.next()).await;
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+
+        let first: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("first completion JSON");
+        assert_eq!(first["type"], "response.completed");
+        let second = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("proxy did not reject the duplicate terminal event")
+            .expect("proxy closed without an error event")
+            .expect("websocket read failed");
+        let UpstreamMessage::Text(second) = second else {
+            panic!("expected proxy error event, got {second:?}");
+        };
+        let second: Value = serde_json::from_str(&second).expect("proxy error JSON");
+        assert_eq!(second["type"], "error");
+        assert!(second["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no response was in flight")));
+
+        drop(client);
+        upstream_task.await.expect("upstream task");
         server.stop().await.expect("stop proxy");
     }
 

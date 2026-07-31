@@ -36,6 +36,7 @@ static RELEASE_RESULT_PERSISTENCE: std::sync::atomic::AtomicBool =
 const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 256;
 #[cfg(test)]
 const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 8;
+const DETACHED_RESULT_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -375,16 +376,28 @@ impl ProviderRouter {
         let failure_threshold = self
             .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
-        let result = self
-            .enqueue_result_persistence(
+        let result = match tokio::time::timeout(
+            DETACHED_RESULT_ENQUEUE_TIMEOUT,
+            self.enqueue_result_persistence(
                 provider_id,
                 app_type,
                 success,
                 error_msg,
                 failure_threshold,
                 None,
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "[{app_type}] Provider result persistence queue remained full for {} ms; skipping detached persistence for provider {provider_id}",
+                    DETACHED_RESULT_ENQUEUE_TIMEOUT.as_millis()
+                );
+                Ok(())
+            }
+        };
         drop(ordering_guard);
         drop(enqueue_guard);
         result
@@ -1064,7 +1077,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn detached_result_persistence_applies_backpressure_when_queue_is_full() {
+    async fn detached_result_persistence_does_not_block_when_queue_is_full() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
         let router = Arc::new(ProviderRouter::new(db));
@@ -1085,41 +1098,37 @@ mod tests {
         .await
         .expect("persistence worker did not pause");
 
-        let mut queued = Vec::new();
-        for index in 0..=PROVIDER_RESULT_PERSISTENCE_CAPACITY {
-            let queued_router = router.clone();
-            queued.push(tokio::spawn(async move {
-                queued_router
-                    .record_result_detached(
-                        &format!("queued-provider-{index}"),
-                        "codex",
-                        false,
-                        true,
-                        None,
-                    )
-                    .await
-                    .unwrap();
-            }));
+        for index in 0..PROVIDER_RESULT_PERSISTENCE_CAPACITY {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                router.record_result_detached(
+                    &format!("queued-provider-{index}"),
+                    "codex",
+                    false,
+                    true,
+                    None,
+                ),
+            )
+            .await
+            .expect("queue did not accept its bounded capacity")
+            .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while queued.iter().filter(|task| task.is_finished()).count()
-                < PROVIDER_RESULT_PERSISTENCE_CAPACITY
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            router.record_result_detached(
+                "overflow-provider",
+                "codex",
+                false,
+                false,
+                Some("queue saturated".to_string()),
+            ),
+        )
         .await
-        .expect("queue did not accept its bounded capacity");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            queued.iter().any(|task| !task.is_finished()),
-            "detached result queue accepted unbounded work without backpressure"
-        );
+        .expect("detached accounting blocked on a saturated persistence queue")
+        .unwrap();
 
         RELEASE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
-        for task in queued {
-            task.await.unwrap();
-        }
         router
             .clear_all_provider_health()
             .await

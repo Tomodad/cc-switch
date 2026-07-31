@@ -211,13 +211,13 @@ pub fn get_current_proxy_url() -> Option<String> {
 /// WebSocket transport uses a raw TCP/TLS connection instead of reqwest, so
 /// it must apply the same environment proxy and NO_PROXY policy explicitly.
 pub(crate) fn get_system_proxy_url(target_url: &url::Url) -> Option<String> {
-    if system_proxy_points_to_loopback() || target_url.host_str().is_some_and(host_is_loopback) {
+    if target_url.host_str().is_some_and(host_is_loopback) {
         return None;
     }
 
-    let (proxy_scheme, scheme_proxy) = match target_url.scheme() {
-        "ws" | "http" => ("http", first_proxy_env(&["HTTP_PROXY", "http_proxy"])),
-        "wss" | "https" => ("https", first_proxy_env(&["HTTPS_PROXY", "https_proxy"])),
+    let proxy_scheme = match target_url.scheme() {
+        "ws" | "http" => "http",
+        "wss" | "https" => "https",
         _ => return None,
     };
     let mut proxy_target = target_url.clone();
@@ -225,9 +225,31 @@ pub(crate) fn get_system_proxy_url(target_url: &url::Url) -> Option<String> {
     let proxy_target: http::Uri = proxy_target.as_str().parse().ok()?;
     let intercepted =
         hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&proxy_target)?;
+
+    select_system_proxy_url(
+        target_url.scheme(),
+        first_proxy_env(&["HTTP_PROXY", "http_proxy"]),
+        first_proxy_env(&["HTTPS_PROXY", "https_proxy"]),
+        first_proxy_env(&["ALL_PROXY", "all_proxy"]),
+        intercepted.uri().to_string(),
+    )
+}
+
+fn select_system_proxy_url(
+    target_scheme: &str,
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    all_proxy: Option<String>,
+    intercepted_proxy: String,
+) -> Option<String> {
+    let scheme_proxy = match target_scheme {
+        "ws" | "http" => http_proxy,
+        "wss" | "https" => https_proxy,
+        _ => return None,
+    };
     let proxy_url = normalize_system_proxy_url(scheme_proxy)
-        .or_else(|| normalize_system_proxy_url(first_proxy_env(&["ALL_PROXY", "all_proxy"])))
-        .unwrap_or_else(|| intercepted.uri().to_string());
+        .or_else(|| normalize_system_proxy_url(all_proxy))
+        .unwrap_or(intercepted_proxy);
 
     if proxy_points_to_loopback(&proxy_url) {
         log::warn!(
@@ -465,6 +487,24 @@ mod tests {
         // 非 loopback 地址不应该被跳过
         assert!(!proxy_points_to_loopback("http://192.168.1.10:7890"));
         assert!(!proxy_points_to_loopback("http://192.168.1.10:15721"));
+    }
+
+    #[test]
+    fn websocket_self_proxy_bypass_is_target_scheme_specific() {
+        set_proxy_port(15721);
+
+        assert_eq!(
+            select_system_proxy_url(
+                "wss",
+                Some("http://127.0.0.1:15721".to_string()),
+                Some("http://corporate-proxy.example:8443".to_string()),
+                None,
+                "http://corporate-proxy.example:8443".to_string(),
+            )
+            .as_deref(),
+            Some("http://corporate-proxy.example:8443"),
+            "an irrelevant HTTP self-proxy must not bypass the HTTPS proxy selected for wss"
+        );
     }
 
     #[test]
