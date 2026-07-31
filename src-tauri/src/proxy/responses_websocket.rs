@@ -215,6 +215,7 @@ impl WebSocketTurnAccounting {
             );
         }
     }
+    #[cfg(test)]
     async fn finish_provider_failure(mut self, message: String) {
         self.finalized = true;
         if let Err(error) = self
@@ -275,6 +276,12 @@ impl WebSocketTurnAccounting {
 
 #[cfg(test)]
 static DELAY_DROP_ACCOUNTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REQUEST_CONTEXT_LOADS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PAUSE_REQUEST_CONTEXT_LOAD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl Drop for WebSocketTurnAccounting {
@@ -388,6 +395,47 @@ async fn handle_connection(
     }
 }
 
+async fn request_context_or_shutdown(
+    state: &ProxyState,
+    body: &Value,
+    headers: &HeaderMap,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<RequestContext>, ProxyError> {
+    let state = state.clone();
+    let body = body.clone();
+    let headers = headers.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut context_task = tokio::task::spawn_blocking(move || {
+        runtime.block_on(RequestContext::new(
+            &state,
+            &body,
+            &headers,
+            AppType::Codex,
+            "CodexWS",
+            "codex",
+        ))
+    });
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    context_task.abort();
+                    return Ok(None);
+                }
+            }
+            result = &mut context_task => {
+                return result
+                    .map_err(|error| ProxyError::ForwardFailed(format!(
+                        "WebSocket request context task failed: {error}"
+                    )))?
+                    .map(Some);
+            }
+        }
+    }
+}
+
 async fn handle_connection_inner(
     downstream: &mut WebSocket,
     state: &ProxyState,
@@ -412,15 +460,19 @@ async fn handle_connection_inner(
     }
     let response_body = response_create_body(&first_event)?;
 
-    let mut turn_context = RequestContext::new(
-        state,
-        &response_body,
-        headers,
-        AppType::Codex,
-        "CodexWS",
-        "codex",
-    )
-    .await?;
+    #[cfg(test)]
+    {
+        REQUEST_CONTEXT_LOADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        while PAUSE_REQUEST_CONTEXT_LOAD.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+    let Some(mut turn_context) =
+        request_context_or_shutdown(state, &response_body, headers, &mut shutdown_rx).await?
+    else {
+        send_proxy_shutdown_close(downstream).await;
+        return Ok(());
+    };
     let mut turn_providers = turn_context.get_providers();
     let mut provider_index = turn_providers
         .iter()
@@ -626,7 +678,9 @@ async fn handle_connection_inner(
                 let kind = if received_response_event { "idle" } else { "first response event" };
                 let message = format!("upstream WebSocket {kind} timed out");
                 if let Some(accounting) = turn_accounting.take() {
-                    accounting.finish_provider_failure(message.clone()).await;
+                    accounting
+                        .finish_provider_failure_detached(message.clone())
+                        .await;
                 }
                 return Err(ProxyError::Timeout(message));
             }
@@ -703,15 +757,27 @@ async fn handle_connection_inner(
                                     ))
                                 })?,
                             )?;
-                            let next_ctx = RequestContext::new(
+                            #[cfg(test)]
+                            {
+                                REQUEST_CONTEXT_LOADS_STARTED
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                while PAUSE_REQUEST_CONTEXT_LOAD
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            let Some(next_ctx) = request_context_or_shutdown(
                                 state,
                                 &body,
                                 headers,
-                                AppType::Codex,
-                                "CodexWS",
-                                "codex",
+                                &mut shutdown_rx,
                             )
-                            .await?;
+                            .await?
+                            else {
+                                finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                                break;
+                            };
                             let current_proxy_url = super::http_client::get_current_proxy_url();
                             if current_proxy_url.as_deref() != upstream_proxy_url.as_deref() {
                                 return Err(ProxyError::ConfigError(
@@ -1041,12 +1107,13 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
-                        if !already_sent && send_upstream_message(
+                        if !already_sent && send_upstream_turn_message(
                             &mut upstream,
                             UpstreamMessage::Text(text),
                             write_deadline,
                             &mut shutdown_rx,
                             "text frame write",
+                            &mut turn_accounting,
                         )
                         .await?
                             == WebSocketSendOutcome::Shutdown
@@ -1063,12 +1130,13 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
-                        if send_upstream_message(
+                        if send_upstream_turn_message(
                             &mut upstream,
                             UpstreamMessage::Binary(data),
                             write_deadline,
                             &mut shutdown_rx,
                             "binary frame write",
+                            &mut turn_accounting,
                         )
                         .await?
                             == WebSocketSendOutcome::Shutdown
@@ -1085,12 +1153,13 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
-                        if send_upstream_message(
+                        if send_upstream_turn_message(
                             &mut upstream,
                             UpstreamMessage::Ping(data),
                             write_deadline,
                             &mut shutdown_rx,
                             "ping frame write",
+                            &mut turn_accounting,
                         )
                         .await?
                             == WebSocketSendOutcome::Shutdown
@@ -1107,12 +1176,13 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
-                        if send_upstream_message(
+                        if send_upstream_turn_message(
                             &mut upstream,
                             UpstreamMessage::Pong(data),
                             write_deadline,
                             &mut shutdown_rx,
                             "pong frame write",
+                            &mut turn_accounting,
                         )
                         .await?
                             == WebSocketSendOutcome::Shutdown
@@ -1897,6 +1967,28 @@ fn websocket_turn_timeout_deadline(
 #[cfg(test)]
 static FAIL_NEXT_REUSED_TURN_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_NEXT_RELAY_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+async fn send_upstream_turn_message(
+    upstream: &mut UpstreamSocket,
+    message: UpstreamMessage,
+    deadline: Option<Instant>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    description: &str,
+    turn_accounting: &mut Option<WebSocketTurnAccounting>,
+) -> Result<WebSocketSendOutcome, ProxyError> {
+    let result = send_upstream_message(upstream, message, deadline, shutdown_rx, description).await;
+    if let Err(error) = &result {
+        if let Some(accounting) = turn_accounting.take() {
+            accounting
+                .finish_provider_failure_detached(error.to_string())
+                .await;
+        }
+    }
+    result
+}
+
 async fn send_upstream_message(
     upstream: &mut UpstreamSocket,
     message: UpstreamMessage,
@@ -1910,6 +2002,14 @@ async fn send_upstream_message(
     {
         return Err(ProxyError::ForwardFailed(
             "upstream WebSocket text frame write failed: injected stale socket".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    if description == "ping frame write"
+        && FAIL_NEXT_RELAY_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ProxyError::ForwardFailed(
+            "upstream WebSocket ping frame write failed: injected relay failure".to_string(),
         ));
     }
 
@@ -3360,9 +3460,9 @@ mod tests {
             .as_str()
             .is_some_and(|message| message.contains("handshake timed out")));
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn times_out_when_upstream_never_emits_first_response_event() {
+    async fn timeout_failure_does_not_block_shutdown_on_health_persistence() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stalled upstream");
@@ -3431,17 +3531,13 @@ mod tests {
 
         let read_task = tokio::spawn(async move { next_text(&mut client).await });
         std::thread::sleep(Duration::from_millis(1500));
-        let delivered_early = read_task.is_finished();
+        let error_result = tokio::time::timeout(Duration::from_secs(1), read_task).await;
+        let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
         release_tx.send(()).expect("release database lock");
         lock_task.join().expect("database lock task");
-        assert!(
-            !delivered_early,
-            "timeout error was delivered before provider failure finalization"
-        );
 
-        let error_text = tokio::time::timeout(Duration::from_secs(2), read_task)
-            .await
-            .expect("timeout error was not delivered after finalization")
+        let error_text = error_result
+            .expect("timeout persistence blocked downstream timeout delivery")
             .expect("timeout reader task");
         let error: Value = serde_json::from_str(&error_text).expect("timeout error event JSON");
         assert_eq!(error["type"], "error");
@@ -3463,7 +3559,10 @@ mod tests {
         assert_eq!(status.failed_requests, 1);
 
         upstream_task.abort();
-        server.stop().await.expect("stop proxy");
+        let _ = upstream_task.await;
+        stop_result
+            .expect("timeout persistence blocked proxy shutdown")
+            .expect("stop proxy");
     }
 
     #[tokio::test]
@@ -4015,6 +4114,177 @@ mod tests {
             .expect("client stream ended without close")
             .expect("client close error");
         assert!(matches!(close, UpstreamMessage::Close(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn stopping_proxy_interrupts_initial_request_context_load() {
+        REQUEST_CONTEXT_LOADS_STARTED.store(0, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_REQUEST_CONTEXT_LOAD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{unavailable_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        ));
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while REQUEST_CONTEXT_LOADS_STARTED.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial request context load did not start");
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_db = db.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = locked_db.conn.lock().expect("lock database");
+            locked_tx.send(()).expect("signal database lock");
+            release_rx.recv().expect("release database lock");
+        });
+        locked_rx.recv().expect("wait for database lock");
+        PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stop_server = server.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build stop runtime");
+            runtime.block_on(stop_server.stop())
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        let stopped_while_locked = stop_thread.is_finished();
+        drop(client);
+        release_tx.send(()).expect("release database lock");
+        lock_thread.join().expect("database lock task");
+        let stop_result = stop_thread.join().expect("proxy stop thread");
+        stop_result.expect("stop proxy");
+        assert!(
+            stopped_while_locked,
+            "initial request context load blocked proxy shutdown"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn stopping_proxy_interrupts_later_request_context_load() {
+        REQUEST_CONTEXT_LOADS_STARTED.store(0, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-context-first","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            while websocket.next().await.is_some() {}
+        });
+
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select provider");
+        let server = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        ));
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send first response.create");
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-context-first");
+
+        PAUSE_REQUEST_CONTEXT_LOAD.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-context-first")).to_string(),
+            ))
+            .await
+            .expect("send later response.create");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while REQUEST_CONTEXT_LOADS_STARTED.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("later request context load did not start");
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locked_db = db.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = locked_db.conn.lock().expect("lock database");
+            locked_tx.send(()).expect("signal database lock");
+            release_rx.recv().expect("release database lock");
+        });
+        locked_rx.recv().expect("wait for database lock");
+        PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stop_server = server.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build stop runtime");
+            runtime.block_on(stop_server.stop())
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        let stopped_while_locked = stop_thread.is_finished();
+        drop(client);
+        release_tx.send(()).expect("release database lock");
+        lock_thread.join().expect("database lock task");
+        let stop_result = stop_thread.join().expect("proxy stop thread");
+        let _ = tokio::time::timeout(Duration::from_secs(2), upstream_task).await;
+        stop_result.expect("stop proxy");
+        assert!(
+            stopped_while_locked,
+            "later request context load blocked proxy shutdown"
+        );
     }
 
     #[tokio::test]
@@ -7259,6 +7529,84 @@ mod tests {
         drop(client);
         bad_task.await.unwrap();
         server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upstream_relay_write_failure_updates_breaker_before_downstream_close() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.created","response":{"id":"resp-relay-write"}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider =
+            websocket_provider_with_id("ws-relay-write", format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).unwrap();
+        db.add_to_failover_queue("codex", &provider.id).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".into(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(created["type"], "response.created");
+
+        DELAY_DROP_ACCOUNTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        FAIL_NEXT_RELAY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Ping(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(error["type"], "error");
+        let permit = router.allow_provider_request(&provider.id, "codex").await;
+        let provider_remained_selectable = permit.allowed;
+        if permit.allowed {
+            router
+                .release_permit_neutral(&provider.id, "codex", permit.used_half_open_permit)
+                .await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
+        assert!(
+            !provider_remained_selectable,
+            "relay write failure did not update the breaker before downstream close"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
