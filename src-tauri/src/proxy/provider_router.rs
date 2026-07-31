@@ -10,7 +10,18 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+#[cfg(test)]
+static PAUSE_RESULT_BEFORE_ENQUEUE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RESULT_PAUSED_BEFORE_ENQUEUE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RELEASE_RESULT_ENQUEUE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RESULTS_ENQUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +29,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Per-provider lock spanning breaker mutation and persistence enqueue.
+    result_ordering_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// Ordered persistence queue so detached WebSocket results cannot overtake later results.
     result_persistence_tx: mpsc::UnboundedSender<ProviderResultPersistence>,
 }
@@ -98,6 +111,7 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            result_ordering_locks: Arc::new(RwLock::new(HashMap::new())),
             result_persistence_tx,
         }
     }
@@ -200,6 +214,18 @@ impl ProviderRouter {
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
     }
+    async fn result_ordering_lock(&self, provider_id: &str, app_type: &str) -> Arc<Mutex<()>> {
+        let key = format!("{app_type}:{provider_id}");
+        if let Some(lock) = self.result_ordering_locks.read().await.get(&key).cloned() {
+            return lock;
+        }
+        self.result_ordering_locks
+            .write()
+            .await
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 
     /// 记录供应商请求结果
     pub async fn record_result(
@@ -210,8 +236,19 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
+        let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
+        let ordering_guard = ordering_lock.lock().await;
         self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
+        #[cfg(test)]
+        {
+            if PAUSE_RESULT_BEFORE_ENQUEUE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                RESULT_PAUSED_BEFORE_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !RELEASE_RESULT_ENQUEUE.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
         let (completion_tx, completion_rx) = oneshot::channel();
         self.enqueue_result_persistence(
             provider_id,
@@ -220,6 +257,9 @@ impl ProviderRouter {
             error_msg,
             Some(completion_tx),
         )?;
+        #[cfg(test)]
+        RESULTS_ENQUEUED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(ordering_guard);
         completion_rx.await.map_err(|_| {
             AppError::Message("provider result persistence worker stopped".to_string())
         })?
@@ -234,9 +274,14 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
+        let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
+        let ordering_guard = ordering_lock.lock().await;
         self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
-        self.enqueue_result_persistence(provider_id, app_type, success, error_msg, None)
+        let result =
+            self.enqueue_result_persistence(provider_id, app_type, success, error_msg, None);
+        drop(ordering_guard);
+        result
     }
 
     async fn record_circuit_result(
@@ -391,6 +436,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::env;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct TempHome {
@@ -634,5 +680,85 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn concurrent_result_updates_preserve_breaker_and_persistence_order() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "ordered-provider".to_string(),
+            "Ordered Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+
+        RESULTS_ENQUEUED.store(0, std::sync::atomic::Ordering::SeqCst);
+        RESULT_PAUSED_BEFORE_ENQUEUE.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_RESULT_ENQUEUE.store(false, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_RESULT_BEFORE_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let success_router = router.clone();
+        let success = tokio::spawn(async move {
+            success_router
+                .record_result("ordered-provider", "codex", false, true, None)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !RESULT_PAUSED_BEFORE_ENQUEUE.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("success result did not pause before enqueue");
+
+        let failure_router = router.clone();
+        let failure = tokio::spawn(async move {
+            failure_router
+                .record_result(
+                    "ordered-provider",
+                    "codex",
+                    false,
+                    false,
+                    Some("later failure".to_string()),
+                )
+                .await
+                .unwrap();
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while RESULTS_ENQUEUED.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        RELEASE_RESULT_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
+        success.await.unwrap();
+        failure.await.unwrap();
+
+        let stats = router
+            .get_circuit_breaker_stats("ordered-provider", "codex")
+            .await
+            .expect("breaker stats");
+        assert_eq!(
+            stats.state,
+            crate::proxy::circuit_breaker::CircuitState::Open
+        );
+        assert_eq!(stats.failed_requests, 1);
+        let health = db
+            .get_provider_health("ordered-provider", "codex")
+            .await
+            .unwrap();
+        assert!(
+            !health.is_healthy,
+            "SQLite must match the live failed breaker"
+        );
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_error.as_deref(), Some("later failure"));
     }
 }

@@ -901,6 +901,17 @@ async fn handle_connection_inner(
                                                                 error.to_string(),
                                                             )
                                                             .await;
+                                                        if response_create_has_provider_cursor(&text)
+                                                        {
+                                                            return Err(
+                                                                finalize_later_turn_provider_exhaustion(
+                                                                    state,
+                                                                    error,
+                                                                    next_provider_attempts,
+                                                                )
+                                                                .await,
+                                                            );
+                                                        }
                                                         attempt_error = Some(error);
                                                     }
                                                 }
@@ -1719,9 +1730,6 @@ async fn handle_connection_inner(
                         relayed_response_event = true;
                     }
                     UpstreamMessage::Ping(data) => {
-                        if response_in_flight && received_response_event {
-                            last_response_event_at = Instant::now();
-                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -1745,9 +1753,6 @@ async fn handle_connection_inner(
                         }
                     }
                     UpstreamMessage::Pong(data) => {
-                        if response_in_flight && received_response_event {
-                            last_response_event_at = Instant::now();
-                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -6195,7 +6200,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn upstream_heartbeats_refresh_active_turn_idle_deadline() {
+    async fn upstream_heartbeats_do_not_refresh_active_turn_idle_deadline() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind heartbeat upstream");
@@ -6223,13 +6228,12 @@ mod tests {
                     return;
                 }
             }
-            websocket
+            let _ = websocket
                 .send(UpstreamMessage::Text(
                     json!({"type":"response.completed","response":{"id":"resp-heartbeat","output":[]}})
                         .to_string(),
                 ))
-                .await
-                .expect("send heartbeat completion");
+                .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
@@ -6273,7 +6277,13 @@ mod tests {
         let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
 
         assert_eq!(created["type"], "response.created");
-        assert_eq!(terminal["type"], "response.completed", "{terminal}");
+        assert_eq!(terminal["type"], "error", "{terminal}");
+        assert!(
+            terminal["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("idle timed out")),
+            "unexpected timeout error: {terminal}"
+        );
 
         drop(client);
         upstream_task.await.expect("heartbeat upstream task");
@@ -7564,6 +7574,106 @@ mod tests {
             .unwrap();
         let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(second["response"]["id"], "resp-reused-fallback", "{second}");
+
+        drop(client);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+    #[tokio::test]
+    #[serial]
+    async fn reused_upstream_write_failure_preserves_provider_cursor_affinity() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-cursor-primary","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_secs(2), fallback_listener.accept()).await;
+            let used = if let Ok(Ok((stream, _))) = accepted {
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let _ = next_text(&mut websocket).await;
+                websocket
+                    .send(UpstreamMessage::Text(
+                        json!({"type":"response.completed","response":{"id":"resp-cursor-replayed","output":[]}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                true
+            } else {
+                false
+            };
+            let _ = fallback_tx.send(used);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut primary =
+            websocket_provider_with_id("ws-cursor-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-cursor-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".into(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-cursor-primary");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.get_status().await.success_requests != 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        FAIL_NEXT_REUSED_TURN_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-cursor-primary")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(second["type"], "error", "{second}");
+        assert!(!fallback_rx.await.unwrap(), "provider cursor was replayed");
 
         drop(client);
         primary_task.await.unwrap();
