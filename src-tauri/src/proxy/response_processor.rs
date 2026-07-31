@@ -630,6 +630,9 @@ pub(crate) async fn log_codex_websocket_usage(
 
     let events = [event.clone()];
     let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
+    if !usage.has_billable_tokens() {
+        return;
+    }
     let model = usage
         .model
         .as_deref()
@@ -1055,6 +1058,45 @@ mod tests {
             websocket_shutdown_tx: tokio::sync::watch::channel(false).0,
             websocket_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_usage_skips_terminal_events_without_billable_tokens() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        insert_provider(&db, "ws-provider", "codex", ProviderMeta::default())?;
+        let state = build_state(db.clone());
+
+        log_codex_websocket_usage(
+            &state,
+            "ws-provider",
+            "request-model",
+            "outbound-model",
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "websocket_transport_error",
+                    "message": "upstream closed"
+                }
+            }),
+            502,
+            10,
+            None,
+            "ws-session",
+        )
+        .await;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE provider_id = ?1",
+            ["ws-provider"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            count, 0,
+            "zero-token terminal events must not create usage rows"
+        );
+        Ok(())
     }
 
     fn seed_pricing(db: &Database) -> Result<(), AppError> {

@@ -734,7 +734,8 @@ async fn handle_connection_inner(
                                     .position(|candidate| candidate.id == next_ctx.provider.id)
                                     .unwrap_or(0)
                             });
-                            if !retain_fallback_provider
+                            if (!retain_fallback_provider
+                                || next_turn_providers[next_index].id == provider.id)
                                 && provider_snapshot_changed(
                                     &provider,
                                     &next_turn_providers[next_index],
@@ -1152,33 +1153,55 @@ async fn handle_connection_inner(
                 }
             }
             upstream_message = upstream.next() => {
-                let Some(upstream_message) = upstream_message else {
-                    if response_in_flight {
+                let upstream_message = match upstream_message {
+                    Some(message) => message,
+                    None if response_in_flight && !relayed_response_event => Ok(
+                        websocket_transport_failure_event(
+                            "upstream WebSocket ended before a terminal response".to_string(),
+                        ),
+                    ),
+                    None if response_in_flight => {
                         return Err(premature_upstream_close_error(
                             &mut turn_accounting,
                             "upstream WebSocket ended before a terminal response",
                         )
                         .await);
                     }
-                    let close_deadline = websocket_turn_timeout_deadline(
-                        response_in_flight,
-                        received_response_event,
-                        turn_started,
-                        last_response_event_at,
-                        timeout_config,
-                    );
-                    let _ = send_downstream_message(
-                        downstream,
-                        DownstreamMessage::Close(None),
-                        close_deadline,
-                        &mut shutdown_rx,
-                        "close frame write",
-                    )
-                    .await;
-                    break;
+                    None => {
+                        let close_deadline = websocket_turn_timeout_deadline(
+                            response_in_flight,
+                            received_response_event,
+                            turn_started,
+                            last_response_event_at,
+                            timeout_config,
+                        );
+                        let _ = send_downstream_message(
+                            downstream,
+                            DownstreamMessage::Close(None),
+                            close_deadline,
+                            &mut shutdown_rx,
+                            "close frame write",
+                        )
+                        .await;
+                        break;
+                    }
                 };
                 let upstream_message = match upstream_message {
+                    Ok(UpstreamMessage::Close(_))
+                        if response_in_flight && !relayed_response_event =>
+                    {
+                        websocket_transport_failure_event(
+                            "upstream WebSocket closed before a terminal response".to_string(),
+                        )
+                    }
                     Ok(message) => message,
+                    Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed)
+                        if response_in_flight && !relayed_response_event =>
+                    {
+                        websocket_transport_failure_event(
+                            "upstream WebSocket closed before a terminal response".to_string(),
+                        )
+                    }
                     Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
                         if response_in_flight {
                             return Err(premature_upstream_close_error(
@@ -1207,18 +1230,7 @@ async fn handle_connection_inner(
                     Err(error) => {
                         let message = format!("upstream WebSocket read failed: {error}");
                         if response_in_flight && !relayed_response_event {
-                            UpstreamMessage::Text(
-                                json!({
-                                    "type": "response.failed",
-                                    "response": {
-                                        "error": {
-                                            "type": "websocket_transport_error",
-                                            "message": message
-                                        }
-                                    }
-                                })
-                                .to_string(),
-                            )
+                            websocket_transport_failure_event(message)
                         } else {
                             if response_in_flight {
                                 if let Some(accounting) = turn_accounting.take() {
@@ -1698,6 +1710,21 @@ async fn handle_connection_inner(
     }
 
     Ok(())
+}
+
+fn websocket_transport_failure_event(message: String) -> UpstreamMessage {
+    UpstreamMessage::Text(
+        json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "websocket_transport_error",
+                    "message": message
+                }
+            }
+        })
+        .to_string(),
+    )
 }
 
 async fn premature_upstream_close_error(
@@ -2393,6 +2420,12 @@ async fn connect_upstream_websocket(
     let target_port = target_url
         .port_or_known_default()
         .ok_or_else(|| ProxyError::ConfigError("upstream WebSocket URL has no port".to_string()))?;
+
+    let system_proxy_url = proxy_url
+        .is_none()
+        .then(|| super::http_client::get_system_proxy_url(&target_url))
+        .flatten();
+    let proxy_url = proxy_url.or(system_proxy_url.as_deref());
 
     let stream: BoxedIo = match proxy_url {
         Some(proxy_url) => {
@@ -6275,7 +6308,7 @@ mod tests {
         assert_eq!(port, 443);
     }
 
-    async fn run_proxy_routing_case(proxy_scheme: &str) {
+    async fn run_proxy_routing_case(proxy_scheme: &str, use_system_proxy: bool) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind proxied upstream");
@@ -6365,7 +6398,12 @@ mod tests {
         });
 
         let proxy_url = format!("{proxy_scheme}://{proxy_addr}");
-        crate::proxy::http_client::init(Some(&proxy_url)).expect("configure global proxy");
+        let _system_proxy = use_system_proxy.then(|| EnvVarGuard::set("HTTP_PROXY", &proxy_url));
+        if use_system_proxy {
+            crate::proxy::http_client::apply_proxy(None).expect("follow system proxy");
+        } else {
+            crate::proxy::http_client::init(Some(&proxy_url)).expect("configure global proxy");
+        }
         let _reset = GlobalProxyReset;
 
         let db = Arc::new(Database::memory().expect("create in-memory database"));
@@ -6405,13 +6443,19 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn routes_websocket_through_configured_http_proxy() {
-        run_proxy_routing_case("http").await;
+        run_proxy_routing_case("http", false).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn routes_websocket_through_configured_socks5h_proxy() {
-        run_proxy_routing_case("socks5h").await;
+        run_proxy_routing_case("socks5h", false).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn routes_websocket_through_system_http_proxy() {
+        run_proxy_routing_case("http", true).await;
     }
     #[tokio::test]
     #[serial]
@@ -6538,6 +6582,203 @@ mod tests {
             .await;
         drop(client);
         primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clean_upstream_close_before_relay_retries_fallback() {
+        let closing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closing_addr = closing_listener.local_addr().unwrap();
+        let closing_task = tokio::spawn(async move {
+            let (stream, _) = closing_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket.close(None).await.unwrap();
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-clean-close-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut closing =
+            websocket_provider_with_id("ws-clean-close", format!("http://{closing_addr}"));
+        closing.sort_index = Some(0);
+        let mut fallback = websocket_provider_with_id(
+            "ws-clean-close-fallback",
+            format!("http://{fallback_addr}"),
+        );
+        fallback.sort_index = Some(1);
+        for provider in [&closing, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &closing.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(response["response"]["id"], "resp-clean-close-fallback");
+
+        drop(client);
+        closing_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn changed_retained_fallback_snapshot_closes_before_reuse() {
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (old_received_tx, old_received_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-retained-one","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let reused = matches!(
+                tokio::time::timeout(Duration::from_secs(2), websocket.next()).await,
+                Ok(Some(Ok(UpstreamMessage::Text(_))))
+            );
+            if reused {
+                websocket
+                    .send(UpstreamMessage::Text(
+                        json!({"type":"response.completed","response":{"id":"resp-stale-reuse","output":[]}})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let _ = old_received_tx.send(reused);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut primary =
+            websocket_provider_with_id("ws-retained-primary", format!("http://{unavailable_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-retained-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-retained-one");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.get_status().await.success_requests == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        fallback.meta = Some(crate::provider::ProviderMeta {
+            custom_user_agent: Some("edited-retained-provider".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &fallback).unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-retained-one")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(
+            second["type"], "error",
+            "unexpected second response: {second}"
+        );
+        assert!(
+            second["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("provider changed")),
+            "unexpected retained-provider error: {second}"
+        );
+        assert!(!old_received_rx.await.unwrap());
+
+        drop(client);
         fallback_task.await.unwrap();
         server.stop().await.unwrap();
     }

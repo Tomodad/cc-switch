@@ -206,6 +206,62 @@ pub fn get_current_proxy_url() -> Option<String> {
         .and_then(|url| url.clone())
 }
 
+/// Resolve the system proxy that reqwest would use for a WebSocket target.
+///
+/// WebSocket transport uses a raw TCP/TLS connection instead of reqwest, so
+/// it must apply the same environment proxy and NO_PROXY policy explicitly.
+pub(crate) fn get_system_proxy_url(target_url: &url::Url) -> Option<String> {
+    if system_proxy_points_to_loopback() || target_url.host_str().is_some_and(host_is_loopback) {
+        return None;
+    }
+
+    let (proxy_scheme, scheme_proxy) = match target_url.scheme() {
+        "ws" | "http" => ("http", first_proxy_env(&["HTTP_PROXY", "http_proxy"])),
+        "wss" | "https" => ("https", first_proxy_env(&["HTTPS_PROXY", "https_proxy"])),
+        _ => return None,
+    };
+    let mut proxy_target = target_url.clone();
+    proxy_target.set_scheme(proxy_scheme).ok()?;
+    let proxy_target: http::Uri = proxy_target.as_str().parse().ok()?;
+    let intercepted =
+        hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&proxy_target)?;
+    let proxy_url = normalize_system_proxy_url(scheme_proxy)
+        .or_else(|| normalize_system_proxy_url(first_proxy_env(&["ALL_PROXY", "all_proxy"])))
+        .unwrap_or_else(|| intercepted.uri().to_string());
+
+    if proxy_points_to_loopback(&proxy_url) {
+        log::warn!(
+            "[GlobalProxy] System proxy points to CC Switch itself, bypassing WebSocket proxy"
+        );
+        None
+    } else {
+        Some(proxy_url)
+    }
+}
+
+fn first_proxy_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| env::var(key).ok())
+}
+
+fn normalize_system_proxy_url(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let normalized = if url::Url::parse(value).is_ok() {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let parsed = url::Url::parse(&normalized).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+        return None;
+    }
+    Some(normalized)
+}
+
 /// 检查是否正在使用代理
 #[allow(dead_code)]
 pub fn is_proxy_enabled() -> bool {
@@ -280,16 +336,16 @@ fn system_proxy_points_to_loopback() -> bool {
         .any(|value| proxy_points_to_loopback(&value))
 }
 
-fn proxy_points_to_loopback(value: &str) -> bool {
-    fn host_is_loopback(host: &str) -> bool {
-        if host.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
-        host.parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
     }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
 
+fn proxy_points_to_loopback(value: &str) -> bool {
     // 检查是否指向 CC Switch 自己的代理端口
     // 只有指向自己的代理才需要跳过，避免递归
     fn is_cc_switch_proxy_port(port: Option<u16>) -> bool {
