@@ -508,11 +508,15 @@ impl ProxyServer {
     }
 
     /// 重置指定 Provider 的熔断器
-    pub async fn reset_provider_circuit_breaker(&self, provider_id: &str, app_type: &str) {
+    pub async fn reset_provider_circuit_breaker(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Result<(), crate::error::AppError> {
         self.state
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
-            .await;
+            .await
     }
 }
 #[cfg(test)]

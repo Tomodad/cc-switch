@@ -3210,9 +3210,15 @@ impl ProxyService {
         if let Some(server) = self.server.read().await.as_ref() {
             server
                 .reset_provider_circuit_breaker(provider_id, app_type)
-                .await;
-            log::info!("已重置 Provider {provider_id} (app: {app_type}) 的熔断器");
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.db
+                .reset_provider_health(provider_id, app_type)
+                .await
+                .map_err(|error| error.to_string())?;
         }
+        log::info!("已重置 Provider {provider_id} (app: {app_type}) 的熔断器");
         Ok(())
     }
 }

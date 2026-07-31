@@ -802,16 +802,28 @@ async fn handle_connection_inner(
                                 ));
                             }
                             let next_turn_providers = next_ctx.get_providers();
+                            let has_provider_cursor = response_create_has_provider_cursor(&text);
                             if next_ctx.provider.id == provider.id {
                                 retain_fallback_provider = false;
                             }
-                            let retained_index = retain_fallback_provider.then(|| {
-                                next_turn_providers.iter().position(|candidate| {
-                                    candidate.id == provider.id
-                                        && !provider_snapshot_changed(&provider, candidate)
+                            let retained_index = retain_fallback_provider
+                                .then(|| {
+                                    next_turn_providers.iter().position(|candidate| {
+                                        candidate.id == provider.id
+                                            && !provider_snapshot_changed(&provider, candidate)
+                                    })
                                 })
-                            });
-                            let mut next_index = retained_index.flatten().unwrap_or_else(|| {
+                                .flatten();
+                            if retain_fallback_provider
+                                && retained_index.is_none()
+                                && has_provider_cursor
+                            {
+                                let message =
+                                    "selected Codex provider changed; reconnect WebSocket".to_string();
+                                record_rejected_later_turn_failure(state, message.clone()).await;
+                                return Err(ProxyError::ConfigError(message));
+                            }
+                            let mut next_index = retained_index.unwrap_or_else(|| {
                                 next_turn_providers
                                     .iter()
                                     .position(|candidate| candidate.id == next_ctx.provider.id)
@@ -824,9 +836,10 @@ async fn handle_connection_inner(
                                     &next_turn_providers[next_index],
                                 )
                             {
-                                return Err(ProxyError::ConfigError(
-                                    "selected Codex provider changed; reconnect WebSocket".to_string(),
-                                ));
+                                let message =
+                                    "selected Codex provider changed; reconnect WebSocket".to_string();
+                                record_rejected_later_turn_failure(state, message.clone()).await;
+                                return Err(ProxyError::ConfigError(message));
                             }
 
                             let next_timeout_config = next_ctx.streaming_timeout_config();
@@ -1348,6 +1361,14 @@ async fn handle_connection_inner(
                             return Err(ProxyError::ForwardFailed(message));
                         }
                     }
+                };
+                let upstream_message = match upstream_message {
+                    UpstreamMessage::Text(text) if !websocket_text_is_responses_event(&text) => {
+                        websocket_transport_failure_event(
+                            "upstream WebSocket sent an invalid Responses event".to_string(),
+                        )
+                    }
+                    message => message,
                 };
 
                 match upstream_message {
@@ -2344,6 +2365,16 @@ fn websocket_event_is(text: &str, expected: &str) -> bool {
     websocket_event_type(text).as_deref() == Some(expected)
 }
 
+fn websocket_text_is_responses_event(text: &str) -> bool {
+    let Ok(Value::Object(event)) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    event
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type == "error" || event_type.starts_with("response."))
+}
+
 fn websocket_event_has_generated_output(text: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -2657,9 +2688,53 @@ async fn connect_upstream_websocket(
     Ok(socket)
 }
 
+enum Socks5Target {
+    Ip(std::net::IpAddr),
+    Domain(String),
+}
+
 async fn connect_via_socks5(
     proxy_url: &Url,
     target_host: &str,
+    target_port: u16,
+) -> Result<tokio::net::TcpStream, ProxyError> {
+    let targets = if let Ok(address) = target_host.parse::<std::net::IpAddr>() {
+        vec![Socks5Target::Ip(address)]
+    } else if proxy_url.scheme() == "socks5h" {
+        vec![Socks5Target::Domain(target_host.to_string())]
+    } else {
+        let addresses = tokio::net::lookup_host((target_host, target_port))
+            .await
+            .map_err(|error| {
+                ProxyError::ForwardFailed(format!("SOCKS target DNS lookup failed: {error}"))
+            })?
+            .map(|address| address.ip())
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(ProxyError::ForwardFailed(
+                "SOCKS target DNS lookup returned no address".to_string(),
+            ));
+        }
+        addresses.into_iter().map(Socks5Target::Ip).collect()
+    };
+
+    let mut last_error = None;
+    for target in targets {
+        match connect_via_socks5_target(proxy_url, &target, target_port).await {
+            Ok(stream) => return Ok(stream),
+            Err(error @ (ProxyError::AuthError(_) | ProxyError::ConfigError(_))) => {
+                return Err(error);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| ProxyError::ForwardFailed("SOCKS target connection failed".to_string())))
+}
+
+async fn connect_via_socks5_target(
+    proxy_url: &Url,
+    target: &Socks5Target,
     target_port: u16,
 ) -> Result<tokio::net::TcpStream, ProxyError> {
     let proxy_host = proxy_url
@@ -2722,47 +2797,25 @@ async fn connect_via_socks5(
     }
 
     let mut request = vec![0x05, 0x01, 0x00];
-    if let Ok(address) = target_host.parse::<std::net::IpAddr>() {
-        match address {
-            std::net::IpAddr::V4(ip) => {
-                request.push(0x01);
-                request.extend_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => {
-                request.push(0x04);
-                request.extend_from_slice(&ip.octets());
-            }
+    match target {
+        Socks5Target::Ip(std::net::IpAddr::V4(ip)) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
         }
-    } else if proxy_url.scheme() == "socks5h" {
-        let host = target_host.as_bytes();
-        if host.len() > u8::MAX as usize {
-            return Err(ProxyError::ConfigError(
-                "WebSocket target hostname is too long for SOCKS5".to_string(),
-            ));
+        Socks5Target::Ip(std::net::IpAddr::V6(ip)) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
         }
-        request.push(0x03);
-        request.push(host.len() as u8);
-        request.extend_from_slice(host);
-    } else {
-        let address = tokio::net::lookup_host((target_host, target_port))
-            .await
-            .map_err(|error| {
-                ProxyError::ForwardFailed(format!("SOCKS target DNS lookup failed: {error}"))
-            })?
-            .next()
-            .ok_or_else(|| {
-                ProxyError::ForwardFailed("SOCKS target DNS lookup returned no address".to_string())
-            })?
-            .ip();
-        match address {
-            std::net::IpAddr::V4(ip) => {
-                request.push(0x01);
-                request.extend_from_slice(&ip.octets());
+        Socks5Target::Domain(host) => {
+            let host = host.as_bytes();
+            if host.len() > u8::MAX as usize {
+                return Err(ProxyError::ConfigError(
+                    "WebSocket target hostname is too long for SOCKS5".to_string(),
+                ));
             }
-            std::net::IpAddr::V6(ip) => {
-                request.push(0x04);
-                request.extend_from_slice(&ip.octets());
-            }
+            request.push(0x03);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host);
         }
     }
     request.extend_from_slice(&target_port.to_be_bytes());
@@ -2802,7 +2855,6 @@ async fn connect_via_socks5(
     })?;
     Ok(stream)
 }
-
 fn url_is_responses_endpoint(url: &str) -> bool {
     Url::parse(url)
         .ok()
@@ -4252,6 +4304,17 @@ mod tests {
             .await
             .expect("send first turn");
         let _ = next_text(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = server.get_status().await;
+                if status.total_requests == 1 && status.success_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first turn status was not recorded");
 
         provider.meta = Some(crate::provider::ProviderMeta {
             custom_user_agent: Some("cc-switch-hot-edit".to_string()),
@@ -4275,6 +4338,14 @@ mod tests {
             "unexpected provider-change error: {error}"
         );
         assert!(!old_received_rx.await.expect("old provider observation"));
+        let status = server.get_status().await;
+        assert_eq!(status.total_requests, 2);
+        assert_eq!(status.success_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("provider changed")));
 
         upstream_task.await.expect("metadata upstream task");
         server.stop().await.expect("stop proxy");
@@ -7067,6 +7138,83 @@ mod tests {
         assert_eq!(port, 443);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn socks5_local_dns_retries_all_resolved_addresses() {
+        let resolved = tokio::net::lookup_host(("localhost", 443))
+            .await
+            .expect("resolve localhost")
+            .collect::<Vec<_>>();
+        assert!(
+            resolved.len() >= 2,
+            "test requires localhost to resolve to multiple addresses: {resolved:?}"
+        );
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SOCKS proxy");
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let (attempts_tx, attempts_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            let mut attempts = Vec::new();
+            for attempt in 0..2 {
+                let (mut client, _) = proxy_listener.accept().await.expect("accept SOCKS client");
+                let mut greeting = [0u8; 2];
+                client
+                    .read_exact(&mut greeting)
+                    .await
+                    .expect("read SOCKS greeting");
+                let mut methods = vec![0u8; greeting[1] as usize];
+                client
+                    .read_exact(&mut methods)
+                    .await
+                    .expect("read SOCKS methods");
+                client.write_all(&[5, 0]).await.expect("select no-auth");
+
+                let mut request_head = [0u8; 4];
+                client
+                    .read_exact(&mut request_head)
+                    .await
+                    .expect("read SOCKS connect head");
+                let mut address = match request_head[3] {
+                    1 => vec![0u8; 4],
+                    4 => vec![0u8; 16],
+                    other => panic!("expected locally resolved IP address, got atyp={other}"),
+                };
+                client
+                    .read_exact(&mut address)
+                    .await
+                    .expect("read SOCKS target address");
+                let mut port = [0u8; 2];
+                client.read_exact(&mut port).await.expect("read SOCKS port");
+                attempts.push((request_head[3], address));
+
+                let reply_code = if attempt == 0 { 4 } else { 0 };
+                client
+                    .write_all(&[5, reply_code, 0, 1, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .expect("write SOCKS reply");
+            }
+            let _ = attempts_tx.send(attempts);
+        });
+
+        let proxy_url =
+            Url::parse(&format!("socks5://{proxy_addr}")).expect("parse SOCKS proxy URL");
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_via_socks5(&proxy_url, "localhost", 443),
+        )
+        .await
+        .expect("SOCKS multi-address retry timed out")
+        .expect("later locally resolved address should succeed");
+        drop(stream);
+        let attempts = attempts_rx.await.expect("SOCKS attempts");
+        proxy_task.await.expect("SOCKS proxy task");
+
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0], attempts[1]);
+    }
+
     async fn run_proxy_routing_case(proxy_scheme: &str, use_system_proxy: bool) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -7421,6 +7569,97 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn malformed_upstream_text_before_relay_retries_fallback() {
+        let malformed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let malformed_addr = malformed_listener.local_addr().unwrap();
+        let malformed_task = tokio::spawn(async move {
+            let (stream, _) = malformed_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text("not-json".to_string()))
+                .await
+                .unwrap();
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-valid-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut malformed =
+            websocket_provider_with_id("ws-malformed", format!("http://{malformed_addr}"));
+        malformed.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-malformed-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&malformed, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &malformed.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("malformed upstream text must not be relayed");
+        assert_eq!(response["response"]["id"], "resp-valid-fallback");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let health = db
+                    .get_provider_health(&malformed.id, "codex")
+                    .await
+                    .unwrap();
+                if !health.is_healthy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("protocol violation did not mark provider unhealthy");
+
+        drop(client);
+        malformed_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn changed_retained_fallback_snapshot_closes_before_reuse() {
         let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_addr = unavailable_listener.local_addr().unwrap();
@@ -7539,6 +7778,164 @@ mod tests {
 
         drop(client);
         fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_retained_fallback_rejects_provider_cursor_turn() {
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-retained-removed","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+
+        let replacement_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replacement_addr = replacement_listener.local_addr().unwrap();
+        let (replacement_received_tx, replacement_received_rx) = oneshot::channel();
+        let (replacement_cancel_tx, mut replacement_cancel_rx) = oneshot::channel();
+        let replacement_task = tokio::spawn(async move {
+            let received = tokio::select! {
+                accepted = replacement_listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let text = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-wrong-provider","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    response_create_has_provider_cursor(&text)
+                }
+                _ = &mut replacement_cancel_rx => false,
+            };
+            let _ = replacement_received_tx.send(received);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut primary =
+            websocket_provider_with_id("ws-retained-primary", format!("http://{unavailable_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-retained-removed", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        let mut replacement = websocket_provider_with_id(
+            "ws-retained-replacement",
+            format!("http://{replacement_addr}"),
+        );
+        replacement.sort_index = Some(2);
+        for provider in [&primary, &fallback, &replacement] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 2;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-retained-removed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.get_status().await.success_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let before_rejection = server.get_status().await;
+
+        db.delete_provider("codex", &primary.id)
+            .expect("delete failed primary");
+        db.delete_provider("codex", &fallback.id)
+            .expect("delete retained fallback");
+        let remaining = db
+            .get_failover_queue("codex")
+            .expect("remaining failover queue");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].provider_id, replacement.id);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-retained-removed")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(
+            second["type"], "error",
+            "unexpected second response: {second}"
+        );
+        assert!(
+            second["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("provider changed")),
+            "unexpected retained-provider rejection: {second}"
+        );
+        let _ = replacement_cancel_tx.send(());
+        assert!(!replacement_received_rx.await.unwrap());
+        let after_rejection = server.get_status().await;
+        assert_eq!(
+            after_rejection.total_requests,
+            before_rejection.total_requests + 1
+        );
+        assert_eq!(
+            after_rejection.failed_requests,
+            before_rejection.failed_requests + 1
+        );
+        assert!(after_rejection
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("provider changed")));
+
+        drop(client);
+        fallback_task.await.unwrap();
+        replacement_task.await.unwrap();
         server.stop().await.unwrap();
     }
 

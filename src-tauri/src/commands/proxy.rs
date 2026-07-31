@@ -332,19 +332,14 @@ pub async fn reset_circuit_breaker(
     provider_id: String,
     app_type: String,
 ) -> Result<(), String> {
-    // 1. 重置数据库健康状态
+    // 1. 按运行中结果的顺序重置内存熔断器和数据库健康状态
     let db = &state.db;
-    db.update_provider_health(&provider_id, &app_type, true, None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 2. 如果代理正在运行，重置内存中的熔断器状态
     state
         .proxy_service
         .reset_provider_circuit_breaker(&provider_id, &app_type)
         .await?;
 
-    // 3. 检查是否应该切回优先级更高的供应商（从 proxy_config 表读取）
+    // 2. 检查是否应该切回优先级更高的供应商（从 proxy_config 表读取）
     // 只有当该应用已被代理接管（enabled=true）且开启了自动故障转移时才执行
     let (app_enabled, auto_failover_enabled) = match db.get_proxy_config_for_app(&app_type).await {
         Ok(config) => (config.enabled, config.auto_failover_enabled),
