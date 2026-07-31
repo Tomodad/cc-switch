@@ -367,9 +367,13 @@ impl ProxyServer {
     pub(crate) fn state_for_tests(&self) -> ProxyState {
         self.state.clone()
     }
+    pub(crate) fn provider_router(&self) -> Arc<ProviderRouter> {
+        self.state.provider_router.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn provider_router_for_tests(&self) -> Arc<ProviderRouter> {
-        self.state.provider_router.clone()
+        self.provider_router()
     }
 
     /// 更新某个应用类型当前“目标供应商”（用于 UI 展示 active_targets）

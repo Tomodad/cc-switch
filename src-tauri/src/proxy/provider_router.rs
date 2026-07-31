@@ -32,6 +32,11 @@ static RESULT_PERSISTENCE_PAUSED: std::sync::atomic::AtomicBool =
 static RELEASE_RESULT_PERSISTENCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(not(test))]
+const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 256;
+#[cfg(test)]
+const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 8;
+
 /// 供应商路由器
 pub struct ProviderRouter {
     /// 数据库连接
@@ -40,8 +45,10 @@ pub struct ProviderRouter {
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
     /// Per-provider lock spanning breaker mutation and persistence enqueue.
     result_ordering_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Gate that orders app-wide clears against in-flight persistence enqueues.
+    result_enqueue_gate: Arc<RwLock<()>>,
     /// Ordered persistence queue so detached WebSocket results cannot overtake later results.
-    result_persistence_tx: mpsc::UnboundedSender<ProviderPersistenceJob>,
+    result_persistence_tx: mpsc::Sender<ProviderPersistenceJob>,
 }
 
 enum ProviderPersistenceJob {
@@ -58,13 +65,20 @@ enum ProviderPersistenceJob {
         app_type: String,
         completion: oneshot::Sender<Result<(), AppError>>,
     },
+    ClearApp {
+        app_type: String,
+        completion: oneshot::Sender<Result<(), AppError>>,
+    },
+    ClearAll {
+        completion: oneshot::Sender<Result<(), AppError>>,
+    },
 }
 
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
         let (result_persistence_tx, mut result_persistence_rx) =
-            mpsc::unbounded_channel::<ProviderPersistenceJob>();
+            mpsc::channel::<ProviderPersistenceJob>(PROVIDER_RESULT_PERSISTENCE_CAPACITY);
         let persistence_db = db.clone();
         let persistence_worker = async move {
             while let Some(result) = result_persistence_rx.recv().await {
@@ -137,6 +151,37 @@ impl ProviderRouter {
                         .and_then(|result| result);
                         let _ = completion.send(persisted);
                     }
+                    ProviderPersistenceJob::ClearApp {
+                        app_type,
+                        completion,
+                    } => {
+                        let job_db = persistence_db.clone();
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            futures::executor::block_on(async move {
+                                job_db.clear_provider_health_for_app(&app_type).await
+                            })
+                        })
+                        .await
+                        .map_err(|error| {
+                            AppError::Message(format!("provider app clear worker failed: {error}"))
+                        })
+                        .and_then(|result| result);
+                        let _ = completion.send(persisted);
+                    }
+                    ProviderPersistenceJob::ClearAll { completion } => {
+                        let job_db = persistence_db.clone();
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            futures::executor::block_on(async move {
+                                job_db.clear_all_provider_health().await
+                            })
+                        })
+                        .await
+                        .map_err(|error| {
+                            AppError::Message(format!("provider clear worker failed: {error}"))
+                        })
+                        .and_then(|result| result);
+                        let _ = completion.send(persisted);
+                    }
                 }
             }
         };
@@ -156,6 +201,7 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             result_ordering_locks: Arc::new(RwLock::new(HashMap::new())),
+            result_enqueue_gate: Arc::new(RwLock::new(())),
             result_persistence_tx,
         }
     }
@@ -280,6 +326,7 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
+        let enqueue_guard = self.result_enqueue_gate.read().await;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
         let failure_threshold = self
@@ -302,10 +349,12 @@ impl ProviderRouter {
             error_msg,
             failure_threshold,
             Some(completion_tx),
-        )?;
+        )
+        .await?;
         #[cfg(test)]
         RESULTS_ENQUEUED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(ordering_guard);
+        drop(enqueue_guard);
         completion_rx.await.map_err(|_| {
             AppError::Message("provider result persistence worker stopped".to_string())
         })?
@@ -320,20 +369,24 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
+        let enqueue_guard = self.result_enqueue_gate.read().await;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
         let failure_threshold = self
             .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
-        let result = self.enqueue_result_persistence(
-            provider_id,
-            app_type,
-            success,
-            error_msg,
-            failure_threshold,
-            None,
-        );
+        let result = self
+            .enqueue_result_persistence(
+                provider_id,
+                app_type,
+                success,
+                error_msg,
+                failure_threshold,
+                None,
+            )
+            .await;
         drop(ordering_guard);
+        drop(enqueue_guard);
         result
     }
 
@@ -353,7 +406,7 @@ impl ProviderRouter {
         }
     }
 
-    fn enqueue_result_persistence(
+    async fn enqueue_result_persistence(
         &self,
         provider_id: &str,
         app_type: &str,
@@ -371,6 +424,7 @@ impl ProviderRouter {
                 failure_threshold,
                 completion,
             })
+            .await
             .map_err(|_| {
                 AppError::Message("provider result persistence worker stopped".to_string())
             })
@@ -390,6 +444,7 @@ impl ProviderRouter {
         provider_id: &str,
         app_type: &str,
     ) -> Result<(), AppError> {
+        let enqueue_guard = self.result_enqueue_gate.read().await;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
         let circuit_key = format!("{app_type}:{provider_id}");
@@ -401,15 +456,53 @@ impl ProviderRouter {
                 app_type: app_type.to_string(),
                 completion: completion_tx,
             })
+            .await
             .map_err(|_| {
                 AppError::Message("provider result persistence worker stopped".to_string())
             })?;
         drop(ordering_guard);
+        drop(enqueue_guard);
         completion_rx.await.map_err(|_| {
             AppError::Message("provider result persistence worker stopped".to_string())
         })?
     }
 
+    /// Clear one app's persisted provider health after all older queued results.
+    pub async fn clear_provider_health_for_app(&self, app_type: &str) -> Result<(), AppError> {
+        let enqueue_guard = self.result_enqueue_gate.write().await;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.result_persistence_tx
+            .send(ProviderPersistenceJob::ClearApp {
+                app_type: app_type.to_string(),
+                completion: completion_tx,
+            })
+            .await
+            .map_err(|_| {
+                AppError::Message("provider result persistence worker stopped".to_string())
+            })?;
+        drop(enqueue_guard);
+        completion_rx.await.map_err(|_| {
+            AppError::Message("provider result persistence worker stopped".to_string())
+        })?
+    }
+
+    /// Clear all persisted provider health after all older queued results.
+    pub async fn clear_all_provider_health(&self) -> Result<(), AppError> {
+        let enqueue_guard = self.result_enqueue_gate.write().await;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.result_persistence_tx
+            .send(ProviderPersistenceJob::ClearAll {
+                completion: completion_tx,
+            })
+            .await
+            .map_err(|_| {
+                AppError::Message("provider result persistence worker stopped".to_string())
+            })?;
+        drop(enqueue_guard);
+        completion_rx.await.map_err(|_| {
+            AppError::Message("provider result persistence worker stopped".to_string())
+        })?
+    }
     /// 仅释放 HalfOpen permit，不影响健康统计（neutral 接口）
     ///
     /// 用于整流器等场景：请求结果不应计入 Provider 健康度，
@@ -968,5 +1061,141 @@ mod tests {
         );
         assert_eq!(health.consecutive_failures, 0);
         assert_eq!(health.last_error, None);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn detached_result_persistence_applies_backpressure_when_queue_is_full() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let router = Arc::new(ProviderRouter::new(db));
+
+        RESULT_PERSISTENCE_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_RESULT_PERSISTENCE.store(false, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        router
+            .record_result_detached("seed-provider", "codex", false, true, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !RESULT_PERSISTENCE_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("persistence worker did not pause");
+
+        let mut queued = Vec::new();
+        for index in 0..=PROVIDER_RESULT_PERSISTENCE_CAPACITY {
+            let queued_router = router.clone();
+            queued.push(tokio::spawn(async move {
+                queued_router
+                    .record_result_detached(
+                        &format!("queued-provider-{index}"),
+                        "codex",
+                        false,
+                        true,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queued.iter().filter(|task| task.is_finished()).count()
+                < PROVIDER_RESULT_PERSISTENCE_CAPACITY
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue did not accept its bounded capacity");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            queued.iter().any(|task| !task.is_finished()),
+            "detached result queue accepted unbounded work without backpressure"
+        );
+
+        RELEASE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
+        for task in queued {
+            task.await.unwrap();
+        }
+        router
+            .clear_all_provider_health()
+            .await
+            .expect("drain queued persistence before test exit");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn app_health_clear_waits_behind_detached_result_persistence() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "clear-provider".to_string(),
+            "Clear Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let barrier_provider = Provider::with_id(
+            "clear-barrier-provider".to_string(),
+            "Clear Barrier Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &barrier_provider).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+
+        RESULT_PERSISTENCE_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_RESULT_PERSISTENCE.store(false, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        router
+            .record_result_detached(
+                &provider.id,
+                "codex",
+                false,
+                false,
+                Some("stale failure".to_string()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !RESULT_PERSISTENCE_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached result persistence did not pause");
+
+        let clear_router = router.clone();
+        let clear = tokio::spawn(async move {
+            clear_router
+                .clear_provider_health_for_app("codex")
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let clear_finished_before_older_result = clear.is_finished();
+
+        RELEASE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
+        clear.await.unwrap();
+        router
+            .record_result(&barrier_provider.id, "codex", false, true, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !clear_finished_before_older_result,
+            "app-wide health clear bypassed older queued persistence"
+        );
+        let health = db.get_provider_health(&provider.id, "codex").await.unwrap();
+        assert!(
+            health.is_healthy,
+            "older queued result recreated health after app-wide clear"
+        );
     }
 }

@@ -77,6 +77,13 @@ impl ProxyService {
             switch_locks: SwitchLockManager::new(),
         }
     }
+    async fn provider_router_snapshot(&self) -> Option<Arc<crate::proxy::ProviderRouter>> {
+        self.server
+            .read()
+            .await
+            .as_ref()
+            .map(ProxyServer::provider_router)
+    }
 
     #[cfg(test)]
     fn apply_claude_takeover_fields(config: &mut Value, proxy_url: &str) {
@@ -887,11 +894,18 @@ impl ProxyService {
             .await
             .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
 
-        // 4) 清除该应用的健康状态（关闭代理时重置队列状态）
-        self.db
-            .clear_provider_health_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        // 4) Clear through the router queue so older detached WebSocket results cannot win later.
+        if let Some(router) = self.provider_router_snapshot().await {
+            router
+                .clear_provider_health_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        } else {
+            self.db
+                .clear_provider_health_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        }
 
         // 5) 若无其它接管，更新旧标志，并停止代理服务
         // 检查是否还有其它 app 的 enabled = true
@@ -943,9 +957,15 @@ impl ProxyService {
                 .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
         }
 
-        // 4) 清除该应用的健康状态
-        futures::executor::block_on(self.db.clear_provider_health_for_app(app_type_str))
-            .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        // 4) Clear through the router queue when one is active.
+        let provider_router = futures::executor::block_on(self.provider_router_snapshot());
+        if let Some(router) = provider_router {
+            futures::executor::block_on(router.clear_provider_health_for_app(app_type_str))
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        } else {
+            futures::executor::block_on(self.db.clear_provider_health_for_app(app_type_str))
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        }
 
         // 5) 清旧标志
         let _ = futures::executor::block_on(self.db.set_live_takeover_active(false));
@@ -1290,6 +1310,7 @@ impl ProxyService {
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
+        let provider_router = self.provider_router_snapshot().await;
         // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
         if let Err(e) = self.stop().await {
             log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
@@ -1322,11 +1343,18 @@ impl ProxyService {
             .await
             .map_err(|e| format!("删除备份失败: {e}"))?;
 
-        // 6. 重置健康状态（让健康徽章恢复为正常）
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        // Reset health after all older detached results have persisted.
+        if let Some(router) = provider_router {
+            router
+                .clear_all_provider_health()
+                .await
+                .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        } else {
+            self.db
+                .clear_all_provider_health()
+                .await
+                .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        }
 
         // 注意：不清除故障转移队列和开关状态，保留供下次开启代理时使用
         log::info!("代理已停止，Live 配置已恢复");
@@ -1337,6 +1365,7 @@ impl ProxyService {
     ///
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
+        let provider_router = self.provider_router_snapshot().await;
         // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
         if let Err(e) = self.stop().await {
             log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
@@ -1358,11 +1387,18 @@ impl ProxyService {
             .await
             .map_err(|e| format!("删除备份失败: {e}"))?;
 
-        // 5. 重置健康状态
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        // Reset health after all older detached results have persisted.
+        if let Some(router) = provider_router {
+            router
+                .clear_all_provider_health()
+                .await
+                .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        } else {
+            self.db
+                .clear_all_provider_health()
+                .await
+                .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        }
 
         log::info!("代理已停止，Live 配置已恢复（保留代理状态，下次启动将自动恢复）");
         Ok(())

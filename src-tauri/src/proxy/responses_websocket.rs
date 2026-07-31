@@ -667,12 +667,13 @@ async fn handle_connection_inner(
     {
         provider_index += 1;
     }
-    let mut provider = turn_providers.get(provider_index).cloned().ok_or_else(|| {
-        ProxyError::ConfigError(
+    let Some(mut provider) = turn_providers.get(provider_index).cloned() else {
+        let message =
             "selected Codex provider chain does not include a native Responses WebSocket provider"
-                .to_string(),
-        )
-    })?;
+                .to_string();
+        record_rejected_later_turn_failure(state, message.clone()).await;
+        return Err(ProxyError::ConfigError(message));
+    };
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
     let mut provider_attempts = 0_usize;
 
@@ -6232,6 +6233,53 @@ mod tests {
         router
             .release_permit_neutral(&fallback.id, "codex", fallback_permit.used_half_open_permit)
             .await;
+        drop(client);
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn chain_without_websocket_provider_counts_rejected_turn_once() {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let provider =
+            non_websocket_provider_with_id("chat-only", "http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider)
+            .expect("save chat-only provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select chat-only provider");
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local websocket");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .expect("send response.create");
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("unsupported-provider error JSON");
+
+        let status = server.get_status().await;
+        assert_eq!(terminal["type"], "error");
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.success_requests, 0);
+        assert_eq!(status.failed_requests, 1);
+        assert!(status.last_request_at.is_some());
+        assert!(status.last_error.as_deref().is_some_and(|message| {
+            message.contains("does not include a native Responses WebSocket provider")
+        }));
+
         drop(client);
         server.stop().await.expect("stop proxy");
     }
