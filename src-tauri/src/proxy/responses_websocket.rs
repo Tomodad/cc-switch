@@ -107,6 +107,10 @@ impl WebSocketTurnAccounting {
             }
             permit.used_half_open_permit
         } else {
+            state
+                .provider_router
+                .prepare_provider_result(&provider.id, ctx.app_type_str)
+                .await;
             false
         };
         {
@@ -132,28 +136,26 @@ impl WebSocketTurnAccounting {
 
     async fn finish_success(mut self) {
         self.finalized = true;
-        self.state
+        if let Err(error) = self
+            .state
             .provider_router
-            .release_permit_neutral(&self.provider_id, "codex", self.used_half_open_permit)
-            .await;
+            .record_result_detached(
+                &self.provider_id,
+                "codex",
+                self.used_half_open_permit,
+                true,
+                None,
+            )
+            .await
+        {
+            log::warn!(
+                "[CodexWS] Failed to record provider success (provider={}): {}",
+                self.provider_id,
+                error
+            );
+        }
         self.used_half_open_permit = false;
         drop(self._active_guard.take());
-
-        let health_state = self.state.clone();
-        let health_provider_id = self.provider_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = health_state
-                .provider_router
-                .record_result(&health_provider_id, "codex", false, true, None)
-                .await
-            {
-                log::warn!(
-                    "[CodexWS] Failed to record provider success (provider={}): {}",
-                    health_provider_id,
-                    error
-                );
-            }
-        });
         {
             let mut current_providers = self.state.current_providers.write().await;
             current_providers.insert(
@@ -646,7 +648,7 @@ async fn handle_connection_inner(
                                 "only one response.create may be in flight per WebSocket".to_string(),
                             ));
                         }
-                        let (text, next_state) = if websocket_event_is(&text, "response.create") {
+                        let (text, next_state, already_sent) = if websocket_event_is(&text, "response.create") {
                             let next_original_response_create = text.clone();
                             let body = response_create_body(
                                 &serde_json::from_str::<Value>(&text).map_err(|error| {
@@ -697,18 +699,31 @@ async fn handle_connection_inner(
                                 ));
                             }
 
-                            let (next_provider, text, mut next_state, next_accounting) = loop {
+                            let next_timeout_config = next_ctx.streaming_timeout_config();
+                            let next_provider_attempt_limit =
+                                websocket_provider_attempt_limit(&next_ctx);
+                            let mut next_provider_attempts = 0_usize;
+                            let (
+                                next_provider,
+                                text,
+                                next_state,
+                                next_accounting,
+                                next_upstream,
+                                already_sent,
+                            ) = loop {
                                 let candidate = next_turn_providers[next_index].clone();
+                                let mut attempt_error = None;
                                 if codex_provider_supports_responses_websocket(&candidate) {
                                     match WebSocketTurnAccounting::begin_for_provider(
                                         state,
                                         &next_ctx,
                                         &candidate,
-                                        true,
+                                        next_provider_attempts == 0,
                                     )
                                     .await
                                     {
                                         Ok(accounting) => {
+                                            next_provider_attempts += 1;
                                             let transformed = match transform_client_text(
                                                 &text,
                                                 &candidate,
@@ -723,9 +738,130 @@ async fn handle_connection_inner(
                                                     return Err(error);
                                                 }
                                             };
-                                            let (text, next_state) =
+                                            let (text, mut next_state) =
                                                 transformed.unwrap_or((text.clone(), None));
-                                            break (candidate, text, next_state, accounting);
+                                            if let Some(state) = next_state.as_mut() {
+                                                state.session_id = next_ctx.session_id.clone();
+                                            }
+                                            if candidate.id == provider.id {
+                                                break (
+                                                    candidate,
+                                                    text,
+                                                    next_state,
+                                                    accounting,
+                                                    None,
+                                                    false,
+                                                );
+                                            }
+
+                                            let request = match build_upstream_request(&candidate, headers) {
+                                                Ok(request) => request,
+                                                Err(error) => {
+                                                    accounting
+                                                        .finish_provider_attempt_failure(
+                                                            error.to_string(),
+                                                        )
+                                                        .await;
+                                                    attempt_error = Some(error);
+                                                    if next_provider_attempts
+                                                        >= next_provider_attempt_limit
+                                                    {
+                                                        return Err(attempt_error
+                                                            .expect("provider attempt failed"));
+                                                    }
+                                                    next_index += 1;
+                                                    if next_index >= next_turn_providers.len() {
+                                                        return Err(attempt_error
+                                                            .expect("provider attempt failed"));
+                                                    }
+                                                    continue;
+                                                }
+                                            };
+                                            let reconnect_started = Instant::now();
+                                            let reconnect_deadline = websocket_turn_timeout_deadline(
+                                                true,
+                                                false,
+                                                reconnect_started,
+                                                reconnect_started,
+                                                next_timeout_config,
+                                            );
+                                            let mut candidate_upstream =
+                                                match connect_upstream_with_shutdown(
+                                                    request,
+                                                    current_proxy_url.as_deref(),
+                                                    reconnect_deadline,
+                                                    &mut shutdown_rx,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Some(upstream)) => upstream,
+                                                    Ok(None) => {
+                                                        turn_accounting = Some(accounting);
+                                                        finish_websocket_shutdown(
+                                                            downstream,
+                                                            &mut turn_accounting,
+                                                        )
+                                                        .await;
+                                                        return Ok(());
+                                                    }
+                                                    Err(error) => {
+                                                        accounting
+                                                            .finish_provider_attempt_failure(
+                                                                error.to_string(),
+                                                            )
+                                                            .await;
+                                                        attempt_error = Some(error);
+                                                        if next_provider_attempts
+                                                            >= next_provider_attempt_limit
+                                                        {
+                                                            return Err(attempt_error
+                                                                .expect("provider attempt failed"));
+                                                        }
+                                                        next_index += 1;
+                                                        if next_index >= next_turn_providers.len() {
+                                                            return Err(attempt_error
+                                                                .expect("provider attempt failed"));
+                                                        }
+                                                        continue;
+                                                    }
+                                                };
+                                            match send_upstream_message(
+                                                &mut candidate_upstream,
+                                                UpstreamMessage::Text(text.clone()),
+                                                reconnect_deadline,
+                                                &mut shutdown_rx,
+                                                "later-turn initial event write",
+                                            )
+                                            .await
+                                            {
+                                                Ok(WebSocketSendOutcome::Sent) => {
+                                                    break (
+                                                        candidate,
+                                                        text,
+                                                        next_state,
+                                                        accounting,
+                                                        Some(candidate_upstream),
+                                                        true,
+                                                    );
+                                                }
+                                                Ok(WebSocketSendOutcome::Shutdown) => {
+                                                    turn_accounting = Some(accounting);
+                                                    finish_websocket_shutdown(
+                                                        downstream,
+                                                        &mut turn_accounting,
+                                                    )
+                                                    .await;
+                                                    return Ok(());
+                                                }
+                                                Err(error) => {
+                                                    accounting
+                                                        .finish_provider_attempt_failure(
+                                                            error.to_string(),
+                                                        )
+                                                        .await;
+                                                    attempt_error = Some(error);
+                                                }
+                                            }
                                         }
                                         Err(ProxyError::NoAvailableProvider)
                                             if next_ctx.app_config.auto_failover_enabled => {}
@@ -733,49 +869,15 @@ async fn handle_connection_inner(
                                     }
                                 }
                                 next_index += 1;
-                                if next_index >= next_turn_providers.len() {
-                                    return Err(ProxyError::NoAvailableProvider);
+                                if next_index >= next_turn_providers.len()
+                                    || next_provider_attempts >= next_provider_attempt_limit
+                                {
+                                    return Err(
+                                        attempt_error.unwrap_or(ProxyError::NoAvailableProvider)
+                                    );
                                 }
                             };
-                            if let Some(state) = next_state.as_mut() {
-                                state.session_id = next_ctx.session_id.clone();
-                            }
-                            let next_timeout_config = next_ctx.streaming_timeout_config();
-                            if next_provider.id != provider.id {
-                                let request = build_upstream_request(&next_provider, headers)?;
-                                let reconnect_started = Instant::now();
-                                let reconnect_deadline = websocket_turn_timeout_deadline(
-                                    true,
-                                    false,
-                                    reconnect_started,
-                                    reconnect_started,
-                                    next_timeout_config,
-                                );
-                                let next_upstream = match connect_upstream_with_shutdown(
-                                    request,
-                                    current_proxy_url.as_deref(),
-                                    reconnect_deadline,
-                                    &mut shutdown_rx,
-                                )
-                                .await
-                                {
-                                    Ok(Some(upstream)) => upstream,
-                                    Ok(None) => {
-                                        turn_accounting = Some(next_accounting);
-                                        finish_websocket_shutdown(
-                                            downstream,
-                                            &mut turn_accounting,
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                    Err(error) => {
-                                        next_accounting
-                                            .finish_provider_failure(error.to_string())
-                                            .await;
-                                        return Err(error);
-                                    }
-                                };
+                            if let Some(next_upstream) = next_upstream {
                                 provider = next_provider.clone();
                                 upstream_proxy_url = current_proxy_url;
                                 upstream = next_upstream;
@@ -789,11 +891,11 @@ async fn handle_connection_inner(
                             provider_index = next_index;
                             provider_attempt_limit =
                                 websocket_provider_attempt_limit(&turn_context);
-                            provider_attempts = 1;
+                            provider_attempts = next_provider_attempts;
                             original_response_create = next_original_response_create;
-                            (text, next_state)
+                            (text, next_state, already_sent)
                         } else {
-                            (text, None)
+                            (text, None, false)
                         };
                         if let Some(next_state) = next_state {
                             turn_state = next_state;
@@ -812,7 +914,7 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
-                        if send_upstream_message(
+                        if !already_sent && send_upstream_message(
                             &mut upstream,
                             UpstreamMessage::Text(text),
                             write_deadline,
@@ -977,9 +1079,23 @@ async fn handle_connection_inner(
                         break;
                     }
                     Err(error) => {
-                        return Err(ProxyError::ForwardFailed(format!(
-                            "upstream WebSocket read failed: {error}"
-                        )));
+                        let message = format!("upstream WebSocket read failed: {error}");
+                        if response_in_flight && !relayed_response_event {
+                            UpstreamMessage::Text(
+                                json!({
+                                    "type": "response.failed",
+                                    "response": {
+                                        "error": {
+                                            "type": "websocket_transport_error",
+                                            "message": message
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            return Err(ProxyError::ForwardFailed(message));
+                        }
                     }
                 };
 
@@ -6153,5 +6269,233 @@ mod tests {
     #[serial]
     async fn routes_websocket_through_configured_socks5h_proxy() {
         run_proxy_routing_case("socks5h").await;
+    }
+    #[tokio::test]
+    #[serial]
+    async fn later_turn_reconnect_failure_retries_remaining_websocket_provider() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-primary","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-later-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut primary =
+            websocket_provider_with_id("ws-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut unavailable =
+            websocket_provider_with_id("ws-unavailable", format!("http://{unavailable_addr}"));
+        unavailable.sort_index = Some(1);
+        let mut fallback =
+            websocket_provider_with_id("ws-later-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(2);
+        for provider in [&primary, &unavailable, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 2;
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let router = server.provider_router_for_tests();
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-primary");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.get_status().await.success_requests == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first turn accounting did not finish");
+
+        router
+            .record_result(
+                &primary.id,
+                "codex",
+                false,
+                false,
+                Some("open primary before later turn".to_string()),
+            )
+            .await
+            .unwrap();
+        let held_permit = router.allow_provider_request(&primary.id, "codex").await;
+        assert!(held_permit.allowed && held_permit.used_half_open_permit);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-primary")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(second["response"]["id"], "resp-later-fallback", "{second}");
+
+        router
+            .release_permit_neutral(&primary.id, "codex", held_permit.used_half_open_permit)
+            .await;
+        drop(client);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn generic_upstream_read_error_before_relay_retries_fallback() {
+        let bad_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_listener.local_addr().unwrap();
+        let bad_task = tokio::spawn(async move {
+            let (stream, _) = bad_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket.get_mut().write_all(&[0x83, 0x00]).await.unwrap();
+            websocket.get_mut().shutdown().await.unwrap();
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-read-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut bad = websocket_provider_with_id("ws-bad-read", format!("http://{bad_addr}"));
+        bad.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-read-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&bad, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &bad.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(response["response"]["id"], "resp-read-fallback");
+
+        drop(client);
+        bad_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn websocket_provider_health_persistence_preserves_result_order() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(ProxyConfig::default(), db.clone(), None);
+
+        accounting_for_tests(&server, &provider)
+            .finish_success()
+            .await;
+        accounting_for_tests(&server, &provider)
+            .finish_provider_failure("later provider failure".to_string())
+            .await;
+        tokio::task::yield_now().await;
+
+        let health = db
+            .get_provider_health(&provider.id, "codex")
+            .await
+            .expect("provider health row");
+        assert!(!health.is_healthy);
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_error.as_deref(), Some("later provider failure"));
     }
 }

@@ -10,7 +10,7 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,14 +18,87 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Ordered persistence queue so detached WebSocket results cannot overtake later results.
+    result_persistence_tx: mpsc::UnboundedSender<ProviderResultPersistence>,
+}
+
+struct ProviderResultPersistence {
+    provider_id: String,
+    app_type: String,
+    success: bool,
+    error_msg: Option<String>,
+    completion: Option<oneshot::Sender<Result<(), AppError>>>,
 }
 
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
+        let (result_persistence_tx, mut result_persistence_rx) =
+            mpsc::unbounded_channel::<ProviderResultPersistence>();
+        let persistence_db = db.clone();
+        let persistence_worker = async move {
+            while let Some(result) = result_persistence_rx.recv().await {
+                let ProviderResultPersistence {
+                    provider_id,
+                    app_type,
+                    success,
+                    error_msg,
+                    completion,
+                } = result;
+                let job_db = persistence_db.clone();
+                let job_provider_id = provider_id.clone();
+                let job_app_type = app_type.clone();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    futures::executor::block_on(async move {
+                        let failure_threshold = job_db
+                            .get_proxy_config_for_app(&job_app_type)
+                            .await
+                            .map(|config| config.circuit_failure_threshold)
+                            .unwrap_or(5);
+                        job_db
+                            .update_provider_health_with_threshold(
+                                &job_provider_id,
+                                &job_app_type,
+                                success,
+                                error_msg,
+                                failure_threshold,
+                            )
+                            .await
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Message(format!("provider result worker failed: {error}"))
+                })
+                .and_then(|result| result);
+                if let Some(completion) = completion {
+                    let _ = completion.send(persisted);
+                } else if let Err(error) = persisted {
+                    log::warn!(
+                        "[{}] Failed to persist detached provider result (provider={}): {}",
+                        app_type,
+                        provider_id,
+                        error
+                    );
+                }
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(persistence_worker);
+        } else {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build provider result persistence runtime")
+                    .block_on(persistence_worker);
+            });
+        }
+
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            result_persistence_tx,
         }
     }
 
@@ -108,6 +181,12 @@ impl ProviderRouter {
         Ok(result)
     }
 
+    /// Prepare the in-memory breaker before a request so terminal accounting never reads SQLite.
+    pub async fn prepare_provider_result(&self, provider_id: &str, app_type: &str) {
+        let circuit_key = format!("{app_type}:{provider_id}");
+        self.get_or_create_circuit_breaker(&circuit_key).await;
+    }
+
     /// 请求执行前获取熔断器“放行许可”
     ///
     /// - Closed：直接放行
@@ -131,34 +210,70 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
-        // 1. 按应用独立获取熔断器配置
-        let failure_threshold = match self.db.get_proxy_config_for_app(app_type).await {
-            Ok(app_config) => app_config.circuit_failure_threshold,
-            Err(_) => 5, // 默认值
-        };
+        self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
+            .await;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.enqueue_result_persistence(
+            provider_id,
+            app_type,
+            success,
+            error_msg,
+            Some(completion_tx),
+        )?;
+        completion_rx.await.map_err(|_| {
+            AppError::Message("provider result persistence worker stopped".to_string())
+        })?
+    }
 
-        // 2. 更新熔断器状态
+    /// Record the in-memory breaker result and queue ordered persistence without awaiting SQLite.
+    pub async fn record_result_detached(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+        error_msg: Option<String>,
+    ) -> Result<(), AppError> {
+        self.record_circuit_result(provider_id, app_type, used_half_open_permit, success)
+            .await;
+        self.enqueue_result_persistence(provider_id, app_type, success, error_msg, None)
+    }
+
+    async fn record_circuit_result(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+    ) {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-
         if success {
             breaker.record_success(used_half_open_permit).await;
         } else {
             breaker.record_failure(used_half_open_permit).await;
         }
+    }
 
-        // 3. 更新数据库健康状态（使用配置的阈值）
-        self.db
-            .update_provider_health_with_threshold(
-                provider_id,
-                app_type,
+    fn enqueue_result_persistence(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        success: bool,
+        error_msg: Option<String>,
+        completion: Option<oneshot::Sender<Result<(), AppError>>>,
+    ) -> Result<(), AppError> {
+        self.result_persistence_tx
+            .send(ProviderResultPersistence {
+                provider_id: provider_id.to_string(),
+                app_type: app_type.to_string(),
                 success,
-                error_msg.clone(),
-                failure_threshold,
-            )
-            .await?;
-
-        Ok(())
+                error_msg,
+                completion,
+            })
+            .map_err(|_| {
+                AppError::Message("provider result persistence worker stopped".to_string())
+            })
     }
 
     /// 重置熔断器（手动恢复）
