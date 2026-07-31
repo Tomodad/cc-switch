@@ -68,6 +68,31 @@ enum WebSocketSendOutcome {
     Shutdown,
 }
 
+struct PreRelayFallbackConnection {
+    provider: Provider,
+    proxy_url: Option<String>,
+    upstream: UpstreamSocket,
+    turn_state: TurnTransformState,
+    accounting: WebSocketTurnAccounting,
+    started: Instant,
+}
+
+struct PreRelayFallbackRequest<'a> {
+    state: &'a ProxyState,
+    headers: &'a HeaderMap,
+    turn_context: &'a RequestContext,
+    turn_providers: &'a [Provider],
+    provider_attempt_limit: usize,
+    original_response_create: &'a str,
+    timeout_config: StreamingTimeoutConfig,
+}
+
+enum PreRelayFallbackOutcome {
+    Connected(Box<PreRelayFallbackConnection>),
+    Shutdown(Box<WebSocketTurnAccounting>),
+    Exhausted,
+}
+
 #[derive(Default)]
 struct TurnTransformState {
     namespace_restore_map:
@@ -358,6 +383,131 @@ async fn finalize_later_turn_provider_exhaustion(
     error
 }
 
+async fn connect_pre_relay_fallback(
+    request: PreRelayFallbackRequest<'_>,
+    provider_index: &mut usize,
+    provider_attempts: &mut usize,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<PreRelayFallbackOutcome, ProxyError> {
+    while *provider_index + 1 < request.turn_providers.len()
+        && *provider_attempts < request.provider_attempt_limit
+    {
+        *provider_index += 1;
+        let candidate = request.turn_providers[*provider_index].clone();
+        if !codex_provider_supports_responses_websocket(&candidate) {
+            continue;
+        }
+        let retry_accounting = match WebSocketTurnAccounting::begin_for_provider(
+            request.state,
+            request.turn_context,
+            &candidate,
+            false,
+        )
+        .await
+        {
+            Ok(accounting) => accounting,
+            Err(ProxyError::NoAvailableProvider) => continue,
+            Err(error) => return Err(error),
+        };
+        *provider_attempts += 1;
+        let (retry_text, retry_state) = match transform_client_text(
+            request.original_response_create,
+            &candidate,
+            &request.turn_context.rectifier_config,
+            true,
+        ) {
+            Ok(Some((text, Some(mut retry_state)))) => {
+                retry_state.session_id = request.turn_context.session_id.clone();
+                (text, retry_state)
+            }
+            Ok(_) => {
+                retry_accounting
+                    .finish_provider_attempt_failure(
+                        "fallback response.create transform produced no turn state".to_string(),
+                    )
+                    .await;
+                continue;
+            }
+            Err(error) => {
+                finish_fallback_transform_error(retry_accounting, &error).await;
+                continue;
+            }
+        };
+        let upstream_request = match build_upstream_request(&candidate, request.headers) {
+            Ok(request) => request,
+            Err(error) => {
+                retry_accounting
+                    .finish_provider_attempt_failure(error.to_string())
+                    .await;
+                continue;
+            }
+        };
+        let retry_started = Instant::now();
+        let retry_deadline = websocket_turn_timeout_deadline(
+            true,
+            false,
+            retry_started,
+            retry_started,
+            request.timeout_config,
+        );
+        let retry_proxy_url = super::http_client::get_current_proxy_url();
+        let mut retry_upstream = match connect_upstream_with_shutdown(
+            upstream_request,
+            retry_proxy_url.as_deref(),
+            retry_deadline,
+            shutdown_rx,
+        )
+        .await
+        {
+            Ok(Some(upstream)) => upstream,
+            Ok(None) => {
+                return Ok(PreRelayFallbackOutcome::Shutdown(Box::new(
+                    retry_accounting,
+                )))
+            }
+            Err(error) => {
+                retry_accounting
+                    .finish_provider_attempt_failure(error.to_string())
+                    .await;
+                continue;
+            }
+        };
+        match send_upstream_message(
+            &mut retry_upstream,
+            UpstreamMessage::Text(retry_text),
+            retry_deadline,
+            shutdown_rx,
+            "fallback initial event write",
+        )
+        .await
+        {
+            Ok(WebSocketSendOutcome::Sent) => {
+                return Ok(PreRelayFallbackOutcome::Connected(Box::new(
+                    PreRelayFallbackConnection {
+                        provider: candidate,
+                        proxy_url: retry_proxy_url,
+                        upstream: retry_upstream,
+                        turn_state: retry_state,
+                        accounting: retry_accounting,
+                        started: retry_started,
+                    },
+                )));
+            }
+            Ok(WebSocketSendOutcome::Shutdown) => {
+                return Ok(PreRelayFallbackOutcome::Shutdown(Box::new(
+                    retry_accounting,
+                )));
+            }
+            Err(error) => {
+                retry_accounting
+                    .finish_provider_attempt_failure(error.to_string())
+                    .await;
+            }
+        }
+    }
+    Ok(PreRelayFallbackOutcome::Exhausted)
+}
+
 fn websocket_origin_is_trusted(headers: &HeaderMap) -> bool {
     let origins = headers.get_all(http::header::ORIGIN);
     if origins.iter().next().is_none() {
@@ -510,6 +660,8 @@ async fn handle_connection_inner(
     let mut provider_attempt_limit = websocket_provider_attempt_limit(&turn_context);
     let mut provider_attempts = 0_usize;
     let mut original_response_create = first_text;
+    let initial_allows_provider_fallback =
+        !response_create_has_provider_cursor(&original_response_create);
 
     let mut count_request = true;
     let mut upstream_proxy_url = super::http_client::get_current_proxy_url();
@@ -531,13 +683,24 @@ async fn handle_connection_inner(
                 Err(ProxyError::NoAvailableProvider)
                     if turn_context.app_config.auto_failover_enabled =>
                 {
-                    provider = next_websocket_provider(
-                        &turn_providers,
-                        &mut provider_index,
-                        provider_attempts,
-                        provider_attempt_limit,
-                    )
-                    .ok_or(ProxyError::NoAvailableProvider)?;
+                    if initial_allows_provider_fallback {
+                        if let Some(next) = next_websocket_provider(
+                            &turn_providers,
+                            &mut provider_index,
+                            provider_attempts,
+                            provider_attempt_limit,
+                        ) {
+                            provider = next;
+                            continue;
+                        }
+                    }
+                    let error = ProxyError::NoAvailableProvider;
+                    if count_request {
+                        record_rejected_later_turn_failure(state, error.to_string()).await;
+                    } else {
+                        record_websocket_status_failure(state, error.to_string()).await;
+                    }
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -575,14 +738,16 @@ async fn handle_connection_inner(
                 initial_accounting
                     .finish_provider_attempt_failure(error.to_string())
                     .await;
-                if let Some(next) = next_websocket_provider(
-                    &turn_providers,
-                    &mut provider_index,
-                    provider_attempts,
-                    provider_attempt_limit,
-                ) {
-                    provider = next;
-                    continue;
+                if initial_allows_provider_fallback {
+                    if let Some(next) = next_websocket_provider(
+                        &turn_providers,
+                        &mut provider_index,
+                        provider_attempts,
+                        provider_attempt_limit,
+                    ) {
+                        provider = next;
+                        continue;
+                    }
                 }
                 record_websocket_status_failure(state, error.to_string()).await;
                 return Err(error);
@@ -606,15 +771,17 @@ async fn handle_connection_inner(
                 initial_accounting
                     .finish_provider_attempt_failure(error.to_string())
                     .await;
-                if let Some(next) = next_websocket_provider(
-                    &turn_providers,
-                    &mut provider_index,
-                    provider_attempts,
-                    provider_attempt_limit,
-                ) {
-                    provider = next;
-                    upstream_proxy_url = super::http_client::get_current_proxy_url();
-                    continue;
+                if initial_allows_provider_fallback {
+                    if let Some(next) = next_websocket_provider(
+                        &turn_providers,
+                        &mut provider_index,
+                        provider_attempts,
+                        provider_attempt_limit,
+                    ) {
+                        provider = next;
+                        upstream_proxy_url = super::http_client::get_current_proxy_url();
+                        continue;
+                    }
                 }
                 record_websocket_status_failure(state, error.to_string()).await;
                 return Err(error);
@@ -647,15 +814,17 @@ async fn handle_connection_inner(
                 initial_accounting
                     .finish_provider_attempt_failure(error.to_string())
                     .await;
-                if let Some(next) = next_websocket_provider(
-                    &turn_providers,
-                    &mut provider_index,
-                    provider_attempts,
-                    provider_attempt_limit,
-                ) {
-                    provider = next;
-                    upstream_proxy_url = super::http_client::get_current_proxy_url();
-                    continue;
+                if initial_allows_provider_fallback {
+                    if let Some(next) = next_websocket_provider(
+                        &turn_providers,
+                        &mut provider_index,
+                        provider_attempts,
+                        provider_attempt_limit,
+                    ) {
+                        provider = next;
+                        upstream_proxy_url = super::http_client::get_current_proxy_url();
+                        continue;
+                    }
                 }
                 record_websocket_status_failure(state, error.to_string()).await;
                 return Err(error);
@@ -694,11 +863,69 @@ async fn handle_connection_inner(
             } => {
                 let kind = if received_response_event { "idle" } else { "first response event" };
                 let message = format!("upstream WebSocket {kind} timed out");
+                if received_response_event {
+                    if let Some(accounting) = turn_accounting.take() {
+                        accounting
+                            .finish_provider_failure_detached(message.clone())
+                            .await;
+                    }
+                    return Err(ProxyError::Timeout(message));
+                }
                 if let Some(accounting) = turn_accounting.take() {
                     accounting
-                        .finish_provider_failure_detached(message.clone())
+                        .finish_provider_attempt_failure(message.clone())
                         .await;
                 }
+                if !response_create_has_provider_cursor(&original_response_create) {
+                    match connect_pre_relay_fallback(
+                        PreRelayFallbackRequest {
+                            state,
+                            headers,
+                            turn_context: &turn_context,
+                            turn_providers: &turn_providers,
+                            provider_attempt_limit,
+                            original_response_create: &original_response_create,
+                            timeout_config,
+                        },
+                        &mut provider_index,
+                        &mut provider_attempts,
+                        &mut shutdown_rx,
+                    )
+                    .await?
+                    {
+                        PreRelayFallbackOutcome::Connected(connection) => {
+                            let PreRelayFallbackConnection {
+                                provider: retry_provider,
+                                proxy_url,
+                                upstream: retry_upstream,
+                                turn_state: retry_state,
+                                accounting: retry_accounting,
+                                started: retry_started,
+                            } = *connection;
+                            provider = retry_provider;
+                            retain_fallback_provider = provider.id != turn_context.provider.id;
+                            upstream_proxy_url = proxy_url;
+                            upstream = retry_upstream;
+                            turn_state = retry_state;
+                            turn_accounting = Some(retry_accounting);
+                            media_rectifier_retried = false;
+                            response_in_flight = true;
+                            turn_started = retry_started;
+                            first_token_ms = None;
+                            received_response_event = false;
+                            relayed_response_event = false;
+                            last_response_event_at = retry_started;
+                            continue;
+                        }
+                        PreRelayFallbackOutcome::Shutdown(accounting) => {
+                            turn_accounting = Some(*accounting);
+                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                            break;
+                        }
+                        PreRelayFallbackOutcome::Exhausted => {}
+                    }
+                }
+                record_websocket_status_failure(state, message.clone()).await;
                 return Err(ProxyError::Timeout(message));
             }
             changed = shutdown_rx.changed() => {
@@ -797,11 +1024,12 @@ async fn handle_connection_inner(
                             };
                             let current_proxy_url = super::http_client::get_current_proxy_url();
                             if current_proxy_url.as_deref() != upstream_proxy_url.as_deref() {
-                                return Err(ProxyError::ConfigError(
-                                    "global proxy changed; reconnect WebSocket".to_string(),
-                                ));
+                                let message =
+                                    "global proxy changed; reconnect WebSocket".to_string();
+                                record_rejected_later_turn_failure(state, message.clone()).await;
+                                return Err(ProxyError::ConfigError(message));
                             }
-                            let next_turn_providers = next_ctx.get_providers();
+                            let mut next_turn_providers = next_ctx.get_providers();
                             let has_provider_cursor = response_create_has_provider_cursor(&text);
                             if next_ctx.provider.id == provider.id {
                                 retain_fallback_provider = false;
@@ -823,12 +1051,18 @@ async fn handle_connection_inner(
                                 record_rejected_later_turn_failure(state, message.clone()).await;
                                 return Err(ProxyError::ConfigError(message));
                             }
-                            let mut next_index = retained_index.unwrap_or_else(|| {
+                            if let Some(retained_index) = retained_index {
+                                let retained = next_turn_providers.remove(retained_index);
+                                next_turn_providers.insert(0, retained);
+                            }
+                            let mut next_index = if retained_index.is_some() {
+                                0
+                            } else {
                                 next_turn_providers
                                     .iter()
                                     .position(|candidate| candidate.id == next_ctx.provider.id)
                                     .unwrap_or(0)
-                            });
+                            };
                             if (!retain_fallback_provider
                                 || next_turn_providers[next_index].id == provider.id)
                                 && provider_snapshot_changed(
@@ -1532,148 +1766,59 @@ async fn handle_connection_inner(
                             let allow_provider_fallback =
                                 !response_create_has_provider_cursor(&original_response_create);
                             let mut retried = false;
-                            while allow_provider_fallback
-                                && provider_index + 1 < turn_providers.len()
-                                && provider_attempts < provider_attempt_limit
-                            {
-                                provider_index += 1;
-                                let candidate = turn_providers[provider_index].clone();
-                                if !codex_provider_supports_responses_websocket(&candidate) {
-                                    continue;
-                                }
-                                let retry_accounting = match WebSocketTurnAccounting::begin_for_provider(
-                                    state,
-                                    &turn_context,
-                                    &candidate,
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok(accounting) => accounting,
-                                    Err(ProxyError::NoAvailableProvider) => continue,
-                                    Err(error) => return Err(error),
-                                };
-                                provider_attempts += 1;
-                                let (retry_text, retry_state) = match transform_client_text(
-                                    &original_response_create,
-                                    &candidate,
-                                    &turn_context.rectifier_config,
-                                    true,
-                                ) {
-                                    Ok(Some((text, Some(mut retry_state)))) => {
-                                        retry_state.session_id = turn_context.session_id.clone();
-                                        (text, retry_state)
-                                    }
-                                    Ok(_) => {
-                                        retry_accounting
-                                            .finish_provider_attempt_failure(
-                                                "fallback response.create transform produced no turn state"
-                                                    .to_string(),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        finish_fallback_transform_error(retry_accounting, &error).await;
-                                        continue;
-                                    }
-                                };
-                                let request = match build_upstream_request(&candidate, headers) {
-                                    Ok(request) => request,
-                                    Err(error) => {
-                                        retry_accounting
-                                            .finish_provider_attempt_failure(error.to_string())
-                                            .await;
-                                        continue;
-                                    }
-                                };
-                                let retry_started = Instant::now();
-                                let retry_deadline = websocket_turn_timeout_deadline(
-                                    true,
-                                    false,
-                                    retry_started,
-                                    retry_started,
-                                    timeout_config,
-                                );
-                                let retry_proxy_url = super::http_client::get_current_proxy_url();
-                                let mut retry_upstream = match connect_upstream_with_shutdown(
-                                    request,
-                                    retry_proxy_url.as_deref(),
-                                    retry_deadline,
-                                    &mut shutdown_rx,
-                                )
-                                .await
-                                {
-                                    Ok(Some(upstream)) => upstream,
-                                    Ok(None) => {
-                                        turn_accounting = Some(retry_accounting);
-                                        finish_websocket_shutdown(
-                                            downstream,
-                                            &mut turn_accounting,
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                    Err(error) => {
-                                        retry_accounting
-                                            .finish_provider_attempt_failure(error.to_string())
-                                            .await;
-                                        continue;
-                                    }
-                                };
-                                match send_upstream_message(
-                                    &mut retry_upstream,
-                                    UpstreamMessage::Text(retry_text),
-                                    retry_deadline,
-                                    &mut shutdown_rx,
-                                    "fallback initial event write",
-                                )
-                                .await
-                                {
-                                    Ok(WebSocketSendOutcome::Sent) => {}
-                                    Ok(WebSocketSendOutcome::Shutdown) => {
-                                        turn_accounting = Some(retry_accounting);
-                                        finish_websocket_shutdown(
-                                            downstream,
-                                            &mut turn_accounting,
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                    Err(error) => {
-                                        retry_accounting
-                                            .finish_provider_attempt_failure(error.to_string())
-                                            .await;
-                                        continue;
-                                    }
-                                }
-
-                                if let Some((status_code, event)) = failed_usage.as_ref() {
-                                    spawn_codex_websocket_usage(
+                            if allow_provider_fallback {
+                                match connect_pre_relay_fallback(
+                                    PreRelayFallbackRequest {
                                         state,
-                                        &provider,
-                                        &turn_state,
-                                        event.clone(),
-                                        *status_code,
-                                        turn_started.elapsed().as_millis() as u64,
-                                        first_token_ms,
-                                    );
+                                        headers,
+                                        turn_context: &turn_context,
+                                        turn_providers: &turn_providers,
+                                        provider_attempt_limit,
+                                        original_response_create: &original_response_create,
+                                        timeout_config,
+                                    },
+                                    &mut provider_index,
+                                    &mut provider_attempts,
+                                    &mut shutdown_rx,
+                                )
+                                .await?
+                                {
+                                    PreRelayFallbackOutcome::Connected(connection) => {
+                                        let PreRelayFallbackConnection {
+                                            provider: retry_provider,
+                                            proxy_url,
+                                            upstream: retry_upstream,
+                                            turn_state: retry_state,
+                                            accounting: retry_accounting,
+                                            started: retry_started,
+                                        } = *connection;
+                                        provider = retry_provider;
+                                        retain_fallback_provider =
+                                            provider.id != turn_context.provider.id;
+                                        upstream_proxy_url = proxy_url;
+                                        upstream = retry_upstream;
+                                        turn_state = retry_state;
+                                        turn_accounting = Some(retry_accounting);
+                                        media_rectifier_retried = false;
+                                        response_in_flight = true;
+                                        turn_started = retry_started;
+                                        first_token_ms = None;
+                                        received_response_event = false;
+                                        relayed_response_event = false;
+                                        last_response_event_at = retry_started;
+                                        retried = true;
+                                    }
+                                    PreRelayFallbackOutcome::Shutdown(accounting) => {
+                                        turn_accounting = Some(*accounting);
+                                        finish_websocket_shutdown(
+                                            downstream,
+                                            &mut turn_accounting,
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                    PreRelayFallbackOutcome::Exhausted => {}
                                 }
-                                provider = candidate;
-                                retain_fallback_provider = provider.id != turn_context.provider.id;
-                                upstream_proxy_url = retry_proxy_url;
-                                upstream = retry_upstream;
-                                turn_state = retry_state;
-                                turn_accounting = Some(retry_accounting);
-                                media_rectifier_retried = false;
-                                response_in_flight = true;
-                                turn_started = retry_started;
-                                first_token_ms = None;
-                                received_response_event = false;
-                                relayed_response_event = false;
-                                last_response_event_at = retry_started;
-                                retried = true;
-                                break;
                             }
                             if retried {
                                 continue;
@@ -2372,7 +2517,10 @@ fn websocket_text_is_responses_event(text: &str) -> bool {
     event
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|event_type| event_type == "error" || event_type.starts_with("response."))
+        .is_some_and(|event_type| {
+            event_type == "error"
+                || (event_type != "response.create" && event_type.starts_with("response."))
+        })
 }
 
 fn websocket_event_has_generated_output(text: &str) -> bool {
@@ -3119,6 +3267,19 @@ mod tests {
     }
 
     #[test]
+    fn upstream_response_create_is_not_a_server_event() {
+        assert!(!websocket_text_is_responses_event(
+            &json!({"type": "response.create", "model": "echoed-client-request"}).to_string()
+        ));
+        assert!(websocket_text_is_responses_event(
+            &json!({"type": "error"}).to_string()
+        ));
+        assert!(websocket_text_is_responses_event(
+            &json!({"type": "response.completed"}).to_string()
+        ));
+    }
+
+    #[test]
     fn transforms_flat_codex_response_create_for_upstream() {
         let provider = websocket_provider("http://127.0.0.1:1".to_string());
         let input = json!({
@@ -3610,6 +3771,98 @@ mod tests {
             .as_str()
             .is_some_and(|message| message.contains("handshake timed out")));
     }
+    #[tokio::test]
+    #[serial]
+    async fn first_response_event_timeout_retries_websocket_fallback() {
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled_listener.local_addr().unwrap();
+        let stalled_task = tokio::spawn(async move {
+            let (stream, _) = stalled_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let used = match tokio::time::timeout(
+                Duration::from_secs(3),
+                fallback_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-timeout-fallback","output":[]}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            };
+            let _ = fallback_tx.send(used);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut stalled =
+            websocket_provider_with_id("ws-first-event-stalled", format!("http://{stalled_addr}"));
+        stalled.sort_index = Some(0);
+        let mut fallback = websocket_provider_with_id(
+            "ws-first-event-fallback",
+            format!("http://{fallback_addr}"),
+        );
+        fallback.sort_index = Some(1);
+        for provider in [&stalled, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &stalled.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.streaming_first_byte_timeout = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let fallback_used = fallback_rx.await.unwrap();
+
+        assert!(
+            fallback_used,
+            "first-event timeout did not try the fallback provider"
+        );
+        assert_eq!(terminal["type"], "response.completed", "{terminal}");
+        assert_eq!(terminal["response"]["id"], "resp-timeout-fallback");
+
+        drop(client);
+        stalled_task.abort();
+        let _ = stalled_task.await;
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn timeout_failure_does_not_block_shutdown_on_health_persistence() {
@@ -5754,7 +6007,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn all_initial_half_open_permit_denials_do_not_count_a_request() {
+    async fn all_initial_half_open_permit_denials_count_one_failed_request() {
         let db = Arc::new(Database::memory().expect("create in-memory database"));
         db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
             failure_threshold: 1,
@@ -5828,7 +6081,11 @@ mod tests {
 
         let status = server.get_status().await;
         assert_eq!(terminal["type"], "error");
-        assert_eq!(status.total_requests, 0);
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.success_requests, 0);
+        assert_eq!(status.failed_requests, 1);
+        assert!(status.last_request_at.is_some());
+        assert!(status.last_error.is_some());
 
         router
             .release_permit_neutral(&primary.id, "codex", primary_permit.used_half_open_permit)
@@ -6046,6 +6303,103 @@ mod tests {
         assert_eq!(terminal["response"]["id"], "resp-handshake-fallback");
 
         drop(client);
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn initial_cursor_handshake_failure_does_not_cross_provider_boundary() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (mut stream, _) = primary_listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let used = match tokio::time::timeout(
+                Duration::from_secs(2),
+                fallback_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-cursor-replayed","output":[]}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            };
+            let _ = fallback_tx.send(used);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut primary = websocket_provider_with_id(
+            "ws-cursor-handshake-primary",
+            format!("http://{primary_addr}"),
+        );
+        primary.sort_index = Some(0);
+        let mut fallback = websocket_provider_with_id(
+            "ws-cursor-handshake-fallback",
+            format!("http://{fallback_addr}"),
+        );
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-provider-cursor")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let fallback_used = fallback_rx.await.unwrap();
+        let status = server.get_status().await;
+
+        assert_eq!(terminal["type"], "error", "{terminal}");
+        assert!(
+            !fallback_used,
+            "cursor request was replayed on the fallback provider"
+        );
+        assert_eq!(status.total_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+
+        drop(client);
+        primary_task.await.unwrap();
         fallback_task.await.unwrap();
         server.stop().await.unwrap();
     }
@@ -6971,6 +7325,7 @@ mod tests {
         let second: Value = serde_json::from_str(&next_text(&mut client).await)
             .expect("proxy reconnect response JSON");
         let second_reached_upstream = second_turn_rx.await.expect("second turn observation");
+        let status = server.get_status().await;
 
         drop(client);
         upstream_task.await.expect("direct upstream task");
@@ -6981,6 +7336,13 @@ mod tests {
             .as_str()
             .is_some_and(|message| message.contains("global proxy changed")));
         assert!(!second_reached_upstream);
+        assert_eq!(status.total_requests, 2);
+        assert_eq!(status.success_requests, 1);
+        assert_eq!(status.failed_requests, 1);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("global proxy changed")));
     }
 
     #[tokio::test]
@@ -8038,6 +8400,95 @@ mod tests {
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.last_error.as_deref(), Some("later provider failure"));
     }
+    #[tokio::test]
+    #[serial]
+    async fn retained_fallback_write_failure_wraps_to_primary_provider() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_task = tokio::spawn(async move {
+            let (failed_stream, _) = primary_listener.accept().await.unwrap();
+            drop(failed_stream);
+
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-wrapped-primary","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-retained-fallback","output":[]}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), websocket.next()).await;
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut primary =
+            websocket_provider_with_id("ws-wrap-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("ws-wrap-fallback", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        app_config.circuit_failure_threshold = 2;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".into(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-retained-fallback");
+
+        FAIL_NEXT_REUSED_TURN_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(second["response"]["id"], "resp-wrapped-primary", "{second}");
+
+        drop(client);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn reused_upstream_write_failure_retries_remaining_provider() {
