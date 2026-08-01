@@ -300,6 +300,14 @@ async fn set_auto_failover_enabled_inner(
     let previous_config = config.clone();
     config.auto_failover_enabled = enabled;
 
+    // Preserve takeover state that may have changed while provider/projection work was running.
+    config.enabled = state
+        .db
+        .get_proxy_config_for_app(&app_type)
+        .await
+        .map_err(|e| e.to_string())?
+        .enabled;
+
     // 写回数据库。失败时也必须撤销已经完成的 P1 热切换和自动入队。
     #[cfg(test)]
     let config_write_result =
@@ -521,8 +529,8 @@ supports_websockets = {supports_websockets}
             .await
             .expect("add fallback");
         assert!(
-            live_supports_websockets(&current.id),
-            "adding a WebSocket-capable fallback must refresh the active takeover projection"
+            !live_supports_websockets(&current.id),
+            "a mixed failover chain must keep the active takeover projection on HTTP"
         );
 
         remove_from_failover_queue_inner(&state, "codex", &fallback.id)

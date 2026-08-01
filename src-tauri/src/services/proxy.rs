@@ -980,7 +980,7 @@ impl ProxyService {
                 let _ = self.db.set_live_takeover_active(false).await;
                 if self.is_running().await {
                     // 此时没有任何 app 处于接管状态，停止服务即可
-                    let _ = self.stop().await;
+                    self.stop().await?;
                 }
             }
             return Ok(());
@@ -1384,6 +1384,7 @@ impl ProxyService {
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
+        let _lifecycle_guard = self.server_lifecycle_lock.lock().await;
         let provider_router = self.provider_router_snapshot().await;
         let server_was_present = self.server.read().await.is_some();
         // 1. Restore live files only after every upgraded connection has stopped.
@@ -3256,10 +3257,10 @@ impl ProxyService {
 
         if require_restart {
             if let Some(server) = server_guard.take() {
-                server
-                    .stop()
-                    .await
-                    .map_err(|e| format!("重启前停止代理服务器失败: {e}"))?;
+                if let Err(error) = server.stop().await {
+                    *server_guard = Some(server);
+                    return Err(format!("重启前停止代理服务器失败: {error}"));
+                }
             }
 
             let app_handle = self.app_handle.read().await.clone();
@@ -5983,6 +5984,24 @@ model = "gpt-5.1-codex"
             .expect("backup exists");
         let expected = serde_json::to_string(&provider_b.settings_config).expect("serialize");
         assert_eq!(backup.original_config, expected);
+    }
+
+    #[tokio::test]
+    async fn manual_restore_waits_for_server_lifecycle_lock() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let guard = service.server_lifecycle_lock.lock().await;
+        let restoring = {
+            let service = service.clone();
+            tokio::spawn(async move { service.stop_with_restore().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !restoring.is_finished(),
+            "manual restore bypassed lifecycle serialization"
+        );
+        restoring.abort();
+        drop(guard);
     }
 
     #[tokio::test]

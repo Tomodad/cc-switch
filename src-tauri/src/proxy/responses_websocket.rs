@@ -1713,7 +1713,9 @@ async fn handle_connection_inner(
                             && turn_context.rectifier_config.enabled
                             && turn_context.rectifier_config.request_media_fallback
                             && response_create_contains_images(&original_response_create)
-                            && websocket_event_is(&text, "response.created")
+                            && ["response.created", "response.in_progress", "response.queued"]
+                                .iter()
+                                .any(|event_type| websocket_event_is(&text, event_type))
                         {
                             buffered_pre_output_events
                                 .push(restore_upstream_text(text, &turn_state));
@@ -2566,11 +2568,6 @@ async fn response_cursor_provider_index(
         .get(&cursor);
     let owner = match recorded_owner {
         Some(owner) => owner,
-        None if providers.len() == 1
-            && codex_provider_supports_responses_websocket(&providers[0]) =>
-        {
-            providers[0].clone()
-        }
         None => {
             return Err(ProxyError::ConfigError(format!(
                 "cannot establish the upstream provider that owns Responses cursor {cursor}; reconnect without provider cursor"
@@ -4356,6 +4353,15 @@ mod tests {
                 ))
                 .await
                 .expect("send response.created");
+            for event_type in ["response.queued", "response.in_progress"] {
+                websocket
+                    .send(UpstreamMessage::Text(
+                        json!({"type":event_type,"response":{"id":"resp-media-attempt"}})
+                            .to_string(),
+                    ))
+                    .await
+                    .expect("send pre-output lifecycle event");
+            }
             websocket
                 .send(UpstreamMessage::Text(
                     json!({
@@ -6853,6 +6859,27 @@ mod tests {
         drop(client);
         fallback_task.await.unwrap();
         server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_cursor_is_rejected_with_single_websocket_provider() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider).unwrap();
+        let server = ProxyServer::new(ProxyConfig::default(), db, None);
+        let text =
+            response_create("local-model", Some("unknown-single-provider-cursor")).to_string();
+
+        let error = response_cursor_provider_index(
+            &server.state_for_tests(),
+            &text,
+            std::slice::from_ref(&provider),
+        )
+        .await
+        .expect_err("unknown cursor must not inherit the only provider");
+        assert!(error
+            .to_string()
+            .contains("cannot establish the upstream provider"));
     }
 
     #[tokio::test]
