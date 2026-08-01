@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(test)]
 pub(crate) static FAIL_NEXT_FAILOVER_PROJECTION_REFRESH: std::sync::atomic::AtomicBool =
@@ -65,6 +65,7 @@ pub struct ProxyService {
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
+    server_lifecycle_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +80,7 @@ impl ProxyService {
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+            server_lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
     async fn provider_router_snapshot(&self) -> Option<Arc<crate::proxy::ProviderRouter>> {
@@ -376,11 +378,11 @@ impl ProxyService {
         if !auto_failover_enabled {
             return crate::proxy::providers::codex_provider_supports_responses_websocket(provider);
         }
-        self.db
-            .get_failover_providers("codex")
-            .unwrap_or_default()
-            .iter()
-            .any(crate::proxy::providers::codex_provider_supports_responses_websocket)
+        let providers = self.db.get_failover_providers("codex").unwrap_or_default();
+        !providers.is_empty()
+            && providers
+                .iter()
+                .all(crate::proxy::providers::codex_provider_supports_responses_websocket)
     }
 
     pub async fn sync_codex_live_from_provider_while_proxy_active(
@@ -790,6 +792,7 @@ impl ProxyService {
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
 
         if enabled {
+            let _lifecycle_guard = self.server_lifecycle_lock.lock().await;
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
                 self.start().await?;
@@ -966,12 +969,19 @@ impl ProxyService {
             .map_err(|e| format!("检查接管状态失败: {e}"))?;
 
         if !any_enabled {
-            let _ = self.db.set_live_takeover_active(false).await;
             drop(_guard);
-
-            if self.is_running().await {
-                // 此时没有任何 app 处于接管状态，停止服务即可
-                let _ = self.stop().await;
+            let _lifecycle_guard = self.server_lifecycle_lock.lock().await;
+            let any_enabled = self
+                .db
+                .is_live_takeover_active()
+                .await
+                .map_err(|e| format!("重新检查接管状态失败: {e}"))?;
+            if !any_enabled {
+                let _ = self.db.set_live_takeover_active(false).await;
+                if self.is_running().await {
+                    // 此时没有任何 app 处于接管状态，停止服务即可
+                    let _ = self.stop().await;
+                }
             }
             return Ok(());
         }
@@ -5377,7 +5387,7 @@ supports_websockets = false
         );
     }
     #[tokio::test]
-    async fn codex_websocket_capability_uses_effective_failover_chain() {
+    async fn codex_websocket_capability_requires_ordered_failover_chain() {
         let db = Arc::new(Database::memory().unwrap());
         let mut current = Provider::with_id(
             "non-websocket-current".to_string(),
@@ -5404,10 +5414,10 @@ supports_websockets = false
         let service = ProxyService::new(db);
 
         assert!(
-            service
+            !service
                 .codex_effective_chain_supports_websockets(&current)
                 .await,
-            "a later WebSocket-capable failover provider must advertise the local WebSocket route"
+            "a non-WebSocket P1 must disable the local WebSocket route even when a later fallback supports it"
         );
     }
 
@@ -5973,6 +5983,24 @@ model = "gpt-5.1-codex"
             .expect("backup exists");
         let expected = serde_json::to_string(&provider_b.settings_config).expect("serialize");
         assert_eq!(backup.original_config, expected);
+    }
+
+    #[tokio::test]
+    async fn takeover_enable_waits_for_server_lifecycle_lock() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let guard = service.server_lifecycle_lock.lock().await;
+        let enabling = {
+            let service = service.clone();
+            tokio::spawn(async move { service.set_takeover_for_app("codex", true).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !enabling.is_finished(),
+            "takeover enable bypassed lifecycle serialization"
+        );
+        enabling.abort();
+        drop(guard);
     }
 
     #[tokio::test]
