@@ -201,6 +201,55 @@ pub fn codex_provider_uses_anthropic(provider: &Provider) -> bool {
 pub fn should_convert_codex_responses_to_anthropic(provider: &Provider, endpoint: &str) -> bool {
     is_codex_responses_endpoint(endpoint) && codex_provider_uses_anthropic(provider)
 }
+/// Whether a Codex provider explicitly supports the native Responses WebSocket
+/// transport that CC Switch can proxy without a protocol bridge.
+pub fn codex_provider_supports_responses_websocket(provider: &Provider) -> bool {
+    if is_codex_official_provider(provider)
+        || provider.uses_managed_account_auth()
+        || codex_provider_uses_chat_completions(provider)
+        || codex_provider_uses_anthropic(provider)
+    {
+        return false;
+    }
+
+    provider
+        .settings_config
+        .get("supports_websockets")
+        .or_else(|| provider.settings_config.get("supportsWebsockets"))
+        .and_then(JsonValue::as_bool)
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(|config| config.get("supports_websockets"))
+                .and_then(JsonValue::as_bool)
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(JsonValue::as_str)
+                .and_then(extract_codex_supports_websockets_from_toml)
+        })
+        .unwrap_or(false)
+}
+
+fn extract_codex_supports_websockets_from_toml(config_text: &str) -> Option<bool> {
+    let doc = config_text.parse::<TomlValue>().ok()?;
+
+    if let Some(active_provider) = doc.get("model_provider").and_then(TomlValue::as_str) {
+        if let Some(supported) = doc
+            .get("model_providers")
+            .and_then(|providers| providers.get(active_provider))
+            .and_then(|provider| provider.get("supports_websockets"))
+            .and_then(TomlValue::as_bool)
+        {
+            return Some(supported);
+        }
+    }
+
+    doc.get("supports_websockets").and_then(TomlValue::as_bool)
+}
 
 /// Whether a native-Responses Codex upstream needs Codex `namespace`/plugin
 /// tool declarations flattened before forwarding, plus xAI schema sanitization.
@@ -1163,6 +1212,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responses_websocket_capability_is_explicit_and_native_only() {
+        let custom = create_provider(json!({"supports_websockets": true}));
+        assert!(codex_provider_supports_responses_websocket(&custom));
+
+        let camel = create_provider(json!({"supportsWebsockets": true}));
+        assert!(codex_provider_supports_responses_websocket(&camel));
+
+        let toml = create_provider(json!({
+            "config": "model_provider = \"native\"\n[model_providers.native]\nsupports_websockets = true\n"
+        }));
+        assert!(codex_provider_supports_responses_websocket(&toml));
+
+        let absent = create_provider(json!({}));
+        assert!(!codex_provider_supports_responses_websocket(&absent));
+
+        let chat = create_provider(json!({
+            "supports_websockets": true,
+            "api_format": "chat"
+        }));
+        assert!(!codex_provider_supports_responses_websocket(&chat));
+
+        let mut managed = create_provider(json!({"supports_websockets": true}));
+        managed.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+        assert!(!codex_provider_supports_responses_websocket(&managed));
+
+        let mut official = create_provider(json!({"supports_websockets": true}));
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert!(!codex_provider_supports_responses_websocket(&official));
+    }
     #[test]
     fn grok_build_toml_exposes_upstream_credentials_and_model() {
         let adapter = CodexAdapter::new();
