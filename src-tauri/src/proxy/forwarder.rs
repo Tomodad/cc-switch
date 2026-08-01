@@ -3401,7 +3401,7 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn apply_local_proxy_body_overrides(
+pub(crate) fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,
 ) -> bool {
@@ -3455,7 +3455,7 @@ fn merge_json_override_inner(target: &mut Value, patch: &Value, is_top_level: bo
     }
 }
 
-fn apply_local_proxy_header_overrides(
+pub(crate) fn apply_local_proxy_header_overrides(
     headers: &mut http::HeaderMap,
     overrides: Option<&LocalProxyRequestOverrides>,
     is_copilot: bool,
@@ -3549,7 +3549,7 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
     )
 }
 
-fn prepare_upstream_request_body(request_body: Value) -> Value {
+pub(crate) fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 

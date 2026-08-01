@@ -2754,6 +2754,11 @@ impl ProxyService {
         let mut updated =
             crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
                 .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
+        let supports_websockets = provider
+            .is_some_and(crate::proxy::providers::codex_provider_supports_responses_websocket);
+        updated =
+            crate::codex_config::update_codex_supports_websockets(&updated, supports_websockets)
+                .map_err(|e| format!("Failed to update Codex WebSocket capability: {e}"))?;
 
         if let Some(upstream_model) =
             provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
@@ -5281,6 +5286,75 @@ wire_api = "chat"
         assert_eq!(
             provider.get("wire_api").and_then(|v| v.as_str()),
             Some("responses")
+        );
+    }
+
+    #[test]
+    fn apply_codex_proxy_toml_config_advertises_explicit_native_websocket_support() {
+        let input = r#"
+model_provider = "custom_native"
+
+[model_providers.custom_native]
+name = "Custom Native"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+supports_websockets = false
+"#;
+        let provider = Provider::with_id(
+            "custom-native".to_string(),
+            "Custom Native".to_string(),
+            serde_json::json!({
+                "base_url": "https://custom.example/v1",
+                "supports_websockets": true
+            }),
+            None,
+        );
+
+        let output = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            input,
+            "http://127.0.0.1:5000/v1",
+            Some(&provider),
+        )
+        .expect("apply proxy config");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid TOML");
+
+        assert_eq!(
+            parsed["model_providers"]["custom_native"]["supports_websockets"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_codex_proxy_toml_config_rejects_unverified_websocket_support() {
+        let input = r#"
+model_provider = "custom_native"
+
+[model_providers.custom_native]
+name = "Custom Native"
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+supports_websockets = true
+"#;
+        let provider = Provider::with_id(
+            "custom-native".to_string(),
+            "Custom Native".to_string(),
+            serde_json::json!({
+                "base_url": "https://custom.example/v1"
+            }),
+            None,
+        );
+
+        let output = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            input,
+            "http://127.0.0.1:5000/v1",
+            Some(&provider),
+        )
+        .expect("apply proxy config");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid TOML");
+
+        assert_eq!(
+            parsed["model_providers"]["custom_native"]["supports_websockets"].as_bool(),
+            Some(false)
         );
     }
 
