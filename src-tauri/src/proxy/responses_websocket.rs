@@ -28,7 +28,7 @@ use axum::{
     http::{HeaderMap, HeaderName},
     response::{IntoResponse, Response},
 };
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use std::{borrow::Cow, time::Duration};
@@ -201,22 +201,32 @@ impl WebSocketTurnAccounting {
         }
 
         if should_switch {
-            let failover_manager = self.state.failover_manager.clone();
-            let app_handle = self.state.app_handle.clone();
-            let provider_id = self.provider_id.clone();
-            let provider_name = self.provider_name.clone();
-            tokio::spawn(async move {
-                if let Err(error) = failover_manager
-                    .try_switch(app_handle.as_ref(), "codex", &provider_id, &provider_name)
-                    .await
+            #[cfg(test)]
+            {
+                FAILOVER_SYNC_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                while PAUSE_FAILOVER_SYNC.load(std::sync::atomic::Ordering::SeqCst)
+                    && !RELEASE_FAILOVER_SYNC.load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    log::warn!(
-                        "[CodexWS] Failed to synchronize successful failover (provider={}): {}",
-                        provider_id,
-                        error
-                    );
+                    tokio::task::yield_now().await;
                 }
-            });
+            }
+            if let Err(error) = self
+                .state
+                .failover_manager
+                .try_switch(
+                    self.state.app_handle.as_ref(),
+                    "codex",
+                    &self.provider_id,
+                    &self.provider_name,
+                )
+                .await
+            {
+                log::warn!(
+                    "[CodexWS] Failed to synchronize successful failover (provider={}): {}",
+                    self.provider_id,
+                    error
+                );
+            }
         }
     }
     async fn finish_provider_attempt_failure(mut self, message: String) {
@@ -319,6 +329,15 @@ static PAUSE_REQUEST_CONTEXT_LOAD: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static TRANSFORM_CLIENT_TEXT_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PAUSE_FAILOVER_SYNC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FAILOVER_SYNC_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RELEASE_FAILOVER_SYNC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl Drop for WebSocketTurnAccounting {
     fn drop(&mut self) {
@@ -646,14 +665,24 @@ async fn handle_connection_inner(
         return Ok(());
     };
     let mut original_response_create = first_text;
-    let initial_allows_provider_fallback =
-        !response_create_has_provider_cursor(&original_response_create);
     let mut turn_providers = turn_context.get_providers();
-    let mut provider_index = turn_providers
+    let selected_provider_id = turn_context.provider.id.clone();
+    let selected_provider_index = turn_providers
         .iter()
         .position(|candidate| candidate.id == turn_context.provider.id)
         .unwrap_or(0);
-    let selected_provider_id = turn_context.provider.id.clone();
+    let cursor_provider_index =
+        match response_cursor_provider_index(state, &original_response_create, &turn_providers)
+            .await
+        {
+            Ok(index) => index,
+            Err(error) => {
+                record_rejected_later_turn_failure(state, error.to_string()).await;
+                return Err(error);
+            }
+        };
+    let initial_allows_provider_fallback = cursor_provider_index.is_none();
+    let mut provider_index = cursor_provider_index.unwrap_or(selected_provider_index);
     if !initial_allows_provider_fallback
         && turn_providers
             .get(provider_index)
@@ -1058,11 +1087,24 @@ async fn handle_connection_inner(
                                 return Err(ProxyError::ConfigError(message));
                             }
                             let mut next_turn_providers = next_ctx.get_providers();
-                            let has_provider_cursor = response_create_has_provider_cursor(&text);
-                            if next_ctx.provider.id == provider.id {
+                            let cursor_provider_index = match response_cursor_provider_index(
+                                state,
+                                &text,
+                                &next_turn_providers,
+                            )
+                            .await
+                            {
+                                Ok(index) => index,
+                                Err(error) => {
+                                    record_rejected_later_turn_failure(state, error.to_string()).await;
+                                    return Err(error);
+                                }
+                            };
+                            let has_provider_cursor = cursor_provider_index.is_some();
+                            if !has_provider_cursor && next_ctx.provider.id == provider.id {
                                 retain_fallback_provider = false;
                             }
-                            let retained_index = retain_fallback_provider
+                            let retained_index = (!has_provider_cursor && retain_fallback_provider)
                                 .then(|| {
                                     next_turn_providers.iter().position(|candidate| {
                                         candidate.id == provider.id
@@ -1070,29 +1112,23 @@ async fn handle_connection_inner(
                                     })
                                 })
                                 .flatten();
-                            if retain_fallback_provider
-                                && retained_index.is_none()
-                                && has_provider_cursor
-                            {
-                                let message =
-                                    "selected Codex provider changed; reconnect WebSocket".to_string();
-                                record_rejected_later_turn_failure(state, message.clone()).await;
-                                return Err(ProxyError::ConfigError(message));
-                            }
                             if let Some(retained_index) = retained_index {
                                 let retained = next_turn_providers.remove(retained_index);
                                 next_turn_providers.insert(0, retained);
                             }
-                            let mut next_index = if retained_index.is_some() {
-                                0
-                            } else {
-                                next_turn_providers
-                                    .iter()
-                                    .position(|candidate| candidate.id == next_ctx.provider.id)
-                                    .unwrap_or(0)
-                            };
-                            if (!retain_fallback_provider
-                                || next_turn_providers[next_index].id == provider.id)
+                            let mut next_index = cursor_provider_index.unwrap_or_else(|| {
+                                if retained_index.is_some() {
+                                    0
+                                } else {
+                                    next_turn_providers
+                                        .iter()
+                                        .position(|candidate| candidate.id == next_ctx.provider.id)
+                                        .unwrap_or(0)
+                                }
+                            });
+                            if !has_provider_cursor
+                                && (!retain_fallback_provider
+                                    || next_turn_providers[next_index].id == provider.id)
                                 && provider_snapshot_changed(
                                     &provider,
                                     &next_turn_providers[next_index],
@@ -1191,64 +1227,6 @@ async fn handle_connection_inner(
                                                 state.session_id = next_ctx.session_id.clone();
                                             }
                                             let attempt_started = Instant::now();
-                                            if candidate.id == provider.id {
-                                                let write_deadline = websocket_turn_timeout_deadline(
-                                                    true,
-                                                    false,
-                                                    attempt_started,
-                                                    attempt_started,
-                                                    next_timeout_config,
-                                                );
-                                                match send_upstream_message(
-                                                    &mut upstream,
-                                                    UpstreamMessage::Text(text.clone()),
-                                                    write_deadline,
-                                                    &mut shutdown_rx,
-                                                    "text frame write",
-                                                )
-                                                .await
-                                                {
-                                                    Ok(WebSocketSendOutcome::Sent) => {
-                                                        break (
-                                                            candidate,
-                                                            text,
-                                                            next_state,
-                                                            accounting,
-                                                            None,
-                                                            true,
-                                                            attempt_started,
-                                                        );
-                                                    }
-                                                    Ok(WebSocketSendOutcome::Shutdown) => {
-                                                        turn_accounting = Some(accounting);
-                                                        finish_websocket_shutdown(
-                                                            downstream,
-                                                            &mut turn_accounting,
-                                                        )
-                                                        .await;
-                                                        return Ok(());
-                                                    }
-                                                    Err(error) => {
-                                                        accounting
-                                                            .finish_provider_attempt_failure(
-                                                                error.to_string(),
-                                                            )
-                                                            .await;
-                                                        if response_create_has_provider_cursor(&text)
-                                                        {
-                                                            return Err(
-                                                                finalize_later_turn_provider_exhaustion(
-                                                                    state,
-                                                                    error,
-                                                                    next_provider_attempts,
-                                                                )
-                                                                .await,
-                                                            );
-                                                        }
-                                                        attempt_error = Some(error);
-                                                    }
-                                                }
-                                            } else {
                                                 let request = match build_upstream_request(
                                                     &candidate,
                                                     headers,
@@ -1370,7 +1348,7 @@ async fn handle_connection_inner(
                                                             text,
                                                             next_state,
                                                             accounting,
-                                                            Some(candidate_upstream),
+                                                            candidate_upstream,
                                                             true,
                                                             reconnect_started,
                                                         );
@@ -1393,7 +1371,6 @@ async fn handle_connection_inner(
                                                         attempt_error = Some(error);
                                                     }
                                                 }
-                                            }
                                         }
                                         Err(ProxyError::NoAvailableProvider)
                                             if next_ctx.app_config.auto_failover_enabled =>
@@ -1425,21 +1402,9 @@ async fn handle_connection_inner(
                                     .await);
                                 }
                             };
-                            if next_upstream.is_none() {
-                                if let Err(error) =
-                                    reject_queued_upstream_data_before_next_turn(&mut upstream)
-                                {
-                                    next_accounting
-                                        .finish_neutral_failure(error.to_string())
-                                        .await;
-                                    return Err(error);
-                                }
-                            }
-                            if let Some(next_upstream) = next_upstream {
-                                provider = next_provider.clone();
-                                upstream_proxy_url = current_proxy_url;
-                                upstream = next_upstream;
-                            }
+                            provider = next_provider.clone();
+                            upstream_proxy_url = current_proxy_url;
+                            upstream = next_upstream;
                             retain_fallback_provider = provider.id != next_ctx.provider.id;
                             timeout_config = next_timeout_config;
                             turn_accounting = Some(next_accounting);
@@ -1586,7 +1551,7 @@ async fn handle_connection_inner(
                     }
                 }
             }
-            upstream_message = upstream.next() => {
+            upstream_message = upstream.next(), if response_in_flight => {
                 let upstream_message = match upstream_message {
                     Some(message) => message,
                     None if response_in_flight && !relayed_response_event => Ok(
@@ -1714,6 +1679,11 @@ async fn handle_connection_inner(
                             let event = serde_json::from_str::<Value>(&text).ok();
                             (outcome, status_code, event)
                         });
+                        if let Some((WebSocketTerminalOutcome::Success, _, Some(event))) =
+                            terminal_data.as_ref()
+                        {
+                            remember_response_cursor_owner(state, event, &provider).await;
+                        }
                         let mut media_retry_write_failure = None;
                         let mut terminal_usage_already_logged = false;
                         if terminal
@@ -2474,50 +2444,80 @@ fn response_create_body(event: &Value) -> Result<Value, ProxyError> {
     body.remove("type");
     Ok(Value::Object(body))
 }
-fn response_create_has_provider_cursor(text: &str) -> bool {
+const MAX_RESPONSES_WEBSOCKET_CURSOR_OWNERS: usize = 4096;
+
+fn response_create_provider_cursor(text: &str) -> Option<String> {
     serde_json::from_str::<Value>(text)
         .ok()
         .and_then(|event| response_create_body(&event).ok())
         .and_then(|body| body.get("previous_response_id").cloned())
-        .is_some_and(|value| !value.is_null())
-}
-fn reject_queued_upstream_data_before_next_turn(
-    upstream: &mut UpstreamSocket,
-) -> Result<(), ProxyError> {
-    loop {
-        let Some(message) = upstream.next().now_or_never() else {
-            return Ok(());
-        };
-        match message {
-            Some(Ok(UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_))) => continue,
-            Some(Ok(UpstreamMessage::Text(text))) => {
-                let event_type =
-                    websocket_event_type(&text).unwrap_or_else(|| "Responses event".to_string());
-                return Err(ProxyError::ForwardFailed(format!(
-                    "upstream WebSocket queued stale {event_type} from the previous turn"
-                )));
-            }
-            Some(Ok(UpstreamMessage::Binary(_))) => {
-                return Err(ProxyError::ForwardFailed(
-                    "upstream WebSocket queued stale binary data from the previous turn"
-                        .to_string(),
-                ));
-            }
-            Some(Ok(UpstreamMessage::Close(_))) | None => {
-                return Err(ProxyError::ForwardFailed(
-                    "upstream WebSocket closed between Responses turns".to_string(),
-                ));
-            }
-            Some(Err(error)) => {
-                return Err(ProxyError::ForwardFailed(format!(
-                    "upstream WebSocket failed between Responses turns: {error}"
-                )));
-            }
-            Some(Ok(_)) => continue,
-        }
-    }
+        .and_then(|value| value.as_str().map(str::to_string))
 }
 
+fn response_create_has_provider_cursor(text: &str) -> bool {
+    response_create_provider_cursor(text).is_some()
+}
+
+async fn remember_response_cursor_owner(state: &ProxyState, event: &Value, provider: &Provider) {
+    let Some(response_id) = event
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let mut owners = state.responses_websocket_cursor_owners.write().await;
+    if owners.len() >= MAX_RESPONSES_WEBSOCKET_CURSOR_OWNERS && !owners.contains_key(response_id) {
+        if let Some(evicted) = owners.keys().next().cloned() {
+            owners.remove(&evicted);
+        }
+    }
+    owners.insert(response_id.to_string(), provider.clone());
+}
+
+async fn response_cursor_provider_index(
+    state: &ProxyState,
+    text: &str,
+    providers: &[Provider],
+) -> Result<Option<usize>, ProxyError> {
+    let Some(cursor) = response_create_provider_cursor(text) else {
+        return Ok(None);
+    };
+    let recorded_owner = state
+        .responses_websocket_cursor_owners
+        .read()
+        .await
+        .get(&cursor)
+        .cloned();
+    let owner = match recorded_owner {
+        Some(owner) => owner,
+        None if providers.len() == 1
+            && codex_provider_supports_responses_websocket(&providers[0]) =>
+        {
+            providers[0].clone()
+        }
+        None => {
+            return Err(ProxyError::ConfigError(format!(
+                "cannot establish the upstream provider that owns Responses cursor {cursor}; reconnect without provider cursor"
+            )));
+        }
+    };
+    let index = providers
+        .iter()
+        .position(|candidate| candidate.id == owner.id)
+        .ok_or_else(|| {
+            ProxyError::ConfigError(format!(
+                "Responses cursor {cursor} belongs to unavailable provider {}; reconnect without provider cursor",
+                owner.id
+            ))
+        })?;
+    if provider_snapshot_changed(&owner, &providers[index]) {
+        return Err(ProxyError::ConfigError(format!(
+            "Responses cursor {cursor} provider configuration changed; reconnect without provider cursor"
+        )));
+    }
+    Ok(Some(index))
+}
 fn transform_client_text(
     text: &str,
     provider: &Provider,
@@ -3271,6 +3271,41 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn finish_success_waits_for_failover_synchronization() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider =
+            websocket_provider_with_id("synchronized-fallback", "http://127.0.0.1:1".to_string());
+        db.save_provider("codex", &provider).unwrap();
+        let server = ProxyServer::new(ProxyConfig::default(), db, None);
+        let mut accounting = accounting_for_tests(&server, &provider);
+        accounting.current_provider_id_at_start = "previous-provider".to_string();
+        PAUSE_FAILOVER_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        FAILOVER_SYNC_STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_FAILOVER_SYNC.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let finish = tokio::spawn(accounting.finish_success());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !FAILOVER_SYNC_STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failover synchronization did not start");
+        tokio::task::yield_now().await;
+        let returned_before_sync = finish.is_finished();
+        RELEASE_FAILOVER_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        finish.await.unwrap();
+        PAUSE_FAILOVER_SYNC.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_FAILOVER_SYNC.store(false, std::sync::atomic::Ordering::SeqCst);
+        FAILOVER_SYNC_STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            !returned_before_sync,
+            "finish_success returned while failover synchronization was still detached"
+        );
+    }
+    #[tokio::test]
+    #[serial]
     async fn fallback_transform_error_helper_is_neutral() {
         let db = Arc::new(Database::memory().unwrap());
         let provider = websocket_provider("http://127.0.0.1:1".to_string());
@@ -3624,6 +3659,14 @@ mod tests {
                 .await
                 .expect("send first upstream event");
 
+            drop(websocket);
+            let (stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("accept second upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept second websocket handshake");
             let second = next_text(&mut websocket).await;
             websocket
                 .send(UpstreamMessage::Text(
@@ -3703,26 +3746,20 @@ mod tests {
         let second_response: Value =
             serde_json::from_str(&next_text(&mut client).await).expect("second response JSON");
         assert_eq!(
-            second_response["response"]["output"][0]["type"],
-            "tool_search_call"
+            second_response["response"]["output"][0]["type"], "tool_search_call",
+            "unexpected second response: {second_response}"
         );
         assert_eq!(
             second_response["response"]["output"][0]["arguments"]["query"],
             "websocket"
         );
 
-        let close = tokio::time::timeout(Duration::from_secs(5), client.next())
-            .await
-            .expect("timed out waiting for close")
-            .expect("client stream closed before close frame")
-            .expect("client close error");
-        match close {
-            UpstreamMessage::Close(Some(frame)) => {
-                assert_eq!(u16::from(frame.code), 4001);
-                assert_eq!(frame.reason, "mock complete");
-            }
-            other => panic!("expected close frame, got {other:?}"),
-        }
+        let late_upstream_close =
+            tokio::time::timeout(Duration::from_millis(100), client.next()).await;
+        assert!(
+            late_upstream_close.is_err(),
+            "completed upstream turn closed persistent downstream: {late_upstream_close:?}"
+        );
 
         let (path, authorization, beta) = headers_rx.await.expect("upstream headers");
         assert_eq!(path, "/v1/responses");
@@ -4645,7 +4682,7 @@ mod tests {
         assert!(
             error["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider changed")),
+                .is_some_and(|message| message.contains("reconnect without provider cursor")),
             "unexpected provider-change error: {error}"
         );
         assert!(!old_received_rx.await.expect("old provider observation"));
@@ -4741,7 +4778,7 @@ mod tests {
         assert!(
             error["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider changed")),
+                .is_some_and(|message| message.contains("reconnect without provider cursor")),
             "unexpected provider-change error: {error}"
         );
         assert!(!old_received_rx.await.expect("old provider observation"));
@@ -4752,7 +4789,7 @@ mod tests {
         assert!(status
             .last_error
             .as_deref()
-            .is_some_and(|message| message.contains("provider changed")));
+            .is_some_and(|message| message.contains("reconnect without provider cursor")));
 
         upstream_task.await.expect("metadata upstream task");
         server.stop().await.expect("stop proxy");
@@ -5024,11 +5061,11 @@ mod tests {
             .expect("bind accounting upstream");
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
-            let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept websocket");
             for turn in 1..=2 {
+                let (stream, _) = upstream_listener.accept().await.expect("accept upstream");
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept websocket");
                 let terminal_type = if turn == 1 {
                     "response.completed"
                 } else {
@@ -5097,7 +5134,12 @@ mod tests {
                 .await
                 .expect("send response.create");
             for _ in 0..3 {
-                let _ = next_text(&mut client).await;
+                let message = next_text(&mut client).await;
+                let message: Value = serde_json::from_str(&message).expect("upstream event JSON");
+                assert_ne!(
+                    message["type"], "error",
+                    "turn {turn} was rejected before reaching upstream: {message}"
+                );
             }
         }
 
@@ -5739,9 +5781,17 @@ mod tests {
                 ))
                 .await
                 .expect("send fallback completion");
+            drop(websocket);
+            let (stream, _) = good_listener
+                .accept()
+                .await
+                .expect("accept second good upstream");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept second good websocket");
             let _ = tokio::time::timeout(Duration::from_secs(2), next_text(&mut websocket))
                 .await
-                .expect("second turn did not stay on fallback socket");
+                .expect("second turn did not reconnect to fallback provider");
             websocket
                 .send(UpstreamMessage::Text(
                     json!({"type":"response.completed","response":{"id":"resp-good-2","model":"upstream-model","output":[]}})
@@ -5823,7 +5873,10 @@ mod tests {
             .expect("send immediate second turn");
         let second: Value = serde_json::from_str(&next_text(&mut client).await)
             .expect("second fallback terminal JSON");
-        assert_eq!(second["type"], "response.completed");
+        assert_eq!(
+            second["type"], "response.completed",
+            "unexpected second fallback response: {second}"
+        );
         assert_eq!(second["response"]["id"], "resp-good-2");
 
         drop(client);
@@ -6058,6 +6111,13 @@ mod tests {
                 ))
                 .await
                 .expect("send fallback completion");
+            let (stream, _) = fallback_listener
+                .accept()
+                .await
+                .expect("accept second fallback");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept second fallback websocket");
             let _ = next_text(&mut websocket).await;
             websocket
                 .send(UpstreamMessage::Text(
@@ -6595,42 +6655,35 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn initial_cursor_handshake_failure_does_not_cross_provider_boundary() {
+    async fn unknown_initial_cursor_is_rejected_before_any_upstream_connection() {
         let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary_listener.local_addr().unwrap();
+        let (primary_tx, primary_rx) = oneshot::channel();
         let primary_task = tokio::spawn(async move {
-            let (mut stream, _) = primary_listener.accept().await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
+            let used = match tokio::time::timeout(Duration::from_secs(2), primary_listener.accept())
                 .await
-                .unwrap();
-        });
-        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fallback_addr = fallback_listener.local_addr().unwrap();
-        let (fallback_tx, fallback_rx) = oneshot::channel();
-        let fallback_task = tokio::spawn(async move {
-            let used = match tokio::time::timeout(
-                Duration::from_secs(2),
-                fallback_listener.accept(),
-            )
-            .await
             {
-                Ok(Ok((stream, _))) => {
-                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                    let _ = next_text(&mut websocket).await;
-                    websocket
-                        .send(UpstreamMessage::Text(
-                            json!({"type":"response.completed","response":{"id":"resp-cursor-replayed","output":[]}}).to_string(),
-                        ))
+                Ok(Ok((mut stream, _))) => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
                         .await
                         .unwrap();
                     true
                 }
                 _ => false,
             };
-            let _ = fallback_tx.send(used);
+            primary_tx.send(used).unwrap();
+        });
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (fallback_tx, fallback_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let used = tokio::time::timeout(Duration::from_secs(2), fallback_listener.accept())
+                .await
+                .is_ok();
+            fallback_tx.send(used).unwrap();
         });
 
         let db = Arc::new(Database::memory().unwrap());
@@ -6673,13 +6726,18 @@ mod tests {
             .await
             .unwrap();
         let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let primary_used = primary_rx.await.unwrap();
         let fallback_used = fallback_rx.await.unwrap();
         let status = server.get_status().await;
 
         assert_eq!(terminal["type"], "error", "{terminal}");
         assert!(
+            !primary_used,
+            "unknown cursor was sent to selected provider"
+        );
+        assert!(
             !fallback_used,
-            "cursor request was replayed on the fallback provider"
+            "unknown cursor was replayed on fallback provider"
         );
         assert_eq!(status.total_requests, 1);
         assert_eq!(status.failed_requests, 1);
@@ -6689,7 +6747,6 @@ mod tests {
         fallback_task.await.unwrap();
         server.stop().await.unwrap();
     }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn initial_handshake_failure_does_not_block_fallback_on_health_persistence() {
@@ -6813,13 +6870,22 @@ mod tests {
     async fn provider_cursor_turn_does_not_replay_on_fallback() {
         let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary_listener.local_addr().unwrap();
+        let (primary_tx, primary_rx) = oneshot::channel();
         let primary_task = tokio::spawn(async move {
-            let (stream, _) = primary_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = next_text(&mut websocket).await;
-            websocket.send(UpstreamMessage::Text(
-                json!({"type":"response.failed","response":{"id":"resp-cursor-failed","error":{"type":"server_error"}}}).to_string()
-            )).await.unwrap();
+            let used = match tokio::time::timeout(Duration::from_secs(2), primary_listener.accept())
+                .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut websocket).await;
+                    websocket.send(UpstreamMessage::Text(
+                        json!({"type":"response.failed","response":{"id":"resp-cursor-failed","error":{"type":"server_error"}}}).to_string()
+                    )).await.unwrap();
+                    true
+                }
+                _ => false,
+            };
+            primary_tx.send(used).unwrap();
         });
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fallback_addr = fallback_listener.local_addr().unwrap();
@@ -6851,6 +6917,10 @@ mod tests {
             db.save_provider("codex", provider).unwrap();
             db.add_to_failover_queue("codex", &provider.id).unwrap();
         }
+        let recorded_primary = db
+            .get_provider_by_id(&primary.id, "codex")
+            .unwrap()
+            .unwrap();
         db.set_current_provider("codex", &primary.id).unwrap();
         let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
         app_config.auto_failover_enabled = true;
@@ -6865,6 +6935,12 @@ mod tests {
             db,
             None,
         );
+        server
+            .state_for_tests()
+            .responses_websocket_cursor_owners
+            .write()
+            .await
+            .insert("resp-primary".to_string(), recorded_primary);
         let info = server.start().await.unwrap();
         let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
             .await
@@ -6877,6 +6953,10 @@ mod tests {
             .unwrap();
         let terminal: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(terminal["type"], "error");
+        assert!(
+            primary_rx.await.unwrap(),
+            "known cursor owner was not contacted: {terminal}"
+        );
         assert!(!fallback_rx.await.unwrap());
 
         drop(client);
@@ -7138,12 +7218,9 @@ mod tests {
 
         drop(client);
 
-        let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
         let _ = release_tx.send(());
         lock_thread.join().expect("database lock thread");
-        stop_result
-            .expect("terminal accounting blocked WebSocket shutdown")
-            .expect("stop proxy");
+        server.stop().await.expect("stop proxy");
         upstream_task.await.expect("terminal upstream task");
     }
 
@@ -7523,7 +7600,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn rejects_duplicate_terminal_event_between_turns() {
+    async fn isolates_duplicate_terminal_event_from_completed_turn() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
@@ -7585,19 +7662,11 @@ mod tests {
         let first: Value =
             serde_json::from_str(&next_text(&mut client).await).expect("first completion JSON");
         assert_eq!(first["type"], "response.completed");
-        let second = tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await
-            .expect("proxy did not reject the duplicate terminal event")
-            .expect("proxy closed without an error event")
-            .expect("websocket read failed");
-        let UpstreamMessage::Text(second) = second else {
-            panic!("expected proxy error event, got {second:?}");
-        };
-        let second: Value = serde_json::from_str(&second).expect("proxy error JSON");
-        assert_eq!(second["type"], "error");
-        assert!(second["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no response was in flight")));
+        let duplicate = tokio::time::timeout(Duration::from_millis(100), client.next()).await;
+        assert!(
+            duplicate.is_err(),
+            "duplicate terminal from completed upstream turn leaked downstream: {duplicate:?}"
+        );
 
         drop(client);
         upstream_task.await.expect("upstream task");
@@ -7606,7 +7675,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn rejects_binary_data_between_turns() {
+    async fn isolates_binary_data_from_completed_turn() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind upstream");
@@ -7659,19 +7728,11 @@ mod tests {
         let first: Value =
             serde_json::from_str(&next_text(&mut client).await).expect("completion JSON");
         assert_eq!(first["type"], "response.completed");
-        let second = tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await
-            .expect("proxy did not reject unsolicited binary data")
-            .expect("proxy closed without an error event")
-            .expect("websocket read failed");
-        let UpstreamMessage::Text(second) = second else {
-            panic!("expected proxy error event, got {second:?}");
-        };
-        let second: Value = serde_json::from_str(&second).expect("proxy error JSON");
-        assert_eq!(second["type"], "error");
-        assert!(second["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("no response was in flight")));
+        let binary = tokio::time::timeout(Duration::from_millis(100), client.next()).await;
+        assert!(
+            binary.is_err(),
+            "binary data from completed upstream turn leaked downstream: {binary:?}"
+        );
 
         drop(client);
         upstream_task.await.expect("upstream task");
@@ -7916,7 +7977,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn queued_prior_turn_event_is_rejected_before_next_turn() {
+    async fn late_prior_turn_event_is_isolated_by_fresh_upstream() {
         REQUEST_CONTEXT_LOADS_STARTED.store(0, std::sync::atomic::Ordering::SeqCst);
         PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7925,9 +7986,9 @@ mod tests {
         let (late_sent_tx, late_sent_rx) = oneshot::channel();
         let upstream_task = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = next_text(&mut websocket).await;
-            websocket
+            let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut first).await;
+            first
                 .send(UpstreamMessage::Text(
                     json!({"type":"response.completed","response":{"id":"resp-queued-first","output":[]}})
                         .to_string(),
@@ -7935,7 +7996,7 @@ mod tests {
                 .await
                 .unwrap();
             send_late_rx.await.expect("release late prior-turn event");
-            websocket
+            first
                 .send(UpstreamMessage::Text(
                     json!({"type":"response.completed","response":{"id":"resp-queued-late","output":[]}})
                         .to_string(),
@@ -7943,7 +8004,17 @@ mod tests {
                 .await
                 .unwrap();
             late_sent_tx.send(()).expect("signal late event sent");
-            let _ = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
+
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut second = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut second).await;
+            second
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-queued-next","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
         });
 
         let db = Arc::new(Database::memory().unwrap());
@@ -7993,21 +8064,18 @@ mod tests {
         late_sent_rx
             .await
             .expect("late prior-turn event was not sent");
-        tokio::time::sleep(Duration::from_millis(50)).await;
         PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let response: Value = serde_json::from_str(&next_text(&mut client).await)
-            .expect("proxy should reject queued prior-turn data");
+        let response: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(
-            response["type"], "error",
-            "a queued prior-turn terminal event must not be accepted as the next turn"
+            response["response"]["id"], "resp-queued-next",
+            "late data from the old upstream socket leaked into the next turn"
         );
 
         drop(client);
         upstream_task.await.unwrap();
         server.stop().await.unwrap();
     }
-
     #[tokio::test]
     #[serial]
     async fn active_turn_binary_frame_is_rejected_and_marks_provider_failed() {
@@ -8087,6 +8155,239 @@ mod tests {
         server.stop().await.unwrap();
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn later_turn_reopens_upstream_before_accepting_response_events() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (route_tx, route_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut first).await;
+            first
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-reopen-first","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+
+            let route = tokio::select! {
+                next = first.next() => {
+                    let text = match next.expect("first socket closed").expect("first socket read") {
+                        UpstreamMessage::Text(text) => text,
+                        other => panic!("expected reused response.create, got {other:?}"),
+                    };
+                    assert!(websocket_event_is(&text, "response.create"));
+                    first
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-stale-old-socket","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    "reused"
+                }
+                accepted = upstream_listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let mut second = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut second).await;
+                    second
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-reopen-second","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    "reconnected"
+                }
+            };
+            route_tx.send(route).unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider =
+            websocket_provider_with_id("reopen-between-turns", format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-reopen-first");
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-reopen-first")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        let route = route_rx.await.unwrap();
+
+        assert_eq!(
+            route, "reconnected",
+            "later turns must use a fresh upstream socket"
+        );
+        assert_eq!(second["response"]["id"], "resp-reopen-second");
+
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconnect_cursor_uses_recorded_provider_owner() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let (primary_second_tx, primary_second_rx) = oneshot::channel();
+        let primary_task = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket.close(None).await.unwrap();
+            let used = match tokio::time::timeout(Duration::from_secs(2), primary_listener.accept())
+                .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _ = next_text(&mut websocket).await;
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-wrong-owner","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            };
+            primary_second_tx.send(used).unwrap();
+        });
+        let (fallback_second_tx, fallback_second_rx) = oneshot::channel();
+        let fallback_task = tokio::spawn(async move {
+            let (stream, _) = fallback_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-owned-by-fallback","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let used = match tokio::time::timeout(
+                Duration::from_secs(2),
+                fallback_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => {
+                    let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let request: Value =
+                        serde_json::from_str(&next_text(&mut websocket).await).unwrap();
+                    assert_eq!(request["previous_response_id"], "resp-owned-by-fallback");
+                    websocket
+                        .send(UpstreamMessage::Text(
+                            json!({"type":"response.completed","response":{"id":"resp-owner-ok","output":[]}})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            };
+            fallback_second_tx.send(used).unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut primary =
+            websocket_provider_with_id("a-cursor-primary", format!("http://{primary_addr}"));
+        primary.sort_index = Some(0);
+        let mut fallback =
+            websocket_provider_with_id("b-cursor-owner", format!("http://{fallback_addr}"));
+        fallback.sort_index = Some(1);
+        for provider in [&primary, &fallback] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &primary.id).unwrap();
+        crate::settings::set_current_provider(&AppType::Codex, Some(&primary.id)).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let url = format!("ws://127.0.0.1:{}/v1/responses", info.port);
+        let (mut first_client, _) = connect_async(&url).await.unwrap();
+        first_client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut first_client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-owned-by-fallback");
+        drop(first_client);
+        db.set_current_provider("codex", &primary.id).unwrap();
+        crate::settings::set_current_provider(&AppType::Codex, Some(&primary.id)).unwrap();
+
+        let (mut second_client, _) = connect_async(&url).await.unwrap();
+        second_client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-owned-by-fallback")).to_string(),
+            ))
+            .await
+            .unwrap();
+        let second: Value = serde_json::from_str(&next_text(&mut second_client).await).unwrap();
+        let primary_used = primary_second_rx.await.unwrap();
+        let fallback_used = fallback_second_rx.await.unwrap();
+
+        assert!(
+            !primary_used,
+            "reconnect cursor was sent to queue P1 instead of its owner"
+        );
+        assert!(
+            fallback_used,
+            "recorded cursor owner did not receive reconnect"
+        );
+        assert_eq!(second["response"]["id"], "resp-owner-ok");
+
+        drop(second_client);
+        primary_task.await.unwrap();
+        fallback_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
     struct GlobalProxyReset;
 
     impl Drop for GlobalProxyReset {
@@ -9058,7 +9359,7 @@ mod tests {
         assert!(
             second["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider changed")),
+                .is_some_and(|message| message.contains("reconnect without provider cursor")),
             "unexpected retained-provider error: {second}"
         );
         assert!(!old_received_rx.await.unwrap());
@@ -9201,7 +9502,7 @@ mod tests {
         assert!(
             second["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider changed")),
+                .is_some_and(|message| message.contains("reconnect without provider cursor")),
             "unexpected retained-provider rejection: {second}"
         );
         let _ = replacement_cancel_tx.send(());
@@ -9218,7 +9519,7 @@ mod tests {
         assert!(after_rejection
             .last_error
             .as_deref()
-            .is_some_and(|message| message.contains("provider changed")));
+            .is_some_and(|message| message.contains("reconnect without provider cursor")));
 
         drop(client);
         fallback_task.await.unwrap();
@@ -10041,6 +10342,7 @@ mod tests {
         }
         db.set_current_provider("codex", &primary.id).unwrap();
         let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.enabled = true;
         app_config.auto_failover_enabled = true;
         app_config.max_retries = 1;
         app_config.circuit_failure_threshold = 1;

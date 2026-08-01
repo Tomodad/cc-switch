@@ -647,11 +647,19 @@ impl ProviderRouter {
                 .await;
             return Ok(());
         };
-        let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
-        let _ordering_guard = ordering_lock.try_lock().ok();
         let provider_reset_key = format!("provider:{app_type}:{provider_id}");
         let app_clear_key = format!("app:{app_type}");
-        let control_in_progress = {
+        let control_started_before_ordering = {
+            let controls = self.result_controls_in_progress.lock().map_err(|_| {
+                AppError::Message("provider result control marker lock poisoned".to_string())
+            })?;
+            controls.contains_key("all")
+                || controls.contains_key(&app_clear_key)
+                || controls.contains_key(&provider_reset_key)
+        };
+        let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
+        let _ordering_guard = ordering_lock.lock().await;
+        let control_in_progress = control_started_before_ordering || {
             let controls = self.result_controls_in_progress.lock().map_err(|_| {
                 AppError::Message("provider result control marker lock poisoned".to_string())
             })?;
@@ -775,6 +783,11 @@ impl ProviderRouter {
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, Some(app_type))
             .await?;
+        let circuit_prefix = format!("{app_type}:");
+        self.circuit_breakers
+            .write()
+            .await
+            .retain(|key, _| !key.starts_with(&circuit_prefix));
         let (completion_tx, completion_rx) = oneshot::channel();
         self.result_persistence_tx
             .send(ProviderPersistenceJob::ClearApp {
@@ -799,6 +812,7 @@ impl ProviderRouter {
         let enqueue_guard = self.result_enqueue_gate.write().await;
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, None).await?;
+        self.circuit_breakers.write().await.clear();
         let (completion_tx, completion_rx) = oneshot::channel();
         self.result_persistence_tx
             .send(ProviderPersistenceJob::ClearAll {
@@ -1460,7 +1474,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn detached_result_does_not_wait_for_same_provider_ordering_lock() {
+    async fn detached_result_waits_for_same_provider_ordering_lock() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
         db.save_provider(
@@ -1494,25 +1508,40 @@ mod tests {
         .await
         .expect("ordered result did not pause while holding the provider lock");
 
-        let detached = tokio::time::timeout(
-            Duration::from_millis(250),
-            router.record_result_detached(
-                "shared-provider",
-                "codex",
-                false,
-                false,
-                Some("concurrent failure".to_string()),
-            ),
-        )
-        .await;
+        let detached_router = router.clone();
+        let detached = tokio::spawn(async move {
+            detached_router
+                .record_result_detached(
+                    "shared-provider",
+                    "codex",
+                    false,
+                    false,
+                    Some("concurrent failure".to_string()),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !detached.is_finished(),
+            "detached accounting bypassed the per-provider ordering lock"
+        );
 
         RELEASE_RESULT_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
         blocking.await.unwrap();
-        assert!(
-            detached.is_ok(),
-            "detached accounting waited on the per-provider ordering lock"
-        );
-        detached.unwrap().unwrap();
+        detached.await.unwrap().unwrap();
+        let flush_guard = router.detached_result_flush_lock.lock().await;
+        router
+            .flush_detached_results_locked(Some("shared-provider"), Some("codex"))
+            .await
+            .unwrap();
+        drop(flush_guard);
+        let health = router
+            .db
+            .get_provider_health("shared-provider", "codex")
+            .await
+            .unwrap();
+        assert_eq!(health.consecutive_failures, 1);
         router.clear_all_provider_health().await.unwrap();
     }
 
@@ -1538,7 +1567,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn provider_reset_wins_over_detached_result_started_during_reset() {
+    async fn detached_result_waits_for_provider_reset_and_reset_wins() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
         let provider = Provider::with_id(
@@ -1580,22 +1609,28 @@ mod tests {
         .await
         .expect("provider reset did not pause before its persistence barrier");
 
-        tokio::time::timeout(
-            Duration::from_millis(250),
-            router.record_result_detached(
-                &provider.id,
-                "codex",
-                false,
-                false,
-                Some("failure racing with reset".to_string()),
-            ),
-        )
-        .await
-        .expect("detached result blocked behind provider reset")
-        .unwrap();
+        let detached_router = router.clone();
+        let detached_provider_id = provider.id.clone();
+        let detached = tokio::spawn(async move {
+            detached_router
+                .record_result_detached(
+                    &detached_provider_id,
+                    "codex",
+                    false,
+                    false,
+                    Some("failure racing with reset".to_string()),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !detached.is_finished(),
+            "detached result bypassed the provider ordering lock"
+        );
 
         RELEASE_PROVIDER_RESET_BARRIER.store(true, std::sync::atomic::Ordering::SeqCst);
         reset.await.unwrap();
+        detached.await.unwrap().unwrap();
         let flush_guard = router.detached_result_flush_lock.lock().await;
         router
             .flush_detached_results_locked(Some(&provider.id), Some("codex"))
@@ -1705,6 +1740,11 @@ mod tests {
         assert!(
             health.is_healthy,
             "older queued result recreated health after app-wide clear"
+        );
+        let permit = router.allow_provider_request(&provider.id, "codex").await;
+        assert!(
+            permit.allowed,
+            "app-wide health clear left the in-memory circuit breaker open"
         );
     }
 }

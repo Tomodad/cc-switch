@@ -18,6 +18,10 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::RwLock;
 
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_FAILOVER_PROJECTION_REFRESH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 
@@ -416,6 +420,10 @@ impl ProxyService {
         &self,
         app_type: &str,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_NEXT_FAILOVER_PROJECTION_REFRESH.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected failover projection refresh failure".to_string());
+        }
         if app_type != AppType::Codex.as_str() {
             return Ok(());
         }

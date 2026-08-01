@@ -262,6 +262,38 @@ mod tests {
         })
     }
 
+    fn codex_websocket_provider(id: &str, supports_websockets: bool) -> Provider {
+        let config = format!(
+            r#"model_provider = "{id}"
+
+[model_providers.{id}]
+name = "{id}"
+base_url = "https://{id}.example/v1"
+wire_api = "responses"
+supports_websockets = {supports_websockets}
+"#
+        );
+        Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            json!({
+                "auth": {},
+                "config": config,
+                "base_url": format!("https://{id}.example/v1"),
+                "supports_websockets": supports_websockets,
+            }),
+            None,
+        )
+    }
+
+    fn live_codex_supports_websockets(provider_id: &str) -> bool {
+        let live = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read Codex live config");
+        let parsed: toml::Value = toml::from_str(&live).expect("parse Codex live config");
+        parsed["model_providers"][provider_id]["supports_websockets"]
+            .as_bool()
+            .expect("projected supports_websockets")
+    }
     fn usage_script_with_credentials(
         api_key: Option<&str>,
         base_url: Option<&str>,
@@ -1240,6 +1272,76 @@ requires_openai_auth = true
     #[cfg(any(target_os = "macos", windows))]
     #[tokio::test]
     #[serial]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_queued_codex_provider_refreshes_websocket_projection() {
+        let _guard = test_guard();
+        let _home = TempHome::new();
+        crate::settings::reload_settings().unwrap();
+        let db = Arc::new(Database::memory().unwrap());
+        let current = codex_websocket_provider("queued-update-current", false);
+        let fallback = codex_websocket_provider("queued-update-fallback", false);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &fallback).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &fallback.id).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        assert!(!live_codex_supports_websockets(&current.id));
+
+        let updated = codex_websocket_provider(&fallback.id, true);
+        ProviderService::update(&state, AppType::Codex, None, updated).unwrap();
+
+        assert!(
+            live_codex_supports_websockets(&current.id),
+            "editing a queued fallback must refresh effective WebSocket capability"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[allow(clippy::await_holding_lock)]
+    async fn delete_queued_codex_provider_refreshes_websocket_projection() {
+        let _guard = test_guard();
+        let _home = TempHome::new();
+        crate::settings::reload_settings().unwrap();
+        let db = Arc::new(Database::memory().unwrap());
+        let current = codex_websocket_provider("queued-delete-current", false);
+        let fallback = codex_websocket_provider("queued-delete-fallback", true);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &fallback).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &fallback.id).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        assert!(live_codex_supports_websockets(&current.id));
+
+        ProviderService::delete(&state, AppType::Codex, &fallback.id).unwrap();
+
+        assert!(
+            !live_codex_supports_websockets(&current.id),
+            "deleting a queued fallback must refresh effective WebSocket capability"
+        );
+    }
+    #[tokio::test]
+    #[serial]
     async fn update_current_claude_desktop_provider_syncs_profile_when_proxy_takeover_is_active() {
         let home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
@@ -2147,6 +2249,11 @@ impl ProviderService {
         let existing_provider = state
             .db
             .get_provider_by_id(&original_id, app_type.as_str())?;
+        let previous_provider = existing_provider.clone();
+        let refresh_queued_codex_projection = matches!(app_type, AppType::Codex)
+            && state
+                .db
+                .is_in_failover_queue(app_type.as_str(), &original_id)?;
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
@@ -2358,6 +2465,26 @@ impl ProviderService {
             }
         }
 
+        if refresh_queued_codex_projection && !is_current {
+            if let Err(error) = futures::executor::block_on(
+                state
+                    .proxy_service
+                    .refresh_failover_projection_if_active(app_type.as_str()),
+            ) {
+                if let Some(previous_provider) = previous_provider.as_ref() {
+                    let _ = state.db.save_provider(app_type.as_str(), previous_provider);
+                    let _ = futures::executor::block_on(
+                        state
+                            .proxy_service
+                            .refresh_failover_projection_if_active(app_type.as_str()),
+                    );
+                }
+                return Err(AppError::Message(format!(
+                    "同步 Codex 故障转移投影失败: {error}"
+                )));
+            }
+        }
+
         Ok(true)
     }
 
@@ -2415,6 +2542,16 @@ impl ProviderService {
         }
 
         // For other apps: Check both local settings and database
+        let existing_provider = state.db.get_provider_by_id(id, app_type.as_str())?;
+        let refresh_queued_codex_projection = matches!(app_type, AppType::Codex)
+            && existing_provider
+                .as_ref()
+                .is_some_and(|provider| provider.in_failover_queue);
+        let previous_health = if refresh_queued_codex_projection {
+            futures::executor::block_on(state.db.get_provider_health_record(id, app_type.as_str()))?
+        } else {
+            None
+        };
         let local_current = crate::settings::get_current_provider(&app_type);
         let db_current = state.db.get_current_provider(app_type.as_str())?;
 
@@ -2424,7 +2561,30 @@ impl ProviderService {
             ));
         }
 
-        state.db.delete_provider(app_type.as_str(), id)
+        state.db.delete_provider(app_type.as_str(), id)?;
+        if refresh_queued_codex_projection {
+            if let Err(error) = futures::executor::block_on(
+                state
+                    .proxy_service
+                    .refresh_failover_projection_if_active(app_type.as_str()),
+            ) {
+                if let Some(provider) = existing_provider.as_ref() {
+                    let _ = state.db.save_provider(app_type.as_str(), provider);
+                }
+                if let Some(health) = previous_health.as_ref() {
+                    let _ = futures::executor::block_on(state.db.restore_provider_health(health));
+                }
+                let _ = futures::executor::block_on(
+                    state
+                        .proxy_service
+                        .refresh_failover_projection_if_active(app_type.as_str()),
+                );
+                return Err(AppError::Message(format!(
+                    "同步 Codex 故障转移投影失败: {error}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Remove provider from live config only (for additive mode apps like OpenCode, OpenClaw)

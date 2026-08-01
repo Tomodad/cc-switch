@@ -81,6 +81,11 @@ async fn remove_from_failover_queue_inner(
     app_type: &str,
     provider_id: &str,
 ) -> Result<(), String> {
+    let previous_health = state
+        .db
+        .get_provider_health_record(provider_id, app_type)
+        .await
+        .map_err(|e| e.to_string())?;
     state
         .db
         .remove_from_failover_queue(app_type, provider_id)
@@ -90,12 +95,30 @@ async fn remove_from_failover_queue_inner(
         .refresh_failover_projection_if_active(app_type)
         .await
     {
-        let _ = state.db.add_to_failover_queue(app_type, provider_id);
-        let _ = state
-            .proxy_service
-            .refresh_failover_projection_if_active(app_type)
-            .await;
-        return Err(error);
+        let rollback = async {
+            state
+                .db
+                .add_to_failover_queue(app_type, provider_id)
+                .map_err(|e| e.to_string())?;
+            if let Some(health) = previous_health.as_ref() {
+                state
+                    .db
+                    .restore_provider_health(health)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            state
+                .proxy_service
+                .refresh_failover_projection_if_active(app_type)
+                .await
+        }
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; failed to restore failover queue state: {rollback_error}"
+            )),
+        };
     }
     Ok(())
 }
@@ -124,6 +147,29 @@ pub async fn set_auto_failover_enabled(
     app_type: String,
     enabled: bool,
 ) -> Result<(), String> {
+    let switched_provider =
+        set_auto_failover_enabled_inner(&state, app_type.clone(), enabled).await?;
+    if let Some(provider_id) = switched_provider {
+        let event_data = serde_json::json!({
+            "appType": app_type,
+            "providerId": provider_id,
+            "source": "failoverEnabled"
+        });
+        let _ = app.emit("provider-switched", event_data);
+    }
+    if let Ok(new_menu) = crate::tray::create_tray_menu(&app, &state) {
+        if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+            let _ = tray.set_menu(Some(new_menu));
+        }
+    }
+    Ok(())
+}
+
+async fn set_auto_failover_enabled_inner(
+    state: &AppState,
+    app_type: String,
+    enabled: bool,
+) -> Result<Option<String>, String> {
     log::info!(
         "[Failover] Setting auto_failover_enabled: app_type='{app_type}', enabled={enabled}"
     );
@@ -138,6 +184,15 @@ pub async fn set_auto_failover_enabled(
     if enabled && !config.enabled {
         return Err("需要先启用该应用的代理接管，再开启故障转移".to_string());
     }
+    let previous_provider_id = if enabled {
+        let app_enum = crate::app_config::AppType::from_str(&app_type)
+            .map_err(|_| format!("无效的应用类型: {app_type}"))?;
+        crate::settings::get_effective_current_provider(&state.db, &app_enum)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "未设置当前供应商，无法安全开启故障转移".to_string())?
+    } else {
+        String::new()
+    };
 
     // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
     let mut auto_added_provider_id: Option<String> = None;
@@ -186,8 +241,8 @@ pub async fn set_auto_failover_enabled(
             .switch_proxy_target(&app_type, &p1_provider_id)
             .await
         {
-            if let Some(provider_id) = auto_added_provider_id {
-                let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
+            if let Some(provider_id) = auto_added_provider_id.as_ref() {
+                let _ = state.db.remove_from_failover_queue(&app_type, provider_id);
             }
             return Err(e);
         }
@@ -208,32 +263,42 @@ pub async fn set_auto_failover_enabled(
         .refresh_failover_projection_if_active(&app_type)
         .await
     {
-        let _ = state.db.update_proxy_config_for_app(previous_config).await;
-        let _ = state
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = state.db.update_proxy_config_for_app(previous_config).await {
+            rollback_errors.push(format!("restore proxy config: {rollback_error}"));
+        }
+        if enabled && previous_provider_id != p1_provider_id {
+            if let Err(rollback_error) = state
+                .proxy_service
+                .switch_proxy_target(&app_type, &previous_provider_id)
+                .await
+            {
+                rollback_errors.push(format!("restore provider target: {rollback_error}"));
+            }
+        }
+        if let Some(provider_id) = auto_added_provider_id.as_ref() {
+            if let Err(rollback_error) = state.db.remove_from_failover_queue(&app_type, provider_id)
+            {
+                rollback_errors.push(format!("restore auto-populated queue: {rollback_error}"));
+            }
+        }
+        if let Err(rollback_error) = state
             .proxy_service
             .refresh_failover_projection_if_active(&app_type)
-            .await;
-        return Err(error);
-    }
-
-    if enabled {
-        // 发射 provider-switched 事件（让前端刷新当前供应商）
-        let event_data = serde_json::json!({
-            "appType": app_type,
-            "providerId": p1_provider_id,
-            "source": "failoverEnabled"
-        });
-        let _ = app.emit("provider-switched", event_data);
-    }
-
-    // 刷新托盘菜单，确保状态同步
-    if let Ok(new_menu) = crate::tray::create_tray_menu(&app, &state) {
-        if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
-            let _ = tray.set_menu(Some(new_menu));
+            .await
+        {
+            rollback_errors.push(format!("restore live projection: {rollback_error}"));
         }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(format!(
+            "{error}; failover enable rollback failed: {}",
+            rollback_errors.join("; ")
+        ));
     }
 
-    Ok(())
+    Ok(enabled.then_some(p1_provider_id))
 }
 
 #[cfg(test)]
@@ -361,5 +426,100 @@ supports_websockets = {supports_websockets}
             !live_supports_websockets(&current.id),
             "removing the final WebSocket-capable fallback must refresh the active takeover projection"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_queue_refresh_failure_restores_provider_health() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("create database"));
+        let current = codex_provider("rollback-current", false);
+        let fallback = codex_provider("rollback-fallback", true);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &fallback).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &fallback.id).unwrap();
+        db.update_provider_health_with_threshold(
+            &fallback.id,
+            "codex",
+            false,
+            Some("preserve this failure".to_string()),
+            1,
+        )
+        .await
+        .unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        crate::services::proxy::FAIL_NEXT_FAILOVER_PROJECTION_REFRESH
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = remove_from_failover_queue_inner(&state, "codex", &fallback.id)
+            .await
+            .expect_err("projection refresh should fail");
+        assert!(error.contains("injected"));
+        assert!(db.is_in_failover_queue("codex", &fallback.id).unwrap());
+        let health = db.get_provider_health(&fallback.id, "codex").await.unwrap();
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_error.as_deref(), Some("preserve this failure"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enabling_failover_refresh_failure_restores_previous_target_and_queue() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("create database"));
+        let current = codex_provider("z-enable-current", false);
+        let mut p1 = codex_provider("a-enable-p1", true);
+        p1.sort_index = Some(0);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &p1).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        crate::settings::set_current_provider(
+            &crate::app_config::AppType::Codex,
+            Some(&current.id),
+        )
+        .unwrap();
+        db.add_to_failover_queue("codex", &p1.id).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        crate::services::proxy::FAIL_NEXT_FAILOVER_PROJECTION_REFRESH
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = set_auto_failover_enabled_inner(&state, "codex".to_string(), true)
+            .await
+            .expect_err("projection refresh should fail");
+        assert!(error.contains("injected"));
+        let config = db.get_proxy_config_for_app("codex").await.unwrap();
+        assert!(!config.auto_failover_enabled);
+        assert_eq!(
+            crate::settings::get_effective_current_provider(
+                &db,
+                &crate::app_config::AppType::Codex
+            )
+            .unwrap()
+            .as_deref(),
+            Some(current.id.as_str()),
+            "failed enable must restore the pre-switch logical target"
+        );
+        assert!(db.is_in_failover_queue("codex", &p1.id).unwrap());
+        assert_eq!(db.get_failover_queue("codex").unwrap().len(), 1);
     }
 }

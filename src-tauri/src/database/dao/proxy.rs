@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use crate::error::AppError;
 use crate::proxy::types::*;
+use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 
 use super::super::{lock_conn, Database};
@@ -526,40 +527,67 @@ impl Database {
 
     // ==================== Provider Health ====================
 
+    pub async fn get_provider_health_record(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Result<Option<ProviderHealth>, AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.query_row(
+            "SELECT provider_id, app_type, is_healthy, consecutive_failures,
+                    last_success_at, last_failure_at, last_error, updated_at
+             FROM provider_health
+             WHERE provider_id = ?1 AND app_type = ?2",
+            rusqlite::params![provider_id, app_type],
+            |row| {
+                Ok(ProviderHealth {
+                    provider_id: row.get(0)?,
+                    app_type: row.get(1)?,
+                    is_healthy: row.get::<_, i64>(2)? != 0,
+                    consecutive_failures: row.get::<_, i64>(3)? as u32,
+                    last_success_at: row.get(4)?,
+                    last_failure_at: row.get(5)?,
+                    last_error: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    pub async fn restore_provider_health(&self, health: &ProviderHealth) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "INSERT OR REPLACE INTO provider_health
+             (provider_id, app_type, is_healthy, consecutive_failures,
+              last_success_at, last_failure_at, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                health.provider_id,
+                health.app_type,
+                i64::from(health.is_healthy),
+                health.consecutive_failures as i64,
+                health.last_success_at,
+                health.last_failure_at,
+                health.last_error,
+                health.updated_at,
+            ],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// 获取Provider健康状态
     pub async fn get_provider_health(
         &self,
         provider_id: &str,
         app_type: &str,
     ) -> Result<ProviderHealth, AppError> {
-        let result = {
-            let conn = lock_conn!(self.conn);
-
-            conn.query_row(
-                "SELECT provider_id, app_type, is_healthy, consecutive_failures,
-                        last_success_at, last_failure_at, last_error, updated_at
-                 FROM provider_health
-                 WHERE provider_id = ?1 AND app_type = ?2",
-                rusqlite::params![provider_id, app_type],
-                |row| {
-                    Ok(ProviderHealth {
-                        provider_id: row.get(0)?,
-                        app_type: row.get(1)?,
-                        is_healthy: row.get::<_, i64>(2)? != 0,
-                        consecutive_failures: row.get::<_, i64>(3)? as u32,
-                        last_success_at: row.get(4)?,
-                        last_failure_at: row.get(5)?,
-                        last_error: row.get(6)?,
-                        updated_at: row.get(7)?,
-                    })
-                },
-            )
-        };
-
-        match result {
-            Ok(health) => Ok(health),
-            // 缺少记录时视为健康（关闭后清空状态，再次打开时默认正常）
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ProviderHealth {
+        Ok(self
+            .get_provider_health_record(provider_id, app_type)
+            .await?
+            .unwrap_or_else(|| ProviderHealth {
                 provider_id: provider_id.to_string(),
                 app_type: app_type.to_string(),
                 is_healthy: true,
@@ -568,9 +596,7 @@ impl Database {
                 last_failure_at: None,
                 last_error: None,
                 updated_at: chrono::Utc::now().to_rfc3339(),
-            }),
-            Err(e) => Err(AppError::Database(e.to_string())),
-        }
+            }))
     }
 
     /// 更新Provider健康状态
