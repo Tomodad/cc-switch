@@ -412,6 +412,26 @@ impl ProxyService {
         Ok(())
     }
 
+    pub async fn refresh_failover_projection_if_active(
+        &self,
+        app_type: &str,
+    ) -> Result<(), String> {
+        if app_type != AppType::Codex.as_str() {
+            return Ok(());
+        }
+        let config = self
+            .db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .map_err(|e| format!("读取 Codex 代理配置失败: {e}"))?;
+        if !config.enabled {
+            return Ok(());
+        }
+        let provider = self.require_current_provider_for_app(&AppType::Codex)?;
+        self.sync_codex_live_from_provider_while_proxy_active(&provider)
+            .await
+    }
+
     pub async fn sync_grok_live_from_provider_while_proxy_active(
         &self,
         provider: &Provider,
@@ -2817,8 +2837,12 @@ impl ProxyService {
         supports_websockets: bool,
     ) -> Result<String, String> {
         if provider.is_some_and(crate::proxy::providers::is_codex_official_provider) {
-            return crate::codex_config::apply_codex_official_proxy_route(toml_str, proxy_url)
-                .map_err(|e| format!("生成 Codex 官方接管配置失败: {e}"));
+            return crate::codex_config::apply_codex_official_proxy_route_with_websocket_capability(
+                toml_str,
+                proxy_url,
+                supports_websockets,
+            )
+            .map_err(|e| format!("生成 Codex 官方接管配置失败: {e}"));
         }
 
         let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", proxy_url)
@@ -5347,6 +5371,34 @@ supports_websockets = false
         assert_eq!(route["base_url"].as_str(), Some(proxy_url));
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert!(parsed.get("experimental_bearer_token").is_none());
+    }
+
+    #[test]
+    fn official_proxy_route_uses_effective_chain_websocket_capability() {
+        let mut provider = Provider::with_id(
+            "codex-official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({ "auth": {}, "config": "" }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        let proxy_url = "http://127.0.0.1:5000/v1";
+
+        let output = ProxyService::apply_codex_proxy_toml_config_with_websocket_capability(
+            "",
+            proxy_url,
+            Some(&provider),
+            true,
+        )
+        .expect("apply official proxy config with effective chain capability");
+        let parsed: toml::Value = toml::from_str(&output).expect("valid official route");
+        let route_id = crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID;
+
+        assert_eq!(
+            parsed["model_providers"][route_id]["supports_websockets"].as_bool(),
+            Some(true),
+            "an official P1 must expose the local WebSocket when a fallback in its effective chain supports it"
+        );
     }
 
     #[test]

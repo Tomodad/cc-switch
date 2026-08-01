@@ -272,13 +272,23 @@ fn normalize_system_proxy_url(value: Option<String>) -> Option<String> {
         return None;
     }
 
-    let normalized = if url::Url::parse(value).is_ok() {
-        value.to_string()
-    } else {
-        format!("http://{value}")
+    let normalized = match url::Url::parse(value) {
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
+                && parsed.host_str().is_some() =>
+        {
+            value.to_string()
+        }
+        Ok(parsed) if parsed.cannot_be_a_base() && !value.contains("://") => {
+            format!("http://{value}")
+        }
+        Err(_) => format!("http://{value}"),
+        Ok(_) => return None,
     };
     let parsed = url::Url::parse(&normalized).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || parsed.host_str().is_none()
+    {
         return None;
     }
     Some(normalized)
@@ -504,6 +514,22 @@ mod tests {
             .as_deref(),
             Some("http://corporate-proxy.example:8443"),
             "an irrelevant HTTP self-proxy must not bypass the HTTPS proxy selected for wss"
+        );
+    }
+
+    #[test]
+    fn websocket_scheme_proxy_preserves_schemeless_host_port_over_all_proxy() {
+        assert_eq!(
+            select_system_proxy_url(
+                "ws",
+                Some("scheme-specific.example:8080".to_string()),
+                None,
+                Some("socks5://fallback.example:1080".to_string()),
+                "socks5://fallback.example:1080".to_string(),
+            )
+            .as_deref(),
+            Some("http://scheme-specific.example:8080"),
+            "a schemeless HTTP_PROXY must remain the scheme-specific choice instead of falling back to ALL_PROXY"
         );
     }
 

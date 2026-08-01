@@ -7,7 +7,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -65,22 +65,21 @@ pub struct ProviderRouter {
     /// Capacity-one wakeup channel; duplicate wakeups coalesce with pending results.
     detached_result_notify_tx: mpsc::Sender<()>,
     /// Reset/clear operations that must win over racing detached lifecycle results.
-    result_controls_in_progress: Arc<StdMutex<HashSet<String>>>,
+    result_controls_in_progress: Arc<StdMutex<HashMap<String, usize>>>,
 }
 
 struct ResultControlMarker {
-    controls: Arc<StdMutex<HashSet<String>>>,
+    controls: Arc<StdMutex<HashMap<String, usize>>>,
     key: String,
 }
 
 impl ResultControlMarker {
-    fn new(controls: Arc<StdMutex<HashSet<String>>>, key: String) -> Result<Self, AppError> {
-        controls
-            .lock()
-            .map_err(|_| {
-                AppError::Message("provider result control marker lock poisoned".to_string())
-            })?
-            .insert(key.clone());
+    fn new(controls: Arc<StdMutex<HashMap<String, usize>>>, key: String) -> Result<Self, AppError> {
+        let mut guard = controls.lock().map_err(|_| {
+            AppError::Message("provider result control marker lock poisoned".to_string())
+        })?;
+        *guard.entry(key.clone()).or_default() += 1;
+        drop(guard);
         Ok(Self { controls, key })
     }
 }
@@ -88,7 +87,12 @@ impl ResultControlMarker {
 impl Drop for ResultControlMarker {
     fn drop(&mut self) {
         if let Ok(mut controls) = self.controls.lock() {
-            controls.remove(&self.key);
+            if let Some(count) = controls.get_mut(&self.key) {
+                *count -= 1;
+                if *count == 0 {
+                    controls.remove(&self.key);
+                }
+            }
         }
     }
 }
@@ -387,7 +391,7 @@ impl ProviderRouter {
             detached_result_pending,
             detached_result_flush_lock,
             detached_result_notify_tx,
-            result_controls_in_progress: Arc::new(StdMutex::new(HashSet::new())),
+            result_controls_in_progress: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -651,9 +655,9 @@ impl ProviderRouter {
             let controls = self.result_controls_in_progress.lock().map_err(|_| {
                 AppError::Message("provider result control marker lock poisoned".to_string())
             })?;
-            controls.contains("all")
-                || controls.contains(&app_clear_key)
-                || controls.contains(&provider_reset_key)
+            controls.contains_key("all")
+                || controls.contains_key(&app_clear_key)
+                || controls.contains_key(&provider_reset_key)
         };
         if control_in_progress {
             self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
@@ -1510,6 +1514,26 @@ mod tests {
         );
         detached.unwrap().unwrap();
         router.clear_all_provider_health().await.unwrap();
+    }
+
+    #[test]
+    fn overlapping_result_control_markers_remain_active_until_last_drop() {
+        let controls = Arc::new(StdMutex::new(HashMap::new()));
+        let key = "provider:codex:shared-provider".to_string();
+        let first = ResultControlMarker::new(controls.clone(), key.clone()).unwrap();
+        let second = ResultControlMarker::new(controls.clone(), key.clone()).unwrap();
+
+        drop(first);
+        assert!(
+            controls.lock().unwrap().contains_key(&key),
+            "dropping one overlapping control operation must not clear the shared marker"
+        );
+
+        drop(second);
+        assert!(
+            !controls.lock().unwrap().contains_key(&key),
+            "the marker should be removed after the final overlapping operation completes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

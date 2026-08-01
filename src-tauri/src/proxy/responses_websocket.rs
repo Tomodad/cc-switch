@@ -28,7 +28,7 @@ use axum::{
     http::{HeaderMap, HeaderName},
     response::{IntoResponse, Response},
 };
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use std::{borrow::Cow, time::Duration};
@@ -1142,6 +1142,19 @@ async fn handle_connection_inner(
                                                         .finish_neutral_failure(error.to_string())
                                                         .await;
                                                     attempt_error = Some(error);
+                                                    if has_provider_cursor {
+                                                        let error = attempt_error
+                                                            .take()
+                                                            .expect("provider attempt failed");
+                                                        return Err(
+                                                            finalize_later_turn_provider_exhaustion(
+                                                                state,
+                                                                error,
+                                                                next_provider_attempts,
+                                                            )
+                                                            .await,
+                                                        );
+                                                    }
                                                     if next_provider_attempts
                                                         >= next_provider_attempt_limit
                                                     {
@@ -1412,6 +1425,16 @@ async fn handle_connection_inner(
                                     .await);
                                 }
                             };
+                            if next_upstream.is_none() {
+                                if let Err(error) =
+                                    reject_queued_upstream_data_before_next_turn(&mut upstream)
+                                {
+                                    next_accounting
+                                        .finish_neutral_failure(error.to_string())
+                                        .await;
+                                    return Err(error);
+                                }
+                            }
                             if let Some(next_upstream) = next_upstream {
                                 provider = next_provider.clone();
                                 upstream_proxy_url = current_proxy_url;
@@ -2458,6 +2481,43 @@ fn response_create_has_provider_cursor(text: &str) -> bool {
         .and_then(|body| body.get("previous_response_id").cloned())
         .is_some_and(|value| !value.is_null())
 }
+fn reject_queued_upstream_data_before_next_turn(
+    upstream: &mut UpstreamSocket,
+) -> Result<(), ProxyError> {
+    loop {
+        let Some(message) = upstream.next().now_or_never() else {
+            return Ok(());
+        };
+        match message {
+            Some(Ok(UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_))) => continue,
+            Some(Ok(UpstreamMessage::Text(text))) => {
+                let event_type =
+                    websocket_event_type(&text).unwrap_or_else(|| "Responses event".to_string());
+                return Err(ProxyError::ForwardFailed(format!(
+                    "upstream WebSocket queued stale {event_type} from the previous turn"
+                )));
+            }
+            Some(Ok(UpstreamMessage::Binary(_))) => {
+                return Err(ProxyError::ForwardFailed(
+                    "upstream WebSocket queued stale binary data from the previous turn"
+                        .to_string(),
+                ));
+            }
+            Some(Ok(UpstreamMessage::Close(_))) | None => {
+                return Err(ProxyError::ForwardFailed(
+                    "upstream WebSocket closed between Responses turns".to_string(),
+                ));
+            }
+            Some(Err(error)) => {
+                return Err(ProxyError::ForwardFailed(format!(
+                    "upstream WebSocket failed between Responses turns: {error}"
+                )));
+            }
+            Some(Ok(_)) => continue,
+        }
+    }
+}
+
 fn transform_client_text(
     text: &str,
     provider: &Provider,
@@ -7761,6 +7821,186 @@ mod tests {
             TRANSFORM_CLIENT_TEXT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "later-turn transform failure must continue to the next eligible provider"
+        );
+
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn later_turn_cursor_transform_collision_does_not_advance_provider() {
+        TRANSFORM_CLIENT_TEXT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-first-turn","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let mut current = websocket_provider_with_id(
+            "later-transform-current",
+            format!("http://{upstream_addr}"),
+        );
+        current.sort_index = Some(0);
+        let mut later =
+            websocket_provider_with_id("later-transform-next", "http://127.0.0.1:9".to_string());
+        later.sort_index = Some(1);
+        for provider in [&current, &later] {
+            db.save_provider("codex", provider).unwrap();
+            db.add_to_failover_queue("codex", &provider.id).unwrap();
+        }
+        db.set_current_provider("codex", &current.id).unwrap();
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        app_config.max_retries = 1;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-first-turn");
+
+        let mut later_request = response_create("local-model", Some("resp-first-turn"));
+        later_request["tools"] = json!([
+            {"type":"function","name":"mcp__files____read","parameters":{}},
+            {"type":"namespace","name":"mcp__files__","tools":[
+                {"type":"function","name":"read","parameters":{}}
+            ]}
+        ]);
+        client
+            .send(UpstreamMessage::Text(later_request.to_string()))
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_str(&next_text(&mut client).await).expect("proxy error JSON");
+        assert_eq!(response["type"], "error");
+        assert_eq!(
+            TRANSFORM_CLIENT_TEXT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a provider-scoped cursor must not be transformed for a fallback provider"
+        );
+
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_prior_turn_event_is_rejected_before_next_turn() {
+        REQUEST_CONTEXT_LOADS_STARTED.store(0, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (send_late_tx, send_late_rx) = oneshot::channel();
+        let (late_sent_tx, late_sent_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-queued-first","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            send_late_rx.await.expect("release late prior-turn event");
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-queued-late","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            late_sent_tx.send(()).expect("signal late event sent");
+            let _ = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider_with_id(
+            "queued-prior-turn-provider",
+            format!("http://{upstream_addr}"),
+        );
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(first["response"]["id"], "resp-queued-first");
+
+        PAUSE_REQUEST_CONTEXT_LOAD.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", Some("resp-queued-first")).to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while REQUEST_CONTEXT_LOADS_STARTED.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later request context load did not pause");
+        send_late_tx.send(()).expect("send late prior-turn event");
+        late_sent_rx
+            .await
+            .expect("late prior-turn event was not sent");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        PAUSE_REQUEST_CONTEXT_LOAD.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let response: Value = serde_json::from_str(&next_text(&mut client).await)
+            .expect("proxy should reject queued prior-turn data");
+        assert_eq!(
+            response["type"], "error",
+            "a queued prior-turn terminal event must not be accepted as the next turn"
         );
 
         drop(client);
