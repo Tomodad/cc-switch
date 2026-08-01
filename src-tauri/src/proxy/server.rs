@@ -194,6 +194,7 @@ impl ProxyServer {
                             if let Err(e) = hyper::server::conn::http1::Builder::new()
                                 .preserve_header_case(true)
                                 .serve_connection(TokioIo::new(stream), service)
+                                .with_upgrades()
                                 .await
                             {
                                 // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
@@ -324,7 +325,11 @@ impl ProxyServer {
             .route("/v1/models", get(handlers::handle_models))
             // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
             .route("/responses", post(handlers::handle_responses))
-            .route("/v1/responses", post(handlers::handle_responses))
+            .route(
+                "/v1/responses",
+                get(super::responses_websocket::handle_responses_websocket)
+                    .post(handlers::handle_responses),
+            )
             .route("/v1/v1/responses", post(handlers::handle_responses))
             .route("/codex/v1/responses", post(handlers::handle_responses))
             // Grok Build uses the Responses protocol but has an independent
@@ -401,5 +406,88 @@ impl ProxyServer {
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn websocket_upgrade_status(port: u16, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to proxy");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write websocket handshake");
+
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buffer))
+                    .await
+                    .expect("timed out reading websocket handshake")
+                    .expect("read websocket handshake");
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&buffer[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v1_responses_accepts_websocket_upgrade() {
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+        let info = server.start().await.expect("start test proxy");
+        let status = websocket_upgrade_status(info.port, "/v1/responses").await;
+        server.stop().await.expect("stop test proxy");
+
+        assert_eq!(status, "HTTP/1.1 101 Switching Protocols");
+    }
+    #[tokio::test]
+    async fn v1_responses_post_remains_on_http_handler() {
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+        let info = server.start().await.expect("start test proxy");
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
+            .json(&serde_json::json!({"model": "test", "input": "hello"}))
+            .send()
+            .await
+            .expect("send HTTP Responses request");
+        let status = response.status();
+        server.stop().await.expect("stop test proxy");
+
+        assert_ne!(status, reqwest::StatusCode::METHOD_NOT_ALLOWED);
     }
 }
