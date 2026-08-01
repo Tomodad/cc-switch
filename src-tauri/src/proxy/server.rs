@@ -26,7 +26,7 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::sync::{oneshot, watch, RwLock};
@@ -151,6 +151,8 @@ pub struct ProxyServer {
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Distinguishes a completed stop retry from a server that was never started.
+    shutdown_started: AtomicBool,
 }
 
 impl ProxyServer {
@@ -188,6 +190,7 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            shutdown_started: AtomicBool::new(false),
         }
     }
 
@@ -225,6 +228,7 @@ impl ProxyServer {
 
         // 保存关闭句柄
         *self.shutdown_tx.write().await = Some(shutdown_tx);
+        self.shutdown_started.store(false, Ordering::Release);
 
         // 更新状态
         let mut status = self.state.status.write().await;
@@ -347,6 +351,7 @@ impl ProxyServer {
         // 1. 发送关闭信号。重试 stop 时 sender 可能已被首次调用消费。
         let shutdown_sent = if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
+            self.shutdown_started.store(true, Ordering::Release);
             true
         } else {
             false
@@ -359,7 +364,11 @@ impl ProxyServer {
             && server_handle.is_none()
             && self.state.websocket_active.load(Ordering::Acquire) == 0
         {
-            return Err(ProxyError::NotRunning);
+            return if self.shutdown_started.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(ProxyError::NotRunning)
+            };
         }
         if let Some(mut handle) = server_handle.take() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
@@ -676,6 +685,18 @@ mod tests {
             *server.state.websocket_shutdown_tx.borrow(),
             "shutdown state was lost when no upgraded socket had subscribed"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_retry_after_listener_and_websockets_drain_is_idempotent() {
+        let server = ProxyServer::new(
+            ProxyConfig::default(),
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+
+        server.shutdown_started.store(true, Ordering::Release);
+        server.stop().await.expect("fully drained stop retry");
     }
 
     #[tokio::test]

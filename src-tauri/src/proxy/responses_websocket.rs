@@ -109,6 +109,7 @@ struct WebSocketTurnAccounting {
     provider_name: String,
     current_provider_id_at_start: String,
     used_half_open_permit: bool,
+    result_generation: u64,
     _active_guard: Option<ActiveConnectionGuard>,
     finalized: bool,
 }
@@ -121,6 +122,10 @@ impl WebSocketTurnAccounting {
         count_request: bool,
     ) -> Result<Self, ProxyError> {
         let active_guard = ActiveConnectionGuard::acquire(state.status.clone()).await;
+        let result_generation = state
+            .provider_router
+            .result_generation_for_app(ctx.app_type_str)
+            .await;
         let used_half_open_permit = if ctx.app_config.auto_failover_enabled {
             let permit = state
                 .provider_router
@@ -154,6 +159,7 @@ impl WebSocketTurnAccounting {
             provider_name: provider.name.clone(),
             current_provider_id_at_start: ctx.current_provider_id.clone(),
             used_half_open_permit,
+            result_generation,
             _active_guard: Some(active_guard),
             finalized: false,
         })
@@ -164,12 +170,13 @@ impl WebSocketTurnAccounting {
         if let Err(error) = self
             .state
             .provider_router
-            .record_result_detached(
+            .record_result_detached_for_generation(
                 &self.provider_id,
                 "codex",
                 self.used_half_open_permit,
                 true,
                 None,
+                self.result_generation,
             )
             .await
         {
@@ -234,12 +241,13 @@ impl WebSocketTurnAccounting {
         if let Err(error) = self
             .state
             .provider_router
-            .record_result_detached(
+            .record_result_detached_for_generation(
                 &self.provider_id,
                 "codex",
                 self.used_half_open_permit,
                 false,
                 Some(message),
+                self.result_generation,
             )
             .await
         {
@@ -279,12 +287,13 @@ impl WebSocketTurnAccounting {
         if let Err(error) = self
             .state
             .provider_router
-            .record_result_detached(
+            .record_result_detached_for_generation(
                 &self.provider_id,
                 "codex",
                 self.used_half_open_permit,
                 false,
                 Some(message.clone()),
+                self.result_generation,
             )
             .await
         {
@@ -1037,6 +1046,12 @@ async fn handle_connection_inner(
 
                 match downstream_message {
                     DownstreamMessage::Text(text) => {
+                        if let Err(error) = validate_client_event_text(&text) {
+                            if let Some(accounting) = turn_accounting.take() {
+                                accounting.finish_neutral_failure(error.to_string()).await;
+                            }
+                            return Err(error);
+                        }
                         if response_in_flight && websocket_event_is(&text, "response.create") {
                             if let Some(accounting) = turn_accounting.take() {
                                 accounting
@@ -1179,9 +1194,7 @@ async fn handle_connection_inner(
                                             ) {
                                                 Ok(transformed) => transformed,
                                                 Err(error) => {
-                                                    accounting
-                                                        .finish_neutral_failure(error.to_string())
-                                                        .await;
+                                                    accounting.finish_neutral_attempt().await;
                                                     attempt_error = Some(error);
                                                     if has_provider_cursor {
                                                         let error = attempt_error
@@ -1505,6 +1518,9 @@ async fn handle_connection_inner(
                         }
                     }
                     DownstreamMessage::Pong(data) => {
+                        if !response_in_flight {
+                            continue;
+                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -2577,6 +2593,17 @@ async fn response_cursor_provider_index(
     }
     Ok(Some(index))
 }
+fn validate_client_event_text(text: &str) -> Result<(), ProxyError> {
+    let event: Value = serde_json::from_str(text)
+        .map_err(|error| ProxyError::InvalidRequest(format!("invalid WebSocket JSON: {error}")))?;
+    if !event.is_object() || event.get("type").and_then(Value::as_str).is_none() {
+        return Err(ProxyError::InvalidRequest(
+            "Responses WebSocket client events must be JSON objects with a string type".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn transform_client_text(
     text: &str,
     provider: &Provider,
@@ -3337,6 +3364,7 @@ mod tests {
             provider_name: provider.name.clone(),
             current_provider_id_at_start: provider.id.clone(),
             used_half_open_permit: false,
+            result_generation: 0,
             _active_guard: None,
             finalized: false,
         }
@@ -5305,6 +5333,69 @@ mod tests {
         drop(client);
         upstream_task.await.expect("accounting upstream task");
         server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_between_turn_text_is_rejected_before_upstream_write() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (forwarded_tx, forwarded_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-before-malformed","output":[]}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            let forwarded = matches!(
+                tokio::time::timeout(Duration::from_millis(500), websocket.next()).await,
+                Ok(Some(Ok(UpstreamMessage::Text(_))))
+            );
+            forwarded_tx.send(forwarded).unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let completed: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(completed["response"]["id"], "resp-before-malformed");
+        client
+            .send(UpstreamMessage::Text("not-json".to_string()))
+            .await
+            .unwrap();
+
+        assert!(
+            !forwarded_rx.await.unwrap(),
+            "malformed text reached upstream"
+        );
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -8061,6 +8152,10 @@ mod tests {
             3,
             "later-turn transform failure must continue to the next eligible provider"
         );
+        let status = server.get_status().await;
+        assert_eq!(status.total_requests, 2);
+        assert_eq!(status.success_requests, 1);
+        assert_eq!(status.failed_requests, 1);
 
         drop(client);
         upstream_task.await.unwrap();
@@ -8355,6 +8450,10 @@ mod tests {
                 next = first.next() => {
                     let text = match next.expect("first socket closed").expect("first socket read") {
                         UpstreamMessage::Text(text) => text,
+                        UpstreamMessage::Pong(_) => {
+                            route_tx.send("pong-forwarded").unwrap();
+                            return;
+                        }
                         other => panic!("expected reused response.create, got {other:?}"),
                     };
                     assert!(websocket_event_is(&text, "response.create"));
@@ -8410,6 +8509,10 @@ mod tests {
             .unwrap();
         let first: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(first["response"]["id"], "resp-reopen-first");
+        client
+            .send(UpstreamMessage::Pong(vec![9, 1]))
+            .await
+            .unwrap();
         client
             .send(UpstreamMessage::Text(
                 response_create("local-model", Some("resp-reopen-first")).to_string(),

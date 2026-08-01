@@ -67,6 +67,8 @@ pub struct ProviderRouter {
     detached_result_notify_tx: mpsc::Sender<()>,
     /// Reset/clear operations that must win over racing detached lifecycle results.
     result_controls_in_progress: Arc<StdMutex<HashMap<String, usize>>>,
+    /// App-scoped generation used to discard lifecycle results from pre-clear requests.
+    result_generations: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 struct ResultControlMarker {
@@ -393,6 +395,7 @@ impl ProviderRouter {
             detached_result_flush_lock,
             detached_result_notify_tx,
             result_controls_in_progress: Arc::new(StdMutex::new(HashMap::new())),
+            result_generations: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -672,6 +675,7 @@ impl ProviderRouter {
     }
 
     /// Record the in-memory breaker result and queue ordered persistence without awaiting SQLite.
+    #[cfg(test)]
     pub async fn record_result_detached(
         &self,
         provider_id: &str,
@@ -680,11 +684,67 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
+        self.record_result_detached_inner(
+            provider_id,
+            app_type,
+            used_half_open_permit,
+            success,
+            error_msg,
+            None,
+        )
+        .await
+    }
+
+    pub async fn result_generation_for_app(&self, app_type: &str) -> u64 {
+        *self
+            .result_generations
+            .read()
+            .await
+            .get(app_type)
+            .unwrap_or(&0)
+    }
+
+    pub async fn record_result_detached_for_generation(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+        error_msg: Option<String>,
+        expected_generation: u64,
+    ) -> Result<(), AppError> {
+        self.record_result_detached_inner(
+            provider_id,
+            app_type,
+            used_half_open_permit,
+            success,
+            error_msg,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    async fn record_result_detached_inner(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+        error_msg: Option<String>,
+        expected_generation: Option<u64>,
+    ) -> Result<(), AppError> {
         let Some(enqueue_guard) = self.result_enqueue_gate.clone().try_read_owned().ok() else {
             self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
                 .await;
             return Ok(());
         };
+        if let Some(expected_generation) = expected_generation {
+            if self.result_generation_for_app(app_type).await != expected_generation {
+                self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
+                    .await;
+                return Ok(());
+            }
+        }
         let control_started_before_ordering =
             self.detached_result_control_in_progress(provider_id, app_type)?;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
@@ -831,6 +891,10 @@ impl ProviderRouter {
             format!("app:{app_type}"),
         )?;
         let enqueue_guard = self.result_enqueue_gate.write().await;
+        let mut generations = self.result_generations.write().await;
+        let generation = generations.entry(app_type.to_string()).or_default();
+        *generation = generation.wrapping_add(1);
+        drop(generations);
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, Some(app_type))
             .await?;
@@ -861,6 +925,9 @@ impl ProviderRouter {
         let _clear_marker =
             ResultControlMarker::new(self.result_controls_in_progress.clone(), "all".to_string())?;
         let enqueue_guard = self.result_enqueue_gate.write().await;
+        for generation in self.result_generations.write().await.values_mut() {
+            *generation = generation.wrapping_add(1);
+        }
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, None).await?;
         self.circuit_breakers.write().await.clear();
@@ -1705,7 +1772,45 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
+    async fn app_health_clear_fences_late_generation_results() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "stale-generation-provider".to_string(),
+            "Stale Generation Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let router = ProviderRouter::new(db.clone());
+        let generation = router.result_generation_for_app("codex").await;
+
+        router.clear_provider_health_for_app("codex").await.unwrap();
+        router
+            .record_result_detached_for_generation(
+                &provider.id,
+                "codex",
+                false,
+                false,
+                Some("late failure".to_string()),
+                generation,
+            )
+            .await
+            .unwrap();
+
+        assert!(router
+            .get_circuit_breaker_stats(&provider.id, "codex")
+            .await
+            .is_none());
+        assert!(
+            db.get_provider_health(&provider.id, "codex")
+                .await
+                .unwrap()
+                .is_healthy
+        );
+    }
+
+    #[tokio::test]
     #[serial]
     async fn app_health_clear_waits_behind_detached_result_persistence() {
         let _home = TempHome::new();

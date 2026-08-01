@@ -427,6 +427,7 @@ impl ProxyService {
         if app_type != AppType::Codex.as_str() {
             return Ok(());
         }
+        let _guard = self.switch_locks.lock_for_app(app_type).await;
         let config = self
             .db
             .get_proxy_config_for_app(app_type)
@@ -966,11 +967,13 @@ impl ProxyService {
 
         if !any_enabled {
             let _ = self.db.set_live_takeover_active(false).await;
+            drop(_guard);
 
             if self.is_running().await {
                 // 此时没有任何 app 处于接管状态，停止服务即可
                 let _ = self.stop().await;
             }
+            return Ok(());
         }
 
         Ok(())
@@ -5970,6 +5973,33 @@ model = "gpt-5.1-codex"
             .expect("backup exists");
         let expected = serde_json::to_string(&provider_b.settings_config).expect("serialize");
         assert_eq!(backup.original_config, expected);
+    }
+
+    #[tokio::test]
+    async fn failover_projection_refresh_rechecks_enabled_after_switch_lock() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let service = ProxyService::new(db.clone());
+        let guard = service.lock_switch_for_test("codex").await;
+        let refreshing = {
+            let service = service.clone();
+            tokio::spawn(
+                async move { service.refresh_failover_projection_if_active("codex").await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !refreshing.is_finished(),
+            "projection refresh bypassed the app switch lock"
+        );
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        drop(guard);
+
+        refreshing.await.unwrap().unwrap();
     }
 
     #[tokio::test]
