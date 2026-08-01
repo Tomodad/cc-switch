@@ -3383,11 +3383,12 @@ base_url = "https://production.api/v1"
                 ]
             }
         });
-        let specs = codex_catalog_model_specs(&settings, "");
+        let specs = codex_catalog_model_specs(&settings);
         let catalog = codex_model_catalog_from_specs(
             &specs,
             &template,
             CodexCatalogToolProfile::ProxiedNativeResponses,
+            128_000,
         );
         let models = catalog["models"].as_array().expect("models array");
 
