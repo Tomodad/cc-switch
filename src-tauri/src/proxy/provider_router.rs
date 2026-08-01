@@ -680,7 +680,7 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
-        let Some(_enqueue_guard) = self.result_enqueue_gate.try_read().ok() else {
+        let Some(enqueue_guard) = self.result_enqueue_gate.clone().try_read_owned().ok() else {
             self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
                 .await;
             return Ok(());
@@ -690,6 +690,7 @@ impl ProviderRouter {
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         match ordering_lock.clone().try_lock_owned() {
             Ok(_ordering_guard) => {
+                let _enqueue_guard = enqueue_guard;
                 self.finish_detached_result_ordered(
                     provider_id,
                     app_type,
@@ -705,6 +706,7 @@ impl ProviderRouter {
                 let provider_id = provider_id.to_string();
                 let app_type = app_type.to_string();
                 tokio::spawn(async move {
+                    let _enqueue_guard = enqueue_guard;
                     let _ordering_guard = ordering_lock.lock_owned().await;
                     if let Err(error) = router
                         .finish_detached_result_ordered(

@@ -1141,8 +1141,11 @@ async fn handle_connection_inner(
                             }
 
                             let next_timeout_config = next_ctx.streaming_timeout_config();
-                            let next_provider_attempt_limit =
-                                websocket_provider_attempt_limit(&next_ctx);
+                            let next_provider_attempt_limit = if has_provider_cursor {
+                                1
+                            } else {
+                                websocket_provider_attempt_limit(&next_ctx)
+                            };
                             let mut next_provider_attempts = 0_usize;
                             let (
                                 next_provider,
@@ -1732,15 +1735,35 @@ async fn handle_connection_inner(
                                 let retry_deadline = websocket_turn_timeout_deadline(
                                     true, false, retry_started, retry_started, timeout_config,
                                 );
-                                match send_upstream_message(
-                                    &mut upstream,
-                                    UpstreamMessage::Text(retry_text),
-                                    retry_deadline,
-                                    &mut shutdown_rx,
-                                    "media fallback event write",
-                                )
-                                .await
-                                {
+                                let retry_send = match build_upstream_request(&provider, headers) {
+                                    Ok(request) => match connect_upstream_with_shutdown(
+                                        request,
+                                        upstream_proxy_url.as_deref(),
+                                        retry_deadline,
+                                        &mut shutdown_rx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(mut retry_upstream)) => {
+                                            let result = send_upstream_message(
+                                                &mut retry_upstream,
+                                                UpstreamMessage::Text(retry_text),
+                                                retry_deadline,
+                                                &mut shutdown_rx,
+                                                "media fallback event write",
+                                            )
+                                            .await;
+                                            if matches!(result, Ok(WebSocketSendOutcome::Sent)) {
+                                                upstream = retry_upstream;
+                                            }
+                                            result
+                                        }
+                                        Ok(None) => Ok(WebSocketSendOutcome::Shutdown),
+                                        Err(error) => Err(error),
+                                    },
+                                    Err(error) => Err(error),
+                                };
+                                match retry_send {
                                     Ok(WebSocketSendOutcome::Sent) => {
                                         turn_state = retry_state;
                                         media_rectifier_retried = true;
@@ -2508,12 +2531,11 @@ fn transform_client_text(
     TRANSFORM_CLIENT_TEXT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut event: Value = match serde_json::from_str(text) {
         Ok(event) => event,
-        Err(error) if require_response_create => {
+        Err(error) => {
             return Err(ProxyError::InvalidRequest(format!(
                 "invalid WebSocket JSON: {error}"
             )));
         }
-        Err(_) => return Ok(None),
     };
 
     if event.get("type").and_then(Value::as_str) != Some("response.create") {
@@ -3464,6 +3486,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_later_turn_text() {
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        let result =
+            transform_client_text("not-json", &provider, &RectifierConfig::default(), false);
+        assert!(matches!(result, Err(ProxyError::InvalidRequest(_))));
+    }
+
+    #[test]
     fn transforms_flat_codex_response_create_for_upstream() {
         let provider = websocket_provider("http://127.0.0.1:1".to_string());
         let input = json!({
@@ -4254,18 +4284,23 @@ mod tests {
                 ))
                 .await
                 .expect("send unsupported-image failure");
-            let retry = tokio::time::timeout(Duration::from_millis(500), next_text(&mut websocket))
-                .await
-                .ok();
-            if retry.is_some() {
-                websocket
-                    .send(UpstreamMessage::Text(
-                        json!({"type":"response.completed","response":{"id":"resp-media-retry","model":"upstream-model","output":[],"usage":{"input_tokens":7,"output_tokens":3}}})
-                            .to_string(),
-                    ))
+
+            let (retry_stream, _) =
+                tokio::time::timeout(Duration::from_secs(2), upstream_listener.accept())
                     .await
-                    .expect("send retry completion");
-            }
+                    .expect("reactive retry did not open a fresh connection")
+                    .expect("accept reactive retry connection");
+            let mut retry_websocket = tokio_tungstenite::accept_async(retry_stream)
+                .await
+                .expect("accept retry websocket");
+            let retry = next_text(&mut retry_websocket).await;
+            retry_websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.completed","response":{"id":"resp-media-retry","model":"upstream-model","output":[],"usage":{"input_tokens":7,"output_tokens":3}}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send retry completion");
             let _ = events_tx.send((first, retry));
         });
 
@@ -4304,7 +4339,6 @@ mod tests {
             serde_json::from_str(&next_text(&mut client).await).expect("retry completion JSON");
         let (first, retry) = events_rx.await.expect("upstream events");
         let first: Value = serde_json::from_str(&first).expect("first event JSON");
-        let retry = retry.expect("rectified retry reached upstream");
         let retry: Value = serde_json::from_str(&retry).expect("retry event JSON");
         assert_eq!(first["input"][0]["content"][0]["type"], "input_image");
         assert_eq!(retry["input"][0]["content"][0]["type"], "input_text");
@@ -4381,6 +4415,13 @@ mod tests {
                 ))
                 .await
                 .expect("send unsupported-image failure");
+            let (retry_stream, _) = primary_listener
+                .accept()
+                .await
+                .expect("accept fresh primary retry socket");
+            let _retry_websocket = tokio_tungstenite::accept_async(retry_stream)
+                .await
+                .expect("accept fresh primary retry websocket");
         });
 
         let fallback_listener = TcpListener::bind("127.0.0.1:0")

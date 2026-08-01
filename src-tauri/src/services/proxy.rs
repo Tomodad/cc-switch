@@ -1328,11 +1328,12 @@ impl ProxyService {
 
     /// 停止代理服务器
     pub async fn stop(&self) -> Result<(), String> {
-        if let Some(server) = self.server.write().await.take() {
-            server
-                .stop()
-                .await
-                .map_err(|e| format!("停止代理服务器失败: {e}"))?;
+        let server = self.server.write().await.take();
+        if let Some(server) = server {
+            if let Err(error) = server.stop().await {
+                *self.server.write().await = Some(server);
+                return Err(format!("停止代理服务器失败: {error}"));
+            }
 
             // 停止时设置 proxy_enabled = false
             let mut global_config = self
@@ -1355,10 +1356,13 @@ impl ProxyService {
         }
     }
 
-    fn require_proxy_stopped_before_restore(stop_result: Result<(), String>) -> Result<(), String> {
+    fn require_proxy_stopped_before_restore(
+        stop_result: Result<(), String>,
+        server_was_present: bool,
+    ) -> Result<(), String> {
         match stop_result {
             Ok(()) => Ok(()),
-            Err(error) if error == "代理服务器未运行" => Ok(()),
+            Err(error) if error == "代理服务器未运行" && !server_was_present => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -1368,8 +1372,9 @@ impl ProxyService {
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
         let provider_router = self.provider_router_snapshot().await;
+        let server_was_present = self.server.read().await.is_some();
         // 1. Restore live files only after every upgraded connection has stopped.
-        Self::require_proxy_stopped_before_restore(self.stop().await)?;
+        Self::require_proxy_stopped_before_restore(self.stop().await, server_was_present)?;
 
         // 2. 恢复原始 Live 配置
         self.restore_live_configs().await?;
@@ -1421,8 +1426,9 @@ impl ProxyService {
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
         let provider_router = self.provider_router_snapshot().await;
+        let server_was_present = self.server.read().await.is_some();
         // 1. Restore live files only after every upgraded connection has stopped.
-        Self::require_proxy_stopped_before_restore(self.stop().await)?;
+        Self::require_proxy_stopped_before_restore(self.stop().await, server_was_present)?;
 
         // 2. 恢复原始 Live 配置
         self.restore_live_configs().await?;
@@ -2533,6 +2539,23 @@ impl ProxyService {
         provider_id: &str,
     ) -> Result<HotSwitchOutcome, String> {
         let _guard = self.switch_locks.lock_for_app(app_type).await;
+        self.hot_switch_provider_inner(app_type, provider_id).await
+    }
+
+    pub(crate) async fn hot_switch_provider_if_enabled(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+    ) -> Result<HotSwitchOutcome, String> {
+        let _guard = self.switch_locks.lock_for_app(app_type).await;
+        let config = self
+            .db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .map_err(|error| format!("读取 {app_type} 代理配置失败: {error}"))?;
+        if !config.enabled {
+            return Ok(HotSwitchOutcome::default());
+        }
         self.hot_switch_provider_inner(app_type, provider_id).await
     }
 
@@ -3873,16 +3896,29 @@ mod tests {
 
     #[test]
     fn live_restore_stops_when_proxy_shutdown_times_out() {
-        let result = ProxyService::require_proxy_stopped_before_restore(Err(
-            "停止代理服务器失败: 代理服务器停止超时".to_string(),
-        ));
+        let result = ProxyService::require_proxy_stopped_before_restore(
+            Err("停止代理服务器失败: 代理服务器停止超时".to_string()),
+            true,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn live_restore_can_continue_when_proxy_is_already_stopped() {
-        ProxyService::require_proxy_stopped_before_restore(Err("代理服务器未运行".to_string()))
-            .unwrap();
+        ProxyService::require_proxy_stopped_before_restore(
+            Err("代理服务器未运行".to_string()),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn live_restore_rejects_not_running_after_an_active_stop_attempt() {
+        let result = ProxyService::require_proxy_stopped_before_restore(
+            Err("代理服务器未运行".to_string()),
+            true,
+        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -5934,6 +5970,33 @@ model = "gpt-5.1-codex"
             .expect("backup exists");
         let expected = serde_json::to_string(&provider_b.settings_config).expect("serialize");
         assert_eq!(backup.original_config, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failover_hot_switch_rechecks_enabled_after_switch_lock() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let service = ProxyService::new(db.clone());
+        let guard = service.lock_switch_for_test("codex").await;
+        let switching = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .hot_switch_provider_if_enabled("codex", "must-not-be-read")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        drop(guard);
+
+        let outcome = switching.await.unwrap().unwrap();
+        assert!(!outcome.logical_target_changed);
     }
 
     #[tokio::test]

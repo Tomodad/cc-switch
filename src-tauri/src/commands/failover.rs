@@ -219,6 +219,7 @@ async fn set_auto_failover_enabled_inner(
 
     // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
     let mut auto_added_provider_id: Option<String> = None;
+    let mut auto_added_previous_health = None;
     let p1_provider_id = if enabled {
         let mut queue = state
             .db
@@ -236,6 +237,11 @@ async fn set_auto_failover_enabled_inner(
                 return Err("故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string());
             };
 
+            auto_added_previous_health = state
+                .db
+                .get_provider_health_record(&current_id, &app_type)
+                .await
+                .map_err(|e| e.to_string())?;
             state
                 .db
                 .add_to_failover_queue(&app_type, &current_id)
@@ -266,6 +272,9 @@ async fn set_auto_failover_enabled_inner(
         {
             if let Some(provider_id) = auto_added_provider_id.as_ref() {
                 let _ = state.db.remove_from_failover_queue(&app_type, provider_id);
+                if let Some(health) = auto_added_previous_health.as_ref() {
+                    let _ = state.db.restore_provider_health(health).await;
+                }
             }
             return Err(e);
         }
@@ -303,6 +312,13 @@ async fn set_auto_failover_enabled_inner(
             if let Err(rollback_error) = state.db.remove_from_failover_queue(&app_type, provider_id)
             {
                 rollback_errors.push(format!("restore auto-populated queue: {rollback_error}"));
+            }
+            if let Some(health) = auto_added_previous_health.as_ref() {
+                if let Err(rollback_error) = state.db.restore_provider_health(health).await {
+                    rollback_errors.push(format!(
+                        "restore auto-populated provider health: {rollback_error}"
+                    ));
+                }
             }
         }
         if let Err(rollback_error) = state
@@ -587,5 +603,53 @@ supports_websockets = {supports_websockets}
         );
         assert!(db.is_in_failover_queue("codex", &p1.id).unwrap());
         assert_eq!(db.get_failover_queue("codex").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_populated_enable_rollback_restores_provider_health() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("create database"));
+        let current = codex_provider("auto-health-current", true);
+        db.save_provider("codex", &current).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        crate::settings::set_current_provider(
+            &crate::app_config::AppType::Codex,
+            Some(&current.id),
+        )
+        .unwrap();
+        db.update_provider_health_with_threshold(
+            &current.id,
+            "codex",
+            false,
+            Some("preserve auto-added health".to_string()),
+            1,
+        )
+        .await
+        .unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        crate::services::proxy::FAIL_NEXT_FAILOVER_PROJECTION_REFRESH
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = set_auto_failover_enabled_inner(&state, "codex".to_string(), true)
+            .await
+            .expect_err("projection refresh should fail");
+        assert!(error.contains("injected"));
+        assert!(db.get_failover_queue("codex").unwrap().is_empty());
+        let health = db.get_provider_health(&current.id, "codex").await.unwrap();
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("preserve auto-added health")
+        );
     }
 }
