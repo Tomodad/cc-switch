@@ -930,7 +930,7 @@ async fn handle_connection_inner(
             } => {
                 let kind = if received_response_event { "idle" } else { "first response event" };
                 let message = format!("upstream WebSocket {kind} timed out");
-                if received_response_event {
+                if relayed_response_event {
                     if let Some(accounting) = turn_accounting.take() {
                         accounting
                             .finish_provider_failure_detached(message.clone())
@@ -4070,13 +4070,22 @@ mod tests {
     }
     #[tokio::test]
     #[serial]
-    async fn first_response_event_timeout_retries_websocket_fallback() {
+    async fn buffered_lifecycle_timeout_retries_websocket_fallback() {
         let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stalled_addr = stalled_listener.local_addr().unwrap();
         let stalled_task = tokio::spawn(async move {
             let (stream, _) = stalled_listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _ = next_text(&mut websocket).await;
+            for event_type in ["response.created", "response.in_progress"] {
+                websocket
+                    .send(UpstreamMessage::Text(
+                        json!({"type":event_type,"response":{"id":"resp-buffered-timeout"}})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4123,6 +4132,7 @@ mod tests {
         app_config.auto_failover_enabled = true;
         app_config.max_retries = 1;
         app_config.streaming_first_byte_timeout = 1;
+        app_config.streaming_idle_timeout = 1;
         db.update_proxy_config_for_app(app_config).await.unwrap();
         let server = ProxyServer::new(
             ProxyConfig {
@@ -4139,7 +4149,12 @@ mod tests {
             .unwrap();
         client
             .send(UpstreamMessage::Text(
-                response_create("local-model", None).to_string(),
+                json!({
+                    "type":"response.create",
+                    "model":"local-model",
+                    "input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+                })
+                .to_string(),
             ))
             .await
             .unwrap();

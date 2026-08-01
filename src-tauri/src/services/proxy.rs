@@ -793,6 +793,25 @@ impl ProxyService {
 
         if enabled {
             let _lifecycle_guard = self.server_lifecycle_lock.lock().await;
+            let retained_shutdown = {
+                let server_guard = self.server.read().await;
+                match server_guard.as_ref() {
+                    Some(server) => !server.get_status().await.running,
+                    None => false,
+                }
+            };
+            if retained_shutdown {
+                let server = self
+                    .server
+                    .write()
+                    .await
+                    .take()
+                    .expect("retained server disappeared while lifecycle lock was held");
+                if let Err(error) = server.stop().await {
+                    *self.server.write().await = Some(server);
+                    return Err(format!("完成上次代理停止失败: {error}"));
+                }
+            }
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
                 self.start().await?;
