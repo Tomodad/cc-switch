@@ -53,6 +53,52 @@ impl Drop for PendingConnectionPeekGuard {
     }
 }
 
+const RESPONSES_WEBSOCKET_CURSOR_OWNER_CAPACITY: usize = 4096;
+
+pub(crate) struct ResponsesWebSocketCursorOwners {
+    owners: std::collections::HashMap<String, crate::provider::Provider>,
+    recency: std::collections::VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for ResponsesWebSocketCursorOwners {
+    fn default() -> Self {
+        Self::new(RESPONSES_WEBSOCKET_CURSOR_OWNER_CAPACITY)
+    }
+}
+
+impl ResponsesWebSocketCursorOwners {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            owners: std::collections::HashMap::new(),
+            recency: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    pub(crate) fn get(&mut self, response_id: &str) -> Option<crate::provider::Provider> {
+        let owner = self.owners.get(response_id).cloned()?;
+        if let Some(index) = self.recency.iter().position(|key| key == response_id) {
+            self.recency.remove(index);
+        }
+        self.recency.push_back(response_id.to_string());
+        Some(owner)
+    }
+
+    pub(crate) fn insert(&mut self, response_id: String, provider: crate::provider::Provider) {
+        if let Some(index) = self.recency.iter().position(|key| key == &response_id) {
+            self.recency.remove(index);
+        }
+        self.owners.insert(response_id.clone(), provider);
+        self.recency.push_back(response_id);
+        while self.owners.len() > self.capacity {
+            if let Some(evicted) = self.recency.pop_front() {
+                self.owners.remove(&evicted);
+            }
+        }
+    }
+}
+
 /// 代理服务器状态（共享）
 #[derive(Clone)]
 pub struct ProxyState {
@@ -63,8 +109,7 @@ pub struct ProxyState {
     /// 每个应用类型当前使用的 provider (app_type -> (provider_id, provider_name))
     pub current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     /// Provider snapshot that produced each Responses cursor, retained across downstream reconnects.
-    pub responses_websocket_cursor_owners:
-        Arc<RwLock<std::collections::HashMap<String, crate::provider::Provider>>>,
+    pub responses_websocket_cursor_owners: Arc<RwLock<ResponsesWebSocketCursorOwners>>,
     /// 共享的 ProviderRouter（持有熔断器状态，跨请求保持）
     pub provider_router: Arc<ProviderRouter>,
     /// Gemini Native shadow state，用于 thoughtSignature / tool call 回放
@@ -127,7 +172,7 @@ impl ProxyServer {
             start_time: Arc::new(RwLock::new(None)),
             current_providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             responses_websocket_cursor_owners: Arc::new(RwLock::new(
-                std::collections::HashMap::new(),
+                ResponsesWebSocketCursorOwners::default(),
             )),
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),

@@ -47,6 +47,11 @@ async fn add_to_failover_queue_inner(
     app_type: &str,
     provider_id: &str,
 ) -> Result<(), String> {
+    let previous_health = state
+        .db
+        .get_provider_health_record(provider_id, app_type)
+        .await
+        .map_err(|e| e.to_string())?;
     state
         .db
         .add_to_failover_queue(app_type, provider_id)
@@ -56,12 +61,30 @@ async fn add_to_failover_queue_inner(
         .refresh_failover_projection_if_active(app_type)
         .await
     {
-        let _ = state.db.remove_from_failover_queue(app_type, provider_id);
-        let _ = state
-            .proxy_service
-            .refresh_failover_projection_if_active(app_type)
-            .await;
-        return Err(error);
+        let rollback = async {
+            state
+                .db
+                .remove_from_failover_queue(app_type, provider_id)
+                .map_err(|e| e.to_string())?;
+            if let Some(health) = previous_health.as_ref() {
+                state
+                    .db
+                    .restore_provider_health(health)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            state
+                .proxy_service
+                .refresh_failover_projection_if_active(app_type)
+                .await
+        }
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; failed to restore failover queue state: {rollback_error}"
+            )),
+        };
     }
     Ok(())
 }
@@ -471,6 +494,49 @@ supports_websockets = {supports_websockets}
         let health = db.get_provider_health(&fallback.id, "codex").await.unwrap();
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.last_error.as_deref(), Some("preserve this failure"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn add_queue_refresh_failure_restores_provider_health() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("create database"));
+        let current = codex_provider("add-rollback-current", false);
+        let fallback = codex_provider("add-rollback-fallback", true);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &fallback).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.update_provider_health_with_threshold(
+            &fallback.id,
+            "codex",
+            false,
+            Some("preserve add failure".to_string()),
+            1,
+        )
+        .await
+        .unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        crate::services::proxy::FAIL_NEXT_FAILOVER_PROJECTION_REFRESH
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = add_to_failover_queue_inner(&state, "codex", &fallback.id)
+            .await
+            .expect_err("projection refresh should fail");
+        assert!(error.contains("injected"));
+        assert!(!db.is_in_failover_queue("codex", &fallback.id).unwrap());
+        let health = db.get_provider_health(&fallback.id, "codex").await.unwrap();
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.last_error.as_deref(), Some("preserve add failure"));
     }
 
     #[tokio::test]

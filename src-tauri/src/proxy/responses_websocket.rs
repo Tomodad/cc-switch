@@ -1451,28 +1451,13 @@ async fn handle_connection_inner(
                             break;
                         }
                     }
-                    DownstreamMessage::Binary(data) => {
-                        let write_deadline = websocket_turn_timeout_deadline(
-                            response_in_flight,
-                            received_response_event,
-                            turn_started,
-                            last_response_event_at,
-                            timeout_config,
-                        );
-                        if send_upstream_turn_message(
-                            &mut upstream,
-                            UpstreamMessage::Binary(data),
-                            write_deadline,
-                            &mut shutdown_rx,
-                            "binary frame write",
-                            &mut turn_accounting,
-                        )
-                        .await?
-                            == WebSocketSendOutcome::Shutdown
-                        {
-                            finish_websocket_shutdown(downstream, &mut turn_accounting).await;
-                            break;
+                    DownstreamMessage::Binary(_) => {
+                        let message =
+                            "Responses WebSocket client events must be JSON text".to_string();
+                        if let Some(accounting) = turn_accounting.take() {
+                            accounting.finish_neutral_failure(message.clone()).await;
                         }
+                        return Err(ProxyError::InvalidRequest(message));
                     }
                     DownstreamMessage::Ping(data) => {
                         let write_deadline = websocket_turn_timeout_deadline(
@@ -2444,8 +2429,6 @@ fn response_create_body(event: &Value) -> Result<Value, ProxyError> {
     body.remove("type");
     Ok(Value::Object(body))
 }
-const MAX_RESPONSES_WEBSOCKET_CURSOR_OWNERS: usize = 4096;
-
 fn response_create_provider_cursor(text: &str) -> Option<String> {
     serde_json::from_str::<Value>(text)
         .ok()
@@ -2466,13 +2449,11 @@ async fn remember_response_cursor_owner(state: &ProxyState, event: &Value, provi
     else {
         return;
     };
-    let mut owners = state.responses_websocket_cursor_owners.write().await;
-    if owners.len() >= MAX_RESPONSES_WEBSOCKET_CURSOR_OWNERS && !owners.contains_key(response_id) {
-        if let Some(evicted) = owners.keys().next().cloned() {
-            owners.remove(&evicted);
-        }
-    }
-    owners.insert(response_id.to_string(), provider.clone());
+    state
+        .responses_websocket_cursor_owners
+        .write()
+        .await
+        .insert(response_id.to_string(), provider.clone());
 }
 
 async fn response_cursor_provider_index(
@@ -2485,10 +2466,9 @@ async fn response_cursor_provider_index(
     };
     let recorded_owner = state
         .responses_websocket_cursor_owners
-        .read()
+        .write()
         .await
-        .get(&cursor)
-        .cloned();
+        .get(&cursor);
     let owner = match recorded_owner {
         Some(owner) => owner,
         None if providers.len() == 1
@@ -3219,6 +3199,21 @@ mod tests {
                 None => env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn cursor_owner_cache_evicts_least_recently_used_entry() {
+        let mut owners = crate::proxy::server::ResponsesWebSocketCursorOwners::new(2);
+        let first = websocket_provider_with_id("cursor-first", "http://127.0.0.1:1".to_string());
+        let second = websocket_provider_with_id("cursor-second", "http://127.0.0.1:2".to_string());
+        let third = websocket_provider_with_id("cursor-third", "http://127.0.0.1:3".to_string());
+        owners.insert("resp-first".to_string(), first);
+        owners.insert("resp-second".to_string(), second);
+        assert!(owners.get("resp-first").is_some());
+        owners.insert("resp-third".to_string(), third);
+        assert!(owners.get("resp-first").is_some());
+        assert!(owners.get("resp-second").is_none());
+        assert!(owners.get("resp-third").is_some());
     }
 
     fn websocket_provider(base_url: String) -> Provider {
@@ -7319,7 +7314,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn proxy_stop_interrupts_stalled_upstream_websocket_write() {
-        const BINARY_FRAME_BYTES: usize = 16 * 1024 * 1024;
+        const TEXT_FRAME_BYTES: usize = 16 * 1024 * 1024;
         const EXPECTED_LIMIT: usize = 200 * 1024 * 1024;
         let large_config = WebSocketConfig {
             max_message_size: Some(EXPECTED_LIMIT),
@@ -7383,18 +7378,21 @@ mod tests {
             .expect("upstream readiness sender dropped");
 
         let flood_task = tokio::spawn(async move {
-            let payload = vec![0_u8; BINARY_FRAME_BYTES];
+            let payload = format!(
+                r#"{{"type":"input_text","text":"{}"}}"#,
+                "x".repeat(TEXT_FRAME_BYTES)
+            );
             loop {
                 client
-                    .send(UpstreamMessage::Binary(payload.clone()))
+                    .send(UpstreamMessage::Text(payload.clone()))
                     .await
-                    .expect("send binary flood frame");
+                    .expect("send JSON text flood frame");
             }
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !flood_task.is_finished(),
-            "binary flood ended before backpressure"
+            "JSON text flood ended before backpressure"
         );
 
         let stop_result = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
@@ -7737,6 +7735,70 @@ mod tests {
         drop(client);
         upstream_task.await.expect("upstream task");
         server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rejects_downstream_binary_after_initial_response_create() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (binary_tx, binary_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.created","response":{"id":"resp-binary"}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            let received_binary = matches!(
+                tokio::time::timeout(Duration::from_millis(500), websocket.next()).await,
+                Ok(Some(Ok(UpstreamMessage::Binary(_))))
+            );
+            let _ = binary_tx.send(received_binary);
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = websocket_provider(format!("http://{upstream_addr}"));
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .unwrap();
+        client
+            .send(UpstreamMessage::Text(
+                response_create("local-model", None).to_string(),
+            ))
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(created["type"], "response.created");
+        client
+            .send(UpstreamMessage::Binary(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_millis(500), next_text(&mut client))
+            .await
+            .expect("binary frame was forwarded instead of rejected locally");
+        let error: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(!binary_rx.await.unwrap(), "binary frame reached upstream");
+
+        drop(client);
+        upstream_task.await.unwrap();
+        server.stop().await.unwrap();
     }
 
     #[tokio::test]

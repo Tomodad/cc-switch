@@ -47,6 +47,7 @@ const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 256;
 const PROVIDER_RESULT_PERSISTENCE_CAPACITY: usize = 8;
 
 /// 供应商路由器
+#[derive(Clone)]
 pub struct ProviderRouter {
     /// 数据库连接
     db: Arc<Database>,
@@ -510,6 +511,43 @@ impl ProviderRouter {
         format!("{app_type}:{provider_id}")
     }
 
+    fn detached_result_control_in_progress(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Result<bool, AppError> {
+        let provider_reset_key = format!("provider:{app_type}:{provider_id}");
+        let app_clear_key = format!("app:{app_type}");
+        let controls = self.result_controls_in_progress.lock().map_err(|_| {
+            AppError::Message("provider result control marker lock poisoned".to_string())
+        })?;
+        Ok(controls.contains_key("all")
+            || controls.contains_key(&app_clear_key)
+            || controls.contains_key(&provider_reset_key))
+    }
+
+    async fn finish_detached_result_ordered(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+        error_msg: Option<String>,
+        control_started_before_ordering: bool,
+    ) -> Result<(), AppError> {
+        if control_started_before_ordering
+            || self.detached_result_control_in_progress(provider_id, app_type)?
+        {
+            self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
+                .await;
+            return Ok(());
+        }
+        let failure_threshold = self
+            .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
+            .await;
+        self.queue_detached_result(provider_id, app_type, success, error_msg, failure_threshold)
+    }
+
     fn queue_detached_result(
         &self,
         provider_id: &str,
@@ -647,35 +685,46 @@ impl ProviderRouter {
                 .await;
             return Ok(());
         };
-        let provider_reset_key = format!("provider:{app_type}:{provider_id}");
-        let app_clear_key = format!("app:{app_type}");
-        let control_started_before_ordering = {
-            let controls = self.result_controls_in_progress.lock().map_err(|_| {
-                AppError::Message("provider result control marker lock poisoned".to_string())
-            })?;
-            controls.contains_key("all")
-                || controls.contains_key(&app_clear_key)
-                || controls.contains_key(&provider_reset_key)
-        };
+        let control_started_before_ordering =
+            self.detached_result_control_in_progress(provider_id, app_type)?;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
-        let _ordering_guard = ordering_lock.lock().await;
-        let control_in_progress = control_started_before_ordering || {
-            let controls = self.result_controls_in_progress.lock().map_err(|_| {
-                AppError::Message("provider result control marker lock poisoned".to_string())
-            })?;
-            controls.contains_key("all")
-                || controls.contains_key(&app_clear_key)
-                || controls.contains_key(&provider_reset_key)
-        };
-        if control_in_progress {
-            self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
-                .await;
-            return Ok(());
+        match ordering_lock.clone().try_lock_owned() {
+            Ok(_ordering_guard) => {
+                self.finish_detached_result_ordered(
+                    provider_id,
+                    app_type,
+                    used_half_open_permit,
+                    success,
+                    error_msg,
+                    control_started_before_ordering,
+                )
+                .await
+            }
+            Err(_) => {
+                let router = self.clone();
+                let provider_id = provider_id.to_string();
+                let app_type = app_type.to_string();
+                tokio::spawn(async move {
+                    let _ordering_guard = ordering_lock.lock_owned().await;
+                    if let Err(error) = router
+                        .finish_detached_result_ordered(
+                            &provider_id,
+                            &app_type,
+                            used_half_open_permit,
+                            success,
+                            error_msg,
+                            control_started_before_ordering,
+                        )
+                        .await
+                    {
+                        log::warn!(
+                            "Failed to record deferred provider result (provider={provider_id}, app={app_type}): {error}"
+                        );
+                    }
+                });
+                Ok(())
+            }
         }
-        let failure_threshold = self
-            .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
-            .await;
-        self.queue_detached_result(provider_id, app_type, success, error_msg, failure_threshold)
     }
 
     async fn record_circuit_result(
@@ -1474,7 +1523,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn detached_result_waits_for_same_provider_ordering_lock() {
+    async fn detached_result_returns_while_same_provider_ordering_lock_is_busy() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
         db.save_provider(
@@ -1508,40 +1557,38 @@ mod tests {
         .await
         .expect("ordered result did not pause while holding the provider lock");
 
-        let detached_router = router.clone();
-        let detached = tokio::spawn(async move {
-            detached_router
-                .record_result_detached(
-                    "shared-provider",
-                    "codex",
-                    false,
-                    false,
-                    Some("concurrent failure".to_string()),
-                )
-                .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !detached.is_finished(),
-            "detached accounting bypassed the per-provider ordering lock"
-        );
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            router.record_result_detached(
+                "shared-provider",
+                "codex",
+                false,
+                false,
+                Some("concurrent failure".to_string()),
+            ),
+        )
+        .await
+        .expect("detached accounting blocked on the per-provider ordering lock")
+        .unwrap();
 
         RELEASE_RESULT_ENQUEUE.store(true, std::sync::atomic::Ordering::SeqCst);
         blocking.await.unwrap();
-        detached.await.unwrap().unwrap();
-        let flush_guard = router.detached_result_flush_lock.lock().await;
-        router
-            .flush_detached_results_locked(Some("shared-provider"), Some("codex"))
-            .await
-            .unwrap();
-        drop(flush_guard);
-        let health = router
-            .db
-            .get_provider_health("shared-provider", "codex")
-            .await
-            .unwrap();
-        assert_eq!(health.consecutive_failures, 1);
+        let health = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let health = router
+                    .db
+                    .get_provider_health("shared-provider", "codex")
+                    .await
+                    .unwrap();
+                if health.consecutive_failures == 1 {
+                    break health;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached result was not persisted after the ordering lock released");
+        assert_eq!(health.last_error.as_deref(), Some("concurrent failure"));
         router.clear_all_provider_health().await.unwrap();
     }
 

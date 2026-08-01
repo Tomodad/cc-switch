@@ -1355,15 +1355,21 @@ impl ProxyService {
         }
     }
 
+    fn require_proxy_stopped_before_restore(stop_result: Result<(), String>) -> Result<(), String> {
+        match stop_result {
+            Ok(()) => Ok(()),
+            Err(error) if error == "代理服务器未运行" => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// 停止代理服务器（恢复 Live 配置，用户手动关闭时使用）
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
         let provider_router = self.provider_router_snapshot().await;
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
-        }
+        // 1. Restore live files only after every upgraded connection has stopped.
+        Self::require_proxy_stopped_before_restore(self.stop().await)?;
 
         // 2. 恢复原始 Live 配置
         self.restore_live_configs().await?;
@@ -1415,10 +1421,8 @@ impl ProxyService {
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
         let provider_router = self.provider_router_snapshot().await;
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
-        }
+        // 1. Restore live files only after every upgraded connection has stopped.
+        Self::require_proxy_stopped_before_restore(self.stop().await)?;
 
         // 2. 恢复原始 Live 配置
         self.restore_live_configs().await?;
@@ -3865,6 +3869,20 @@ mod tests {
                 .is_none(),
             "non-managed providers should retain the legacy fallback behavior"
         );
+    }
+
+    #[test]
+    fn live_restore_stops_when_proxy_shutdown_times_out() {
+        let result = ProxyService::require_proxy_stopped_before_restore(Err(
+            "停止代理服务器失败: 代理服务器停止超时".to_string(),
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn live_restore_can_continue_when_proxy_is_already_stopped() {
+        ProxyService::require_proxy_stopped_before_restore(Err("代理服务器未运行".to_string()))
+            .unwrap();
     }
 
     #[tokio::test]
