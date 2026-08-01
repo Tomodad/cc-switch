@@ -63,7 +63,13 @@ async fn handle_connection_inner(
     state: &ProxyState,
     headers: &HeaderMap,
 ) -> Result<(), ProxyError> {
-    let first_text = receive_first_text(downstream).await?;
+    let first_event_timeout = {
+        let config = state.config.read().await;
+        Duration::from_secs(config.streaming_first_byte_timeout.max(1))
+    };
+    let first_text = tokio::time::timeout(first_event_timeout, receive_first_text(downstream))
+        .await
+        .map_err(|_| ProxyError::Timeout("downstream response.create timed out".to_string()))??;
     let first_event: Value = serde_json::from_str(&first_text)
         .map_err(|error| ProxyError::InvalidRequest(format!("invalid WebSocket JSON: {error}")))?;
     let response_body = response_create_body(&first_event)?;
@@ -765,6 +771,49 @@ mod tests {
         assert!(upstream_event.get("_private").is_none());
 
         upstream_task.await.expect("fake upstream task");
+        server.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn idle_downstream_before_response_create_times_out_and_closes() {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                streaming_first_byte_timeout: 1,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start proxy");
+        let (mut client, _) = connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+            .await
+            .expect("connect local proxy");
+
+        let error_text = tokio::time::timeout(Duration::from_secs(2), next_text(&mut client))
+            .await
+            .expect("proxy did not bound the wait for response.create");
+        let error: Value = serde_json::from_str(&error_text).expect("proxy error event JSON");
+        assert_eq!(error["type"], "error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("response.create") && message.contains("timed out")
+            ));
+
+        let close = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("timed out waiting for close")
+            .expect("client stream closed before close frame")
+            .expect("client close error");
+        match close {
+            UpstreamMessage::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1011),
+            other => panic!("expected close frame, got {other:?}"),
+        }
+
         server.stop().await.expect("stop proxy");
     }
 
