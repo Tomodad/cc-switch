@@ -51,6 +51,10 @@ async fn add_to_failover_queue_inner(
     app_type: &str,
     provider_id: &str,
 ) -> Result<(), String> {
+    let was_in_queue = state
+        .db
+        .is_in_failover_queue(app_type, provider_id)
+        .map_err(|e| e.to_string())?;
     let previous_health = state
         .db
         .get_provider_health_record(provider_id, app_type)
@@ -66,10 +70,12 @@ async fn add_to_failover_queue_inner(
         .await
     {
         let rollback = async {
-            state
-                .db
-                .remove_from_failover_queue(app_type, provider_id)
-                .map_err(|e| e.to_string())?;
+            if !was_in_queue {
+                state
+                    .db
+                    .remove_from_failover_queue(app_type, provider_id)
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(health) = previous_health.as_ref() {
                 state
                     .db
@@ -108,6 +114,10 @@ async fn remove_from_failover_queue_inner(
     app_type: &str,
     provider_id: &str,
 ) -> Result<(), String> {
+    let was_in_queue = state
+        .db
+        .is_in_failover_queue(app_type, provider_id)
+        .map_err(|e| e.to_string())?;
     let previous_health = state
         .db
         .get_provider_health_record(provider_id, app_type)
@@ -123,10 +133,12 @@ async fn remove_from_failover_queue_inner(
         .await
     {
         let rollback = async {
-            state
-                .db
-                .add_to_failover_queue(app_type, provider_id)
-                .map_err(|e| e.to_string())?;
+            if was_in_queue {
+                state
+                    .db
+                    .add_to_failover_queue(app_type, provider_id)
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(health) = previous_health.as_ref() {
                 state
                     .db
@@ -524,7 +536,7 @@ supports_websockets = {supports_websockets}
 
     #[tokio::test]
     #[serial]
-    async fn remove_queue_refresh_failure_restores_provider_health() {
+    async fn remove_queue_refresh_failure_preserves_unqueued_membership() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().expect("create database"));
         let current = codex_provider("rollback-current", false);
@@ -533,7 +545,6 @@ supports_websockets = {supports_websockets}
         db.save_provider("codex", &fallback).unwrap();
         db.set_current_provider("codex", &current.id).unwrap();
         db.add_to_failover_queue("codex", &current.id).unwrap();
-        db.add_to_failover_queue("codex", &fallback.id).unwrap();
         db.update_provider_health_with_threshold(
             &fallback.id,
             "codex",
@@ -561,7 +572,7 @@ supports_websockets = {supports_websockets}
             .await
             .expect_err("projection refresh should fail");
         assert!(error.contains("injected"));
-        assert!(db.is_in_failover_queue("codex", &fallback.id).unwrap());
+        assert!(!db.is_in_failover_queue("codex", &fallback.id).unwrap());
         let health = db.get_provider_health(&fallback.id, "codex").await.unwrap();
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.last_error.as_deref(), Some("preserve this failure"));
@@ -569,7 +580,7 @@ supports_websockets = {supports_websockets}
 
     #[tokio::test]
     #[serial]
-    async fn add_queue_refresh_failure_restores_provider_health() {
+    async fn add_queue_refresh_failure_preserves_existing_membership() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().expect("create database"));
         let current = codex_provider("add-rollback-current", false);
@@ -578,6 +589,7 @@ supports_websockets = {supports_websockets}
         db.save_provider("codex", &fallback).unwrap();
         db.set_current_provider("codex", &current.id).unwrap();
         db.add_to_failover_queue("codex", &current.id).unwrap();
+        db.add_to_failover_queue("codex", &fallback.id).unwrap();
         db.update_provider_health_with_threshold(
             &fallback.id,
             "codex",
@@ -604,7 +616,7 @@ supports_websockets = {supports_websockets}
             .await
             .expect_err("projection refresh should fail");
         assert!(error.contains("injected"));
-        assert!(!db.is_in_failover_queue("codex", &fallback.id).unwrap());
+        assert!(db.is_in_failover_queue("codex", &fallback.id).unwrap());
         let health = db.get_provider_health(&fallback.id, "codex").await.unwrap();
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.last_error.as_deref(), Some("preserve add failure"));

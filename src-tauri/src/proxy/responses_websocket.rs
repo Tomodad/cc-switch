@@ -1466,6 +1466,22 @@ async fn handle_connection_inner(
                         return Err(ProxyError::InvalidRequest(message));
                     }
                     DownstreamMessage::Ping(data) => {
+                        if !response_in_flight {
+                            if send_downstream_message(
+                                downstream,
+                                DownstreamMessage::Pong(data),
+                                None,
+                                &mut shutdown_rx,
+                                "between-turn pong write",
+                            )
+                            .await?
+                                == WebSocketSendOutcome::Shutdown
+                            {
+                                finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                                break;
+                            }
+                            continue;
+                        }
                         let write_deadline = websocket_turn_timeout_deadline(
                             response_in_flight,
                             received_response_event,
@@ -5223,6 +5239,18 @@ mod tests {
                     message["type"], "error",
                     "turn {turn} was rejected before reaching upstream: {message}"
                 );
+            }
+            if turn == 1 {
+                client
+                    .send(UpstreamMessage::Ping(vec![4, 2]))
+                    .await
+                    .expect("send between-turn ping");
+                let pong = tokio::time::timeout(Duration::from_secs(2), client.next())
+                    .await
+                    .expect("between-turn pong timed out")
+                    .expect("downstream closed before pong")
+                    .expect("read between-turn pong");
+                assert!(matches!(pong, UpstreamMessage::Pong(data) if data == vec![4, 2]));
             }
         }
 
