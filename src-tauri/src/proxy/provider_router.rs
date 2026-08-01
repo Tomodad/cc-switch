@@ -7,7 +7,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -30,6 +30,15 @@ static RESULT_PERSISTENCE_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static RELEASE_RESULT_PERSISTENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static PAUSE_PROVIDER_RESET_BEFORE_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static PROVIDER_RESET_PAUSED_BEFORE_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static RELEASE_PROVIDER_RESET_BARRIER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(test))]
@@ -55,6 +64,33 @@ pub struct ProviderRouter {
     detached_result_flush_lock: Arc<Mutex<()>>,
     /// Capacity-one wakeup channel; duplicate wakeups coalesce with pending results.
     detached_result_notify_tx: mpsc::Sender<()>,
+    /// Reset/clear operations that must win over racing detached lifecycle results.
+    result_controls_in_progress: Arc<StdMutex<HashSet<String>>>,
+}
+
+struct ResultControlMarker {
+    controls: Arc<StdMutex<HashSet<String>>>,
+    key: String,
+}
+
+impl ResultControlMarker {
+    fn new(controls: Arc<StdMutex<HashSet<String>>>, key: String) -> Result<Self, AppError> {
+        controls
+            .lock()
+            .map_err(|_| {
+                AppError::Message("provider result control marker lock poisoned".to_string())
+            })?
+            .insert(key.clone());
+        Ok(Self { controls, key })
+    }
+}
+
+impl Drop for ResultControlMarker {
+    fn drop(&mut self) {
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.remove(&self.key);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -351,6 +387,7 @@ impl ProviderRouter {
             detached_result_pending,
             detached_result_flush_lock,
             detached_result_notify_tx,
+            result_controls_in_progress: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -601,9 +638,28 @@ impl ProviderRouter {
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
-        let _enqueue_guard = self.result_enqueue_gate.try_read().ok();
+        let Some(_enqueue_guard) = self.result_enqueue_gate.try_read().ok() else {
+            self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
+                .await;
+            return Ok(());
+        };
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let _ordering_guard = ordering_lock.try_lock().ok();
+        let provider_reset_key = format!("provider:{app_type}:{provider_id}");
+        let app_clear_key = format!("app:{app_type}");
+        let control_in_progress = {
+            let controls = self.result_controls_in_progress.lock().map_err(|_| {
+                AppError::Message("provider result control marker lock poisoned".to_string())
+            })?;
+            controls.contains("all")
+                || controls.contains(&app_clear_key)
+                || controls.contains(&provider_reset_key)
+        };
+        if control_in_progress {
+            self.release_permit_neutral(provider_id, app_type, used_half_open_permit)
+                .await;
+            return Ok(());
+        }
         let failure_threshold = self
             .record_circuit_result(provider_id, app_type, used_half_open_permit, success)
             .await;
@@ -664,6 +720,9 @@ impl ProviderRouter {
         provider_id: &str,
         app_type: &str,
     ) -> Result<(), AppError> {
+        let reset_key = format!("provider:{app_type}:{provider_id}");
+        let _reset_marker =
+            ResultControlMarker::new(self.result_controls_in_progress.clone(), reset_key)?;
         let enqueue_guard = self.result_enqueue_gate.read().await;
         let ordering_lock = self.result_ordering_lock(provider_id, app_type).await;
         let ordering_guard = ordering_lock.lock().await;
@@ -672,6 +731,17 @@ impl ProviderRouter {
             .await?;
         let circuit_key = format!("{app_type}:{provider_id}");
         self.reset_circuit_breaker(&circuit_key).await;
+        #[cfg(test)]
+        {
+            if PAUSE_PROVIDER_RESET_BEFORE_BARRIER.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                PROVIDER_RESET_PAUSED_BEFORE_BARRIER
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !RELEASE_PROVIDER_RESET_BARRIER.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
         let (completion_tx, completion_rx) = oneshot::channel();
         self.result_persistence_tx
             .send(ProviderPersistenceJob::Reset {
@@ -693,6 +763,10 @@ impl ProviderRouter {
 
     /// Clear one app's persisted provider health after all older queued results.
     pub async fn clear_provider_health_for_app(&self, app_type: &str) -> Result<(), AppError> {
+        let _clear_marker = ResultControlMarker::new(
+            self.result_controls_in_progress.clone(),
+            format!("app:{app_type}"),
+        )?;
         let enqueue_guard = self.result_enqueue_gate.write().await;
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, Some(app_type))
@@ -716,6 +790,8 @@ impl ProviderRouter {
 
     /// Clear all persisted provider health after all older queued results.
     pub async fn clear_all_provider_health(&self) -> Result<(), AppError> {
+        let _clear_marker =
+            ResultControlMarker::new(self.result_controls_in_progress.clone(), "all".to_string())?;
         let enqueue_guard = self.result_enqueue_gate.write().await;
         let flush_guard = self.detached_result_flush_lock.lock().await;
         self.flush_detached_results_locked(None, None).await?;
@@ -1438,6 +1514,91 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
+    async fn provider_reset_wins_over_detached_result_started_during_reset() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "reset-race-provider".to_string(),
+            "Reset Race Provider".to_string(),
+            json!({}),
+            None,
+        );
+        let barrier_provider = Provider::with_id(
+            "reset-race-barrier".to_string(),
+            "Reset Race Barrier".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        db.save_provider("codex", &barrier_provider).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+
+        PROVIDER_RESET_PAUSED_BEFORE_BARRIER.store(false, std::sync::atomic::Ordering::SeqCst);
+        RELEASE_PROVIDER_RESET_BARRIER.store(false, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_PROVIDER_RESET_BEFORE_BARRIER.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let reset_router = router.clone();
+        let reset_provider_id = provider.id.clone();
+        let reset = tokio::spawn(async move {
+            reset_router
+                .reset_provider_breaker(&reset_provider_id, "codex")
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !PROVIDER_RESET_PAUSED_BEFORE_BARRIER.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider reset did not pause before its persistence barrier");
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            router.record_result_detached(
+                &provider.id,
+                "codex",
+                false,
+                false,
+                Some("failure racing with reset".to_string()),
+            ),
+        )
+        .await
+        .expect("detached result blocked behind provider reset")
+        .unwrap();
+
+        RELEASE_PROVIDER_RESET_BARRIER.store(true, std::sync::atomic::Ordering::SeqCst);
+        reset.await.unwrap();
+        let flush_guard = router.detached_result_flush_lock.lock().await;
+        router
+            .flush_detached_results_locked(Some(&provider.id), Some("codex"))
+            .await
+            .unwrap();
+        drop(flush_guard);
+        router
+            .record_result(&barrier_provider.id, "codex", false, true, None)
+            .await
+            .unwrap();
+
+        let health = db.get_provider_health(&provider.id, "codex").await.unwrap();
+        assert!(health.is_healthy, "manual reset must win in SQLite");
+        assert_eq!(health.consecutive_failures, 0);
+        if let Some(stats) = router
+            .get_circuit_breaker_stats(&provider.id, "codex")
+            .await
+        {
+            assert_eq!(
+                stats.consecutive_failures, 0,
+                "manual reset must win in memory"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn app_health_clear_waits_behind_detached_result_persistence() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
@@ -1491,6 +1652,19 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let clear_finished_before_older_result = clear.is_finished();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            router.record_result_detached(
+                &provider.id,
+                "codex",
+                false,
+                false,
+                Some("failure racing with app clear".to_string()),
+            ),
+        )
+        .await
+        .expect("detached result blocked behind app-wide clear")
+        .unwrap();
 
         RELEASE_RESULT_PERSISTENCE.store(true, std::sync::atomic::Ordering::SeqCst);
         clear.await.unwrap();
