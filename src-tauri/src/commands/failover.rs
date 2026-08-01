@@ -8,6 +8,10 @@ use crate::store::AppState;
 use std::str::FromStr;
 use tauri::Emitter;
 
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_AUTO_FAILOVER_CONFIG_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 获取故障转移队列
 #[tauri::command]
 pub async fn get_failover_queue(
@@ -284,12 +288,63 @@ async fn set_auto_failover_enabled_inner(
     let previous_config = config.clone();
     config.auto_failover_enabled = enabled;
 
-    // 写回数据库
-    state
+    // 写回数据库。失败时也必须撤销已经完成的 P1 热切换和自动入队。
+    #[cfg(test)]
+    let config_write_result =
+        if FAIL_NEXT_AUTO_FAILOVER_CONFIG_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err("injected auto-failover config write failure".to_string())
+        } else {
+            state
+                .db
+                .update_proxy_config_for_app(config)
+                .await
+                .map_err(|e| e.to_string())
+        };
+    #[cfg(not(test))]
+    let config_write_result = state
         .db
         .update_proxy_config_for_app(config)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    if let Err(error) = config_write_result {
+        let mut rollback_errors = Vec::new();
+        if enabled && previous_provider_id != p1_provider_id {
+            if let Err(rollback_error) = state
+                .proxy_service
+                .switch_proxy_target(&app_type, &previous_provider_id)
+                .await
+            {
+                rollback_errors.push(format!("restore provider target: {rollback_error}"));
+            }
+        }
+        if let Some(provider_id) = auto_added_provider_id.as_ref() {
+            if let Err(rollback_error) = state.db.remove_from_failover_queue(&app_type, provider_id)
+            {
+                rollback_errors.push(format!("restore auto-populated queue: {rollback_error}"));
+            }
+            if let Some(health) = auto_added_previous_health.as_ref() {
+                if let Err(rollback_error) = state.db.restore_provider_health(health).await {
+                    rollback_errors.push(format!(
+                        "restore auto-populated provider health: {rollback_error}"
+                    ));
+                }
+            }
+        }
+        if let Err(rollback_error) = state
+            .proxy_service
+            .refresh_failover_projection_if_active(&app_type)
+            .await
+        {
+            rollback_errors.push(format!("restore live projection: {rollback_error}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(format!(
+            "{error}; failover enable rollback failed: {}",
+            rollback_errors.join("; ")
+        ));
+    }
     if let Err(error) = state
         .proxy_service
         .refresh_failover_projection_if_active(&app_type)
@@ -603,6 +658,57 @@ supports_websockets = {supports_websockets}
         );
         assert!(db.is_in_failover_queue("codex", &p1.id).unwrap());
         assert_eq!(db.get_failover_queue("codex").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enabling_failover_config_write_failure_restores_previous_target() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("create database"));
+        let current = codex_provider("config-write-current", false);
+        let mut p1 = codex_provider("config-write-p1", true);
+        p1.sort_index = Some(0);
+        db.save_provider("codex", &current).unwrap();
+        db.save_provider("codex", &p1).unwrap();
+        db.set_current_provider("codex", &current.id).unwrap();
+        crate::settings::set_current_provider(
+            &crate::app_config::AppType::Codex,
+            Some(&current.id),
+        )
+        .unwrap();
+        db.add_to_failover_queue("codex", &p1.id).unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.enabled = true;
+        config.auto_failover_enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        let state = AppState::new(db.clone());
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&current)
+            .await
+            .unwrap();
+        FAIL_NEXT_AUTO_FAILOVER_CONFIG_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = set_auto_failover_enabled_inner(&state, "codex".to_string(), true)
+            .await
+            .expect_err("config write should fail");
+        assert!(error.contains("injected"));
+        assert_eq!(
+            crate::settings::get_effective_current_provider(
+                &db,
+                &crate::app_config::AppType::Codex,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(current.id.as_str())
+        );
+        assert!(db.is_in_failover_queue("codex", &p1.id).unwrap());
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await
+                .unwrap()
+                .auto_failover_enabled
+        );
     }
 
     #[tokio::test]

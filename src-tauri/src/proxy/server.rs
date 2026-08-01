@@ -344,24 +344,34 @@ impl ProxyServer {
         // Close upgraded WebSocket connections before the listener is marked stopped.
         self.state.websocket_shutdown_tx.send_replace(true);
 
-        // 1. 发送关闭信号
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
+        // 1. 发送关闭信号。重试 stop 时 sender 可能已被首次调用消费。
+        let shutdown_sent = if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
+            true
         } else {
+            false
+        };
+
+        // 2. 等待服务器任务结束（带 5 秒超时保护）。超时时保留 handle，
+        // 让后续 restore/stop 调用可以继续等待同一个关闭任务。
+        let mut server_handle = self.server_handle.write().await.take();
+        if !shutdown_sent
+            && server_handle.is_none()
+            && self.state.websocket_active.load(Ordering::Acquire) == 0
+        {
             return Err(ProxyError::NotRunning);
         }
-
-        // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        if let Some(mut handle) = server_handle.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
                     return Err(ProxyError::StopFailed(e.to_string()));
                 }
                 Err(_) => {
+                    *self.server_handle.write().await = Some(handle);
                     log::warn!(
-                        "[{}] 代理服务器停止超时（5秒），强制继续",
+                        "[{}] 代理服务器停止超时（5秒），保留关闭任务供后续重试",
                         log_srv::STOP_TIMEOUT
                     );
                     return Err(ProxyError::StopTimeout);
@@ -666,6 +676,24 @@ mod tests {
             *server.state.websocket_shutdown_tx.borrow(),
             "shutdown state was lost when no upgraded socket had subscribed"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_timeout_retains_server_handle_for_retry() {
+        let server = ProxyServer::new(
+            ProxyConfig::default(),
+            Arc::new(Database::memory().expect("create in-memory database")),
+            None,
+        );
+        *server.server_handle.write().await = Some(tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
+        }));
+
+        assert!(matches!(server.stop().await, Err(ProxyError::StopTimeout)));
+        assert!(server.server_handle.read().await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.stop().await.expect("retry retained stop handle");
     }
 
     #[tokio::test]

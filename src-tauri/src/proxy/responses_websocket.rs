@@ -895,6 +895,7 @@ async fn handle_connection_inner(
     let mut first_token_ms = None;
     let mut received_response_event = false;
     let mut relayed_response_event = false;
+    let mut buffered_pre_output_events = Vec::new();
     let mut last_response_event_at = turn_started;
     log::info!(
         "[CodexWS] Connected protocol-aware Responses WebSocket (provider={})",
@@ -971,6 +972,7 @@ async fn handle_connection_inner(
                             first_token_ms = None;
                             received_response_event = false;
                             relayed_response_event = false;
+                            buffered_pre_output_events.clear();
                             last_response_event_at = retry_started;
                             continue;
                         }
@@ -1430,6 +1432,7 @@ async fn handle_connection_inner(
                             received_response_event = false;
                             media_rectifier_retried = false;
                             relayed_response_event = false;
+                            buffered_pre_output_events.clear();
                             last_response_event_at = turn_started;
                         }
                         let write_deadline = websocket_turn_timeout_deadline(
@@ -1672,6 +1675,18 @@ async fn handle_connection_inner(
                         {
                             remember_response_cursor_owner(state, event, &provider).await;
                         }
+                        if !terminal
+                            && !relayed_response_event
+                            && !media_rectifier_retried
+                            && turn_context.rectifier_config.enabled
+                            && turn_context.rectifier_config.request_media_fallback
+                            && response_create_contains_images(&original_response_create)
+                            && websocket_event_is(&text, "response.created")
+                        {
+                            buffered_pre_output_events
+                                .push(restore_upstream_text(text, &turn_state));
+                            continue;
+                        }
                         let mut media_retry_write_failure = None;
                         let mut terminal_usage_already_logged = false;
                         if terminal
@@ -1769,6 +1784,7 @@ async fn handle_connection_inner(
                                         media_rectifier_retried = true;
                                         received_response_event = false;
                                         relayed_response_event = false;
+                                        buffered_pre_output_events.clear();
                                         turn_started = retry_started;
                                         first_token_ms = None;
                                         last_response_event_at = retry_started;
@@ -1876,6 +1892,7 @@ async fn handle_connection_inner(
                                         first_token_ms = None;
                                         received_response_event = false;
                                         relayed_response_event = false;
+                                        buffered_pre_output_events.clear();
                                         last_response_event_at = retry_started;
                                         retried = true;
                                     }
@@ -1929,6 +1946,22 @@ async fn handle_connection_inner(
                             last_response_event_at,
                             timeout_config,
                         );
+                        for buffered in buffered_pre_output_events.drain(..) {
+                            if send_downstream_message_with_accounting(
+                                downstream,
+                                &mut turn_accounting,
+                                DownstreamMessage::Text(buffered),
+                                write_deadline,
+                                &mut shutdown_rx,
+                                "buffered lifecycle frame write",
+                            )
+                            .await?
+                                == WebSocketSendOutcome::Shutdown
+                            {
+                                finish_websocket_shutdown(downstream, &mut turn_accounting).await;
+                                return Ok(());
+                            }
+                        }
                         if send_downstream_message_with_accounting(
                             downstream,
                             &mut turn_accounting,
@@ -2462,6 +2495,13 @@ fn response_create_provider_cursor(text: &str) -> Option<String> {
 
 fn response_create_has_provider_cursor(text: &str) -> bool {
     response_create_provider_cursor(text).is_some()
+}
+
+fn response_create_contains_images(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|event| response_create_body(&event).ok())
+        .is_some_and(|body| super::media_sanitizer::contains_image_blocks(&body))
 }
 
 async fn remember_response_cursor_owner(state: &ProxyState, event: &Value, provider: &Provider) {
@@ -4265,6 +4305,13 @@ mod tests {
                 .await
                 .expect("accept websocket");
             let first = next_text(&mut websocket).await;
+            websocket
+                .send(UpstreamMessage::Text(
+                    json!({"type":"response.created","response":{"id":"resp-media-attempt"}})
+                        .to_string(),
+                ))
+                .await
+                .expect("send response.created");
             websocket
                 .send(UpstreamMessage::Text(
                     json!({
