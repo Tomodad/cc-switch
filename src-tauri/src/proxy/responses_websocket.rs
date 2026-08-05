@@ -41,6 +41,7 @@ const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 struct RestoreState {
     namespace_restore_map: HashMap<String, transform_codex_responses_namespace::NamespacedName>,
     restore_tool_search: bool,
+    tool_search_item_ids: HashMap<String, String>,
 }
 
 pub async fn handle_responses_websocket(
@@ -94,7 +95,7 @@ async fn handle_connection_inner(
         ));
     }
 
-    let (first_text, restore_state) = transform_response_create(&first_text, &provider)?;
+    let (first_text, mut restore_state) = transform_response_create(&first_text, &provider)?;
     let request = build_upstream_request(&provider, headers)?;
     let connect = tokio_tungstenite::connect_async(request);
     let (mut upstream, _) = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, connect)
@@ -184,7 +185,7 @@ async fn handle_connection_inner(
                 match upstream_message {
                     UpstreamMessage::Text(text) => {
                         let terminal = websocket_event_is_terminal(&text);
-                        let text = restore_upstream_text(text, &restore_state);
+                        let text = restore_upstream_text(text, &mut restore_state);
                         downstream.send(DownstreamMessage::Text(text)).await.map_err(|error| {
                             ProxyError::ForwardFailed(format!("downstream WebSocket write failed: {error}"))
                         })?;
@@ -348,6 +349,7 @@ fn transform_response_create(
             namespace_restore_map,
             restore_tool_search: request_uses_tool_search_shim
                 && should_restore_codex_native_tool_search(provider, RESPONSES_ENDPOINT),
+            tool_search_item_ids: HashMap::new(),
         },
     ))
 }
@@ -381,17 +383,18 @@ fn websocket_event_is_terminal(text: &str) -> bool {
         })
 }
 
-fn restore_upstream_text(text: String, state: &RestoreState) -> String {
+fn restore_upstream_text(text: String, state: &mut RestoreState) -> String {
     if state.namespace_restore_map.is_empty() && !state.restore_tool_search {
         return text;
     }
     let Ok(mut event) = serde_json::from_str::<Value>(&text) else {
         return text;
     };
-    if !transform_codex_responses_namespace::restore_response_tool_calls(
+    if !transform_codex_responses_namespace::restore_sse_event_tool_calls(
         &mut event,
         &state.namespace_restore_map,
         state.restore_tool_search,
+        &mut state.tool_search_item_ids,
     ) {
         return text;
     }
@@ -582,8 +585,9 @@ mod tests {
     #[test]
     fn response_create_matches_native_http_transform_semantics() {
         let provider = websocket_provider("http://127.0.0.1:1".to_string());
-        let (encoded, state) = transform_response_create(&response_create().to_string(), &provider)
-            .expect("transform");
+        let (encoded, mut state) =
+            transform_response_create(&response_create().to_string(), &provider)
+                .expect("transform");
         let event: Value = serde_json::from_str(&encoded).expect("transformed event JSON");
 
         assert_eq!(event["type"], "response.create");
@@ -615,11 +619,83 @@ mod tests {
                 }
             })
             .to_string(),
-            &state,
+            &mut state,
         );
         let restored: Value = serde_json::from_str(&restored).expect("restored event");
         assert_eq!(restored["response"]["output"][0]["name"], "run");
         assert_eq!(restored["response"]["output"][0]["namespace"], "demo");
+    }
+
+    #[test]
+    fn websocket_stream_restores_tool_search_ids_consistently() {
+        let provider = websocket_provider("http://127.0.0.1:1".to_string());
+        let (_, mut state) = transform_response_create(&response_create().to_string(), &provider)
+            .expect("transform");
+
+        let restore = |state: &mut RestoreState, event: Value| {
+            serde_json::from_str::<Value>(&restore_upstream_text(event.to_string(), state))
+                .expect("restored event")
+        };
+        let added = restore(
+            &mut state,
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "id": "fc_search-1",
+                    "type": "function_call",
+                    "name": "tool_search",
+                    "call_id": "search-1",
+                    "arguments": ""
+                }
+            }),
+        );
+        let delta = restore(
+            &mut state,
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_search-1",
+                "delta": "{\"query\":\"thread tools\"}"
+            }),
+        );
+        let done = restore(
+            &mut state,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "fc_search-1",
+                    "type": "function_call",
+                    "name": "tool_search",
+                    "call_id": "search-1",
+                    "arguments": "{\"query\":\"thread tools\"}"
+                }
+            }),
+        );
+        let completed = restore(
+            &mut state,
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [{
+                        "id": "fc_search-1",
+                        "type": "function_call",
+                        "name": "tool_search",
+                        "call_id": "search-1",
+                        "arguments": "{\"query\":\"thread tools\"}"
+                    }]
+                }
+            }),
+        );
+
+        for item in [
+            &added["item"],
+            &done["item"],
+            &completed["response"]["output"][0],
+        ] {
+            assert_eq!(item["type"], "tool_search_call");
+            assert_eq!(item["id"], "tsc_search-1");
+            assert_eq!(item["call_id"], "search-1");
+        }
+        assert_eq!(delta["item_id"], "tsc_search-1");
     }
 
     #[test]
