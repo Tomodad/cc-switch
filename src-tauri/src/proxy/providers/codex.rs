@@ -73,15 +73,18 @@ pub fn codex_provider_uses_chat_completions(provider: &Provider) -> bool {
         .unwrap_or(false)
 }
 
-pub fn should_convert_codex_responses_to_chat(provider: &Provider, endpoint: &str) -> bool {
+fn is_codex_responses_endpoint(endpoint: &str) -> bool {
     let path = endpoint
         .split_once('?')
         .map_or(endpoint, |(path, _query)| path);
-
     matches!(
         path,
         "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
-    ) && codex_provider_uses_chat_completions(provider)
+    )
+}
+
+pub fn should_convert_codex_responses_to_chat(provider: &Provider, endpoint: &str) -> bool {
+    is_codex_responses_endpoint(endpoint) && codex_provider_uses_chat_completions(provider)
 }
 
 /// Whether a converted Codex Responses request may send `prompt_cache_key` to
@@ -196,14 +199,56 @@ pub fn codex_provider_uses_anthropic(provider: &Provider) -> bool {
 }
 
 pub fn should_convert_codex_responses_to_anthropic(provider: &Provider, endpoint: &str) -> bool {
-    let path = endpoint
-        .split_once('?')
-        .map_or(endpoint, |(path, _query)| path);
+    is_codex_responses_endpoint(endpoint) && codex_provider_uses_anthropic(provider)
+}
+/// Whether a Codex provider explicitly supports the native Responses WebSocket
+/// transport that CC Switch can proxy without a protocol bridge.
+pub fn codex_provider_supports_responses_websocket(provider: &Provider) -> bool {
+    if is_codex_official_provider(provider)
+        || provider.uses_managed_account_auth()
+        || codex_provider_uses_chat_completions(provider)
+        || codex_provider_uses_anthropic(provider)
+    {
+        return false;
+    }
 
-    matches!(
-        path,
-        "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
-    ) && codex_provider_uses_anthropic(provider)
+    provider
+        .settings_config
+        .get("supports_websockets")
+        .or_else(|| provider.settings_config.get("supportsWebsockets"))
+        .and_then(JsonValue::as_bool)
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(|config| config.get("supports_websockets"))
+                .and_then(JsonValue::as_bool)
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(JsonValue::as_str)
+                .and_then(extract_codex_supports_websockets_from_toml)
+        })
+        .unwrap_or(false)
+}
+
+fn extract_codex_supports_websockets_from_toml(config_text: &str) -> Option<bool> {
+    let doc = config_text.parse::<TomlValue>().ok()?;
+
+    if let Some(active_provider) = doc.get("model_provider").and_then(TomlValue::as_str) {
+        if let Some(supported) = doc
+            .get("model_providers")
+            .and_then(|providers| providers.get(active_provider))
+            .and_then(|provider| provider.get("supports_websockets"))
+            .and_then(TomlValue::as_bool)
+        {
+            return Some(supported);
+        }
+    }
+
+    doc.get("supports_websockets").and_then(TomlValue::as_bool)
 }
 
 /// Whether a native-Responses Codex upstream needs Codex `namespace`/plugin
@@ -225,6 +270,22 @@ pub fn provider_needs_responses_namespace_flatten(provider: &Provider) -> bool {
 pub fn is_codex_official_provider(provider: &Provider) -> bool {
     provider.id == crate::database::CODEX_OFFICIAL_PROVIDER_ID
         && provider.category.as_deref() == Some("official")
+}
+
+/// Whether a request passing through the local CC-Switch Codex proxy should
+/// receive the deferred-tool discovery shim. Direct/non-takeover Codex config
+/// that points at an upstream directly never reaches this routing layer and
+/// therefore cannot be changed by CC-Switch.
+pub fn should_inject_codex_tool_search_shim(provider: &Provider, endpoint: &str) -> bool {
+    is_codex_responses_endpoint(endpoint) && !is_codex_official_provider(provider)
+}
+
+/// Native Responses upstreams return the synthetic shim as a regular
+/// `function_call`; Chat/Anthropic paths already restore it in their adapters.
+pub fn should_restore_codex_native_tool_search(provider: &Provider, endpoint: &str) -> bool {
+    should_inject_codex_tool_search_shim(provider, endpoint)
+        && !codex_provider_uses_chat_completions(provider)
+        && !codex_provider_uses_anthropic(provider)
 }
 
 /// Resolve the model-catalog tool profile for a Codex provider using the SAME
@@ -252,6 +313,33 @@ pub fn resolve_codex_catalog_tool_profile(
     CodexCatalogToolProfile::from_api_format(
         provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
     )
+}
+
+/// Resolve the catalog profile used while CC-Switch owns the local Codex route.
+/// Direct native Responses configs stay conservative, while a non-official
+/// native Responses provider can advertise ToolSearch because the local proxy
+/// supplies the compatibility transport.
+pub fn resolve_codex_proxy_catalog_tool_profile(
+    provider: &Provider,
+) -> crate::codex_config::CodexCatalogToolProfile {
+    use crate::codex_config::CodexCatalogToolProfile;
+    let profile = resolve_codex_catalog_tool_profile(provider);
+    if !is_codex_official_provider(provider)
+        && matches!(
+            profile,
+            CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic
+        )
+    {
+        match profile {
+            CodexCatalogToolProfile::NativeResponses => {
+                CodexCatalogToolProfile::ProxiedNativeResponses
+            }
+            CodexCatalogToolProfile::Anthropic => CodexCatalogToolProfile::ProxiedAnthropic,
+            _ => unreachable!(),
+        }
+    } else {
+        profile
+    }
 }
 
 /// Extract the real upstream model configured for a Codex provider.
@@ -840,6 +928,40 @@ mod tests {
     }
 
     #[test]
+    fn responses_websocket_capability_is_explicit_and_native_only() {
+        let custom = create_provider(json!({"supports_websockets": true}));
+        assert!(codex_provider_supports_responses_websocket(&custom));
+
+        let camel = create_provider(json!({"supportsWebsockets": true}));
+        assert!(codex_provider_supports_responses_websocket(&camel));
+
+        let toml = create_provider(json!({
+            "config": "model_provider = \"native\"\n[model_providers.native]\nsupports_websockets = true\n"
+        }));
+        assert!(codex_provider_supports_responses_websocket(&toml));
+
+        let absent = create_provider(json!({}));
+        assert!(!codex_provider_supports_responses_websocket(&absent));
+
+        let chat = create_provider(json!({
+            "supports_websockets": true,
+            "api_format": "chat"
+        }));
+        assert!(!codex_provider_supports_responses_websocket(&chat));
+
+        let mut managed = create_provider(json!({"supports_websockets": true}));
+        managed.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..Default::default()
+        });
+        assert!(!codex_provider_supports_responses_websocket(&managed));
+
+        let mut official = create_provider(json!({"supports_websockets": true}));
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert!(!codex_provider_supports_responses_websocket(&official));
+    }
+    #[test]
     fn grok_build_toml_exposes_upstream_credentials_and_model() {
         let adapter = CodexAdapter::new();
         let provider = create_provider(json!({
@@ -1150,6 +1272,11 @@ wire_api = "anthropic"
             resolve_codex_catalog_tool_profile(&settings_anthropic),
             CodexCatalogToolProfile::Anthropic
         );
+        assert_eq!(
+            resolve_codex_proxy_catalog_tool_profile(&settings_anthropic),
+            CodexCatalogToolProfile::ProxiedAnthropic,
+            "proxy-owned Anthropic routing needs the ToolSearch-capable proxy profile"
+        );
 
         // Native openai_responses (meta) → NativeResponses; chat → ProxyChat.
         let mut native = create_provider(json!({}));
@@ -1160,6 +1287,20 @@ wire_api = "anthropic"
         assert_eq!(
             resolve_codex_catalog_tool_profile(&native),
             CodexCatalogToolProfile::NativeResponses
+        );
+        assert_eq!(
+            resolve_codex_proxy_catalog_tool_profile(&native),
+            CodexCatalogToolProfile::ProxiedNativeResponses,
+            "a non-official native provider gets ToolSearch capability only on the local proxy route"
+        );
+
+        let mut official = native.clone();
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert_eq!(
+            resolve_codex_proxy_catalog_tool_profile(&official),
+            CodexCatalogToolProfile::NativeResponses,
+            "official Codex routing must not receive the custom-provider ToolSearch capability"
         );
 
         let chat = create_provider(json!({ "apiFormat": "openai_chat" }));
@@ -1294,6 +1435,73 @@ wire_api = "anthropic"
         assert!(!CodexAdapter::is_official_client("some codex_vscode/1.0.0"));
         assert!(!CodexAdapter::is_official_client(
             "prefix_codex_cli_rs/1.0.0"
+        ));
+    }
+
+    #[test]
+    fn tool_search_shim_is_scoped_to_local_third_party_responses_routes() {
+        let native = create_provider(json!({"base_url": "https://relay.example.com/v1"}));
+        assert!(should_inject_codex_tool_search_shim(&native, "/responses"));
+        assert!(should_restore_codex_native_tool_search(
+            &native,
+            "/responses"
+        ));
+        assert!(!should_inject_codex_tool_search_shim(
+            &native,
+            "/chat/completions"
+        ));
+
+        let mut chat = create_provider(json!({"apiFormat": "openai_chat"}));
+        chat.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        assert!(should_inject_codex_tool_search_shim(&chat, "/responses"));
+        assert!(!should_restore_codex_native_tool_search(
+            &chat,
+            "/responses"
+        ));
+
+        let mut anthropic = create_provider(json!({"apiFormat": "anthropic"}));
+        anthropic.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            ..Default::default()
+        });
+        assert!(should_inject_codex_tool_search_shim(
+            &anthropic,
+            "/responses"
+        ));
+        assert!(!should_restore_codex_native_tool_search(
+            &anthropic,
+            "/responses"
+        ));
+
+        let mut official = create_provider(json!({}));
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert!(!should_inject_codex_tool_search_shim(
+            &official,
+            "/responses"
+        ));
+        assert!(!should_restore_codex_native_tool_search(
+            &official,
+            "/responses"
+        ));
+    }
+
+    #[test]
+    fn tool_search_shim_supports_third_party_provider_with_stale_official_category() {
+        let mut provider = create_provider(json!({"base_url": "https://api.deepseek.com/v1"}));
+        provider.id = "deepseek-responses".to_string();
+        provider.category = Some("official".to_string());
+
+        assert!(should_inject_codex_tool_search_shim(
+            &provider,
+            "/responses"
+        ));
+        assert!(should_restore_codex_native_tool_search(
+            &provider,
+            "/responses"
         ));
     }
 

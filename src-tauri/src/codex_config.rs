@@ -127,6 +127,11 @@ const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
 pub enum CodexCatalogToolProfile {
     ProxyChat,
     NativeResponses,
+    /// Codex reaches a third-party native Responses gateway through CC-Switch's
+    /// local proxy. Keep the clean function-only native tool shape, but advertise
+    /// ToolSearch support so app-server builds the deferred dynamic-tool index;
+    /// the proxy translates ToolSearch for upstream compatibility.
+    ProxiedNativeResponses,
     /// Codex talks (through cc-switch's proxy) to a native Anthropic Messages
     /// gateway. Like `NativeResponses` it must suppress Codex's freeform custom
     /// tools — the Responses→Anthropic transform keeps only `function` tools.
@@ -134,6 +139,11 @@ pub enum CodexCatalogToolProfile {
     /// (the transform drops it), so it is always disabled — see
     /// `prepare_codex_config_text_with_model_catalog`.
     Anthropic,
+    /// The same Anthropic transport while CC-Switch owns the local proxy route.
+    /// It keeps the conservative Anthropic tool shape while advertising
+    /// ToolSearch so app-server builds the deferred dynamic-tool index that the
+    /// proxy shim transports upstream.
+    ProxiedAnthropic,
 }
 
 impl CodexCatalogToolProfile {
@@ -548,6 +558,51 @@ fn codex_catalog_input_modalities(
     modalities.iter().map(|item| (*item).to_string()).collect()
 }
 
+fn codex_reasoning_level(effort: &str) -> Value {
+    let description = match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Ultra reasoning depth for the most demanding problems",
+        _ => "Reasoning effort",
+    };
+    json!({ "effort": effort, "description": description })
+}
+
+fn codex_model_reasoning_metadata(model: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-5.6-sol" => Some(("low", &["low", "medium", "high", "xhigh", "max", "ultra"])),
+        "gpt-5.6-terra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
+        "gpt-5.6-luna" => Some(("medium", &["low", "medium", "high", "xhigh", "max"])),
+        _ => None,
+    }
+}
+
+fn apply_codex_model_reasoning_metadata(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    model: &str,
+) {
+    let Some((default_effort, efforts)) = codex_model_reasoning_metadata(model) else {
+        return;
+    };
+
+    entry_obj.insert("default_reasoning_level".to_string(), json!(default_effort));
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        Value::Array(
+            efforts
+                .iter()
+                .map(|effort| codex_reasoning_level(effort))
+                .collect(),
+        ),
+    );
+    entry_obj.insert("reasoning_levels".to_string(), Value::Null);
+}
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -585,6 +640,8 @@ fn codex_catalog_model_entry(
         )),
     );
 
+    apply_codex_model_reasoning_metadata(entry_obj, &spec.model);
+
     if profile != CodexCatalogToolProfile::ProxyChat {
         // Native `/responses` and Anthropic gateways reject / drop Codex's freeform
         // `apply_patch` (type=="custom") tool. Strip any key that would make Codex
@@ -617,6 +674,13 @@ fn codex_catalog_model_entry(
         if let Some(parallel) = spec.supports_parallel_tool_calls {
             entry_obj.insert("supports_parallel_tool_calls".to_string(), json!(parallel));
         }
+    }
+
+    if matches!(
+        profile,
+        CodexCatalogToolProfile::ProxiedNativeResponses | CodexCatalogToolProfile::ProxiedAnthropic
+    ) {
+        entry_obj.insert("supports_search_tool".to_string(), json!(true));
     }
 
     entry
@@ -1225,9 +1289,10 @@ fn codex_model_catalog_from_settings(
     // no cache dependency); proxy-chat providers keep cloning Codex's gpt-5.5
     // entry so the proxy can rewrite custom<->function tools as before.
     let template = match profile {
-        CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
-            load_codex_native_responses_template()
-        }
+        CodexCatalogToolProfile::NativeResponses
+        | CodexCatalogToolProfile::ProxiedNativeResponses
+        | CodexCatalogToolProfile::ProxiedAnthropic
+        | CodexCatalogToolProfile::Anthropic => load_codex_native_responses_template(),
         CodexCatalogToolProfile::ProxyChat => load_codex_model_catalog_template()?,
     };
     Ok(Some(codex_model_catalog_from_specs(
@@ -1317,8 +1382,9 @@ pub fn prepare_codex_config_text_with_model_catalog(
         let disable_web_search = match profile {
             // The Responses→Anthropic transform silently drops the Codex web_search
             // hosted tool, so always disable it here rather than present a dead tool.
-            CodexCatalogToolProfile::Anthropic => true,
-            CodexCatalogToolProfile::NativeResponses => {
+            CodexCatalogToolProfile::Anthropic | CodexCatalogToolProfile::ProxiedAnthropic => true,
+            CodexCatalogToolProfile::NativeResponses
+            | CodexCatalogToolProfile::ProxiedNativeResponses => {
                 codex_native_gateway_rejects_web_search(&config_text)
             }
             CodexCatalogToolProfile::ProxyChat => false,
@@ -1331,7 +1397,10 @@ pub fn prepare_codex_config_text_with_model_catalog(
         // Even without a generated catalog, the Responses→Anthropic transform drops the
         // Codex web_search hosted tool, so keep the invariant that an Anthropic provider
         // never presents it as a dead tool.
-        let disable_web_search = profile == CodexCatalogToolProfile::Anthropic;
+        let disable_web_search = matches!(
+            profile,
+            CodexCatalogToolProfile::Anthropic | CodexCatalogToolProfile::ProxiedAnthropic
+        );
         set_codex_native_web_search_field(&config_text, disable_web_search)
     }
 }
@@ -2287,6 +2356,38 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
 
     Ok(doc.to_string())
 }
+/// Project the active Codex provider's WebSocket capability while preserving
+/// the rest of the user's TOML document.
+pub fn update_codex_supports_websockets(
+    toml_str: &str,
+    supports_websockets: bool,
+) -> Result<String, String> {
+    let mut doc = toml_str
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("TOML parse error: {e}"))?;
+
+    if let Some(provider_key) = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+    {
+        let provider_table = doc
+            .get_mut("model_providers")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .and_then(|providers| providers.get_mut(&provider_key))
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| {
+                format!(
+                    "model_providers.{provider_key} must be a table before projecting supports_websockets"
+                )
+            })?;
+        provider_table.insert("supports_websockets", toml_edit::value(supports_websockets));
+        return Ok(doc.to_string());
+    }
+
+    doc["supports_websockets"] = toml_edit::value(supports_websockets);
+    Ok(doc.to_string())
+}
 
 /// Remove `base_url` from the active model_provider section only if it matches `predicate`.
 /// Also removes top-level `base_url` if it matches.
@@ -3225,6 +3326,102 @@ base_url = "https://production.api/v1"
         );
     }
 
+    #[test]
+    fn proxied_anthropic_catalog_advertises_tool_search_without_enabling_direct_profile() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "claude-sonnet",
+                    "displayName": "Claude Sonnet",
+                    "contextWindow": 200_000
+                }]
+            }
+        });
+        let catalog_for = |profile| {
+            codex_model_catalog_from_settings(&settings, "", profile)
+                .expect("catalog generation should not error")
+                .expect("non-empty modelCatalog must yield a catalog")
+        };
+
+        let direct = catalog_for(CodexCatalogToolProfile::Anthropic);
+        let proxied = catalog_for(CodexCatalogToolProfile::ProxiedAnthropic);
+
+        assert_eq!(
+            direct["models"][0]
+                .get("supports_search_tool")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            proxied["models"][0]
+                .get("supports_search_tool")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_model_catalog_uses_gpt_5_6_model_specific_reasoning_metadata() {
+        let template = json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "Frontier model",
+            "base_instructions": "gpt-5.5 base instructions",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                { "effort": "none", "description": "Disable Thinking" },
+                { "effort": "high", "description": "Enabled Thinking" }
+            ]
+        });
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "gpt-5.6-sol" },
+                    { "model": "gpt-5.6-terra" },
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "custom-model" }
+                ]
+            }
+        });
+        let specs = codex_catalog_model_specs(&settings);
+        let catalog = codex_model_catalog_from_specs(
+            &specs,
+            &template,
+            CodexCatalogToolProfile::ProxiedNativeResponses,
+            128_000,
+        );
+        let models = catalog["models"].as_array().expect("models array");
+
+        let efforts = |index: usize| {
+            models[index]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .map(|level| level["effort"].as_str().expect("effort"))
+                .collect::<Vec<_>>()
+        };
+        let default = |index: usize| {
+            models[index]["default_reasoning_level"]
+                .as_str()
+                .expect("default reasoning level")
+        };
+
+        assert_eq!(default(0), "low");
+        assert_eq!(
+            efforts(0),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(default(1), "medium");
+        assert_eq!(
+            efforts(1),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(default(2), "medium");
+        assert_eq!(efforts(2), vec!["low", "medium", "high", "xhigh", "max"]);
+
+        assert_eq!(default(3), "high");
+        assert_eq!(efforts(3), vec!["none", "high"]);
+    }
     #[test]
     fn codex_model_catalog_uses_provider_models_and_context() {
         let template = json!({
