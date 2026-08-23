@@ -724,6 +724,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[allow(clippy::result_large_err)]
     async fn proxies_native_responses_websocket_end_to_end() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
