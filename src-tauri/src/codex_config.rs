@@ -2378,6 +2378,48 @@ fn apply_codex_reasoning_level_override(
     true
 }
 
+fn codex_known_model_reasoning_metadata(
+    model: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    let normalized_model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match normalized_model.as_str() {
+        "gpt-5.6" | "gpt-5.6-sol" => {
+            Some(("low", &["low", "medium", "high", "xhigh", "max", "ultra"]))
+        }
+        "gpt-5.6-terra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
+        "gpt-5.6-luna" => Some(("medium", &["low", "medium", "high", "xhigh", "max"])),
+        "gpt-5.5" => Some(("medium", &["low", "medium", "high", "xhigh"])),
+        _ => None,
+    }
+}
+
+fn apply_codex_known_model_reasoning_metadata(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    model: &str,
+) -> bool {
+    let Some((default_level, efforts)) = codex_known_model_reasoning_metadata(model) else {
+        return false;
+    };
+    let levels = efforts
+        .iter()
+        .map(|effort| (*effort).to_string())
+        .collect::<Vec<_>>();
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        codex_supported_reasoning_levels(&levels),
+    );
+    entry_obj.insert("default_reasoning_level".to_string(), json!(default_level));
+    true
+}
+
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -2435,6 +2477,7 @@ fn codex_catalog_model_entry(
             entry_obj.remove(key);
         }
         entry_obj.insert("shell_type".to_string(), json!("shell_command"));
+        entry_obj.insert("use_responses_lite".to_string(), json!(false));
 
         if let Some(base_instructions) = spec
             .base_instructions
@@ -2455,7 +2498,9 @@ fn codex_catalog_model_entry(
     let template_default = template
         .get("default_reasoning_level")
         .and_then(|value| value.as_str());
-    apply_codex_reasoning_level_override(entry_obj, template_default, spec);
+    if !apply_codex_reasoning_level_override(entry_obj, template_default, spec) {
+        apply_codex_known_model_reasoning_metadata(entry_obj, &spec.model);
+    }
 
     entry
 }
@@ -7860,6 +7905,58 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
+    fn native_catalog_infers_known_model_reasoning_without_explicit_overrides() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "openai/gpt-5.6-sol" },
+                    { "model": "gpt-5.6" },
+                    { "model": "gpt-5.6-terra" },
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "gpt-5.5" }
+                ]
+            }
+        });
+
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("catalog generation should not error")
+        .expect("non-empty modelCatalog must yield a catalog");
+        let models = catalog["models"].as_array().expect("models array");
+        let efforts = |index: usize| {
+            models[index]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .map(|level| level["effort"].as_str().expect("effort"))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            efforts(0),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            efforts(1),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            efforts(2),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(efforts(3), vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(efforts(4), vec!["low", "medium", "high", "xhigh"]);
+        let defaults = models
+            .iter()
+            .map(|model| model["default_reasoning_level"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, vec!["low", "low", "medium", "medium", "medium"]);
+    }
+
+    #[test]
     fn vendor_catalog_honors_per_model_reasoning_levels() {
         // The DeepSeek official catalog declares low/high/max; a per-model
         // override must win over the official entry.
@@ -8880,6 +8977,11 @@ base_url = "https://production.api/v1"
         assert!(
             entry.get("model_messages").is_none(),
             "native entries must not carry the gpt-5.5 model_messages persona text"
+        );
+        assert_eq!(
+            entry.get("use_responses_lite"),
+            Some(&json!(false)),
+            "third-party native entries must explicitly opt out of OpenAI Responses Lite"
         );
         assert_eq!(
             entry.get("supports_parallel_tool_calls"),
