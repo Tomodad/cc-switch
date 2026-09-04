@@ -3687,10 +3687,8 @@ fn codex_desktop_available_models_cache_ids_after_provider_write(
     config_text: Option<&str>,
 ) -> Option<Vec<String>> {
     let generated_path = get_codex_model_catalog_path();
-    let preserves_external_catalog = settings.get("modelCatalog").is_none()
-        && config_text.is_some_and(|text| {
-            codex_config_has_external_model_catalog_pointer(text, &generated_path)
-        });
+    let preserves_external_catalog = config_text
+        .is_some_and(|text| codex_config_has_external_model_catalog_pointer(text, &generated_path));
     if preserves_external_catalog {
         None
     } else {
@@ -9530,6 +9528,19 @@ web_search = "disabled"
         assert_eq!(
             model_ids, None,
             "preserving an external catalog must select pin-preserving owned-model cleanup"
+        );
+
+        assert_eq!(
+            codex_desktop_available_models_cache_ids_after_provider_write(
+                &json!({
+                    "modelCatalog": {
+                        "models": [{ "model": "gpt-5.6-sol" }]
+                    }
+                }),
+                Some(r#"model_catalog_json = "C:/Users/me/.codex/custom-models.json""#),
+            ),
+            None,
+            "a surviving external catalog pointer must override stale inline model IDs"
         );
 
         assert_eq!(
