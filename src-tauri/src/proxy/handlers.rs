@@ -836,6 +836,13 @@ fn should_restore_codex_responses_namespaces(
                 && super::providers::should_inject_codex_tool_search_shim(provider, endpoint)))
 }
 
+fn codex_responses_tool_restore_flag(
+    restore_tool_search: bool,
+    restore_namespaces: bool,
+) -> Option<bool> {
+    (restore_tool_search || restore_namespaces).then_some(restore_tool_search)
+}
+
 /// 处理 /v1/responses 请求（OpenAI Responses API - Codex CLI 透传）
 pub async fn handle_responses(
     State(state): State<ProxyState>,
@@ -955,6 +962,9 @@ async fn handle_responses_for_app(
     // Native Responses passthrough to a strict gateway (xAI): restore flattened
     // function-call names *and* rewrite whole-float tool arguments. The integer
     // rewrite must run even when the request had no namespace tools.
+    let restore_tool_search = super::supports_codex_tool_search_compat(&app_type)
+        && request_uses_tool_search_shim
+        && super::providers::should_restore_codex_native_tool_search(&ctx.provider, &endpoint);
     if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
         return handle_codex_xai_native_responses_rewrite(
             response,
@@ -962,20 +972,20 @@ async fn handle_responses_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
+            restore_tool_search,
         )
         .await;
     }
 
-    let restore_tool_search = super::supports_codex_tool_search_compat(&app_type)
-        && request_uses_tool_search_shim
-        && super::providers::should_restore_codex_native_tool_search(&ctx.provider, &endpoint);
     let restore_namespaces = should_restore_codex_responses_namespaces(
         &ctx.provider,
         &endpoint,
         allow_tool_search_compat,
         !namespace_restore_map.is_empty(),
     );
-    if restore_tool_search || restore_namespaces {
+    if let Some(restore_tool_search) =
+        codex_responses_tool_restore_flag(restore_tool_search, restore_namespaces)
+    {
         log::debug!(
             "[Codex] Native Responses tool restore provider={} tool_search={} namespaces={}",
             ctx.provider.id,
@@ -988,7 +998,7 @@ async fn handle_responses_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
-            true,
+            restore_tool_search,
         )
         .await;
     }
@@ -1181,6 +1191,9 @@ async fn handle_responses_compact_for_app(
         .await;
     }
 
+    let restore_tool_search = super::supports_codex_tool_search_compat(&app_type)
+        && request_uses_tool_search_shim
+        && super::providers::should_restore_codex_native_tool_search(&ctx.provider, &endpoint);
     if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
         return handle_codex_xai_native_responses_rewrite(
             response,
@@ -1188,20 +1201,20 @@ async fn handle_responses_compact_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
+            restore_tool_search,
         )
         .await;
     }
 
-    let restore_tool_search = super::supports_codex_tool_search_compat(&app_type)
-        && request_uses_tool_search_shim
-        && super::providers::should_restore_codex_native_tool_search(&ctx.provider, &endpoint);
     let restore_namespaces = should_restore_codex_responses_namespaces(
         &ctx.provider,
         &endpoint,
         allow_tool_search_compat,
         !namespace_restore_map.is_empty(),
     );
-    if restore_tool_search || restore_namespaces {
+    if let Some(restore_tool_search) =
+        codex_responses_tool_restore_flag(restore_tool_search, restore_namespaces)
+    {
         log::debug!(
             "[Codex] Native Responses compact tool restore provider={} tool_search={} namespaces={}",
             ctx.provider.id,
@@ -1214,7 +1227,7 @@ async fn handle_responses_compact_for_app(
             &state,
             connection_guard,
             namespace_restore_map,
-            true,
+            restore_tool_search,
         )
         .await;
     }
@@ -1242,6 +1255,7 @@ async fn handle_codex_xai_native_responses_rewrite(
         String,
         transform_codex_responses_namespace::NamespacedName,
     >,
+    restore_tool_search: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -1266,6 +1280,7 @@ async fn handle_codex_xai_native_responses_rewrite(
             transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
                 response.bytes_stream(),
                 restore_map,
+                restore_tool_search,
             );
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
@@ -1302,9 +1317,10 @@ async fn handle_codex_xai_native_responses_rewrite(
     // this only guards against a malformed upstream).
     let restored_bytes = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(mut value) => {
-            transform_codex_responses_namespace::restore_response_namespaces(
+            transform_codex_responses_namespace::restore_response_tool_calls(
                 &mut value,
                 &restore_map,
+                restore_tool_search,
             );
             transform_codex_responses_xai_sanitize::normalize_xai_function_call_integer_arguments(
                 &mut value,
@@ -3841,11 +3857,19 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert!(!request_uses_tool_search_shim);
         assert!(!namespace_restore_map.is_empty());
 
-        assert!(super::should_restore_codex_responses_namespaces(
+        let restore_namespaces = super::should_restore_codex_responses_namespaces(
             &provider,
             "/responses",
             true,
             !namespace_restore_map.is_empty(),
-        ));
+        );
+        assert!(restore_namespaces);
+        assert_eq!(
+            super::codex_responses_tool_restore_flag(
+                request_uses_tool_search_shim,
+                restore_namespaces,
+            ),
+            Some(false),
+        );
     }
 }

@@ -500,20 +500,6 @@ pub(crate) fn restore_response_tool_calls(
     restore_response_output_items(value, map, restore_tool_search, &mut HashMap::new())
 }
 
-pub(crate) fn restore_response_namespaces(
-    value: &mut Value,
-    map: &HashMap<String, NamespacedName>,
-) -> bool {
-    restore_response_tool_calls(value, map, false)
-}
-
-pub(crate) fn restore_sse_event_namespaces(
-    event: &mut Value,
-    map: &HashMap<String, NamespacedName>,
-) -> bool {
-    restore_sse_event_tool_calls(event, map, false, &mut HashMap::new())
-}
-
 /// Restore a single parsed SSE event (e.g. `response.output_item.added` /
 /// `.done` carrying a `function_call`). Returns whether anything changed.
 pub(crate) fn restore_sse_event_tool_calls(
