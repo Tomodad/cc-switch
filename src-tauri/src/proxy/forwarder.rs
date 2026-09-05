@@ -1744,7 +1744,17 @@ impl RequestForwarder {
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
-        let mut filtered_body = prepare_upstream_request_body(request_body);
+        let prepare_body = |body| {
+            if matches!(app_type, AppType::Codex)
+                && !codex_responses_to_chat
+                && !codex_responses_to_anthropic
+            {
+                prepare_codex_native_request_body(body, provider)
+            } else {
+                prepare_upstream_request_body(body)
+            }
+        };
+        let mut filtered_body = prepare_body(request_body);
         if !is_copilot {
             if let Some(overrides) = provider
                 .meta
@@ -1752,7 +1762,7 @@ impl RequestForwarder {
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
             {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
-                    filtered_body = prepare_upstream_request_body(filtered_body);
+                    filtered_body = prepare_body(filtered_body);
                 }
             }
         }
@@ -3733,6 +3743,11 @@ pub(crate) fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+pub(crate) fn prepare_codex_native_request_body(mut body: Value, provider: &Provider) -> Value {
+    super::codex_delegation::normalize(&mut body, provider);
+    prepare_upstream_request_body(body)
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -4040,6 +4055,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&prepared).unwrap(),
             r#"{"a":2,"reasoning":{"effort":"xhigh"},"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
+        );
+    }
+
+    #[test]
+    fn codex_delegation_native_http_preparation_matches_ws_and_preserves_override_effort() {
+        let text = "<codex_delegation>\n<source_thread_id>10000000-0000-4000-8000-000000000001</source_thread_id>\n<input>Reply only synthetic.</input>\n</codex_delegation>";
+        let provider =
+            Provider::with_id("synthetic-api".into(), "Synthetic".into(), json!({}), None);
+        let body = json!({"input":[{"type":"function_call_output","namespace":"codex_app",
+            "name":"send_message_to_thread","output":text}],"reasoning":{"effort":"xhigh"},"_internal":"drop"});
+        let prepared = prepare_codex_native_request_body(body, &provider);
+        assert_eq!(prepared["input"][0]["role"], "user");
+        assert_eq!(prepared["input"][0]["content"][0]["text"], text);
+        assert_eq!(prepared["reasoning"]["effort"], "xhigh");
+        assert!(prepared.get("_internal").is_none());
+        assert_eq!(
+            prepare_codex_native_request_body(prepared.clone(), &provider),
+            prepared
         );
     }
 

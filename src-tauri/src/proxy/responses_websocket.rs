@@ -3,7 +3,7 @@
 use super::{
     forwarder::{
         apply_local_proxy_body_overrides, apply_local_proxy_header_overrides,
-        prepare_upstream_request_body,
+        prepare_codex_native_request_body,
     },
     handler_context::RequestContext,
     providers::{
@@ -357,14 +357,14 @@ fn transform_response_create(
         );
     }
 
-    let mut body = prepare_upstream_request_body(body);
+    let mut body = prepare_codex_native_request_body(body, provider);
     if let Some(overrides) = provider
         .meta
         .as_ref()
         .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
     {
         if apply_local_proxy_body_overrides(&mut body, overrides) {
-            body = prepare_upstream_request_body(body);
+            body = prepare_codex_native_request_body(body, provider);
         }
     }
     body.as_object_mut()
@@ -599,6 +599,28 @@ mod tests {
                 }
             ]
         })
+    }
+
+    #[test]
+    fn websocket_delegation_with_history_is_forwarded_as_user_input() {
+        // Observed wire shape, synthetic contents: app input has no call_id.
+        let envelope = "<codex_delegation>\n  <source_thread_id>10000000-0000-4000-8000-000000000001</source_thread_id>\n  <input>Reply only SYNTHETIC_MARKER.</input>\n</codex_delegation>";
+        let mut event = response_create();
+        event["previous_response_id"] = json!("resp_history");
+        event["input"] = json!([
+            {"type":"function_call","name":"lookup","call_id":"call_history","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_history","output":"done"},
+            {"type":"message","role":"user","content":"repository instructions"},
+            {"type":"function_call_output","namespace":"codex_app","name":"send_message_to_thread","output":envelope}
+        ]);
+        let provider = websocket_provider("https://provider.example".into());
+        let (outgoing, _) = transform_response_create(&event.to_string(), &provider).unwrap();
+        let outgoing: Value = serde_json::from_str(&outgoing).unwrap();
+        assert_eq!(outgoing["input"][3]["role"], "user");
+        assert_eq!(outgoing["input"][3]["content"][0]["text"], envelope);
+        assert_eq!(outgoing["input"][1], event["input"][1]);
+        assert_eq!(outgoing["previous_response_id"], "resp_history");
+        assert_eq!(outgoing["reasoning"]["effort"], "xhigh");
     }
 
     async fn next_text<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> String

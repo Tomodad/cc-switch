@@ -15,6 +15,9 @@ use std::{
 
 const MAX_EVENTS: usize = 64;
 const MAX_FRAME: usize = 65_536;
+// WS messages already reside in the forwarding layer; parsing shares the existing
+// 1 MiB cumulative observation budget. HTTP framing/output storage remain 64 KiB.
+const MAX_WS_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -259,13 +262,26 @@ impl Attempt {
         if let Ok(mut s) = self.received.lock() {
             s.0 = s.0.saturating_add(1);
             s.1 = s.1.saturating_add(text.len());
-            if s.0 > 512 || s.1 > 1_048_576 {
-                self.sink.write(&self.id, "observation_limit", json!({}));
+            if s.0 > 512 || s.1 > MAX_WS_BYTES {
+                self.sink.write(
+                    &self.id,
+                    "observation_limit",
+                    json!({
+                        "reason":if s.0 > 512 { "ws_frame_count" } else { "ws_total_bytes" },
+                        "frame_bytes":text.len(), "observed_frames":s.0, "observed_bytes":s.1
+                    }),
+                );
                 return;
             }
         }
-        if text.len() > MAX_FRAME {
-            self.sink.write(&self.id, "observation_limit", json!({}));
+        if text.len() > MAX_WS_BYTES {
+            self.sink.write(
+                &self.id,
+                "observation_limit",
+                json!({
+                    "reason":"ws_frame_bytes", "frame_bytes":text.len()
+                }),
+            );
             return;
         }
         if let Ok(v) = serde_json::from_str(text) {
@@ -580,6 +596,46 @@ mod tests {
         assert_eq!(events[0]["detail"]["route"]["path"], "/v1/responses");
     }
 
+    #[test]
+    fn route_probe_ws_terminal_above_http_buffer_limit_keeps_identity_without_secrets() {
+        let (dir, path, provider) = fixture();
+        let registry = Mutex::new(None);
+        let probe = begin_at(
+            path,
+            &request(),
+            &provider,
+            (
+                "wss://provider.example/v1/responses",
+                "ws",
+                "native_responses",
+            ),
+            &registry,
+        )
+        .unwrap();
+        let mut terminal = completed();
+        terminal["response"]["output"][0]["encrypted_content"] =
+            json!("SYNTHETIC_SECRET".repeat(6000));
+        let frame = terminal.to_string();
+        assert!(frame.len() > MAX_FRAME && frame.len() < 1_048_576);
+        probe.ws_text(&frame);
+        drop(probe);
+        let text = fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+        assert!(!text.contains("SYNTHETIC_SECRET"));
+        let events: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let terminal = events
+            .iter()
+            .find(|e| e["phase"] == "terminal")
+            .expect("bounded WS terminal must not be discarded at the HTTP buffer size");
+        assert_eq!(
+            terminal["detail"]["response_id_sha256"],
+            digest("resp_fixture")
+        );
+        assert_eq!(terminal["detail"]["marker_exact"], true);
+    }
+
     #[tokio::test]
     async fn route_probe_http_sse_observes_fragmented_bytes_without_changing_them() {
         let (dir, path, provider) = fixture();
@@ -618,6 +674,43 @@ mod tests {
         let text = fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
         assert!(text.contains("\"marker_exact\":true"));
         assert!(!text.contains("SYNTHETIC_SECRET"));
+    }
+
+    #[test]
+    fn route_probe_ws_observation_budget_stays_bounded_and_reports_safe_counts() {
+        let (dir, path, provider) = fixture();
+        let registry = Mutex::new(None);
+        let probe = begin_at(
+            path,
+            &request(),
+            &provider,
+            (
+                "wss://provider.example/v1/responses",
+                "ws",
+                "native_responses",
+            ),
+            &registry,
+        )
+        .unwrap();
+        let too_large = "SYNTHETIC_SECRET".repeat(MAX_WS_BYTES / 16 + 1);
+        assert!(too_large.len() > MAX_WS_BYTES);
+        probe.ws_text(&too_large);
+        probe.ws_text(&completed().to_string());
+        drop(probe);
+        let text = fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+        assert!(!text.contains("SYNTHETIC_SECRET"));
+        let events: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!events.iter().any(|e| e["phase"] == "terminal"));
+        let limit = events
+            .iter()
+            .find(|e| e["phase"] == "observation_limit")
+            .unwrap();
+        assert_eq!(limit["detail"]["reason"], "ws_total_bytes");
+        assert_eq!(limit["detail"]["frame_bytes"], too_large.len());
+        assert!(text.len() < MAX_FRAME);
     }
 
     #[test]

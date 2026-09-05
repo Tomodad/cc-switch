@@ -58,6 +58,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "reason": {
+          "enum": ["ws_frame_count", "ws_total_bytes", "ws_frame_bytes"]
+        },
+        "frame_bytes": { "type": "integer", "minimum": 0 },
         "provider_id_sha256": { "$ref": "#/$defs/sha" },
         "route": { "$ref": "#/$defs/route" },
         "upstream_transport": { "enum": ["http", "ws"] },
