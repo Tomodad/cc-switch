@@ -547,6 +547,7 @@ mod tests {
             "type": "response.create",
             "model": "local-model",
             "_private": "do-not-forward",
+            "reasoning": {"effort": "xhigh"},
             "input": [{"role": "user", "content": "hello"}],
             "tools": [
                 {"type": "tool_search"},
@@ -592,6 +593,7 @@ mod tests {
 
         assert_eq!(event["type"], "response.create");
         assert_eq!(event["model"], "upstream-model");
+        assert_eq!(event["reasoning"]["effort"], "xhigh");
         assert!(event.get("_private").is_none());
         let tools = event["tools"].as_array().expect("tools");
         assert!(tools.iter().any(|tool| {

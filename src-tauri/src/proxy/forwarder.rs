@@ -3993,6 +3993,7 @@ mod tests {
         let body = json!({
             "z": 1,
             "_internal": "drop",
+            "reasoning": {"effort": "xhigh"},
             "tools": [
                 {
                     "name": "lookup",
@@ -4023,7 +4024,7 @@ mod tests {
             .is_none());
         assert_eq!(
             serde_json::to_string(&prepared).unwrap(),
-            r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
+            r#"{"a":2,"reasoning":{"effort":"xhigh"},"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
         );
     }
 
