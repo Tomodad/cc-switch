@@ -9,7 +9,7 @@
 ## Fresh preflight pins
 
 - Official `origin/main`: `db41d701879592b8eca938cbe5c5ac28dd732b9f` (`v3.20.1-28-gdb41d701`).
-- PR #5265 initial preflight head: `2c427808e5f130f019bee50b539c8774ca9a6b11`; repaired head integrated later: `48decdb5`.
+- PR #5265 initial preflight head: `2c427808e5f130f019bee50b539c8774ca9a6b11`; final repaired head integrated later: `5e6caf75`.
 - PR #5799 head: `7e6203ddcd0ebde3d04c7a006f15625cf8a57ad0`.
 - Installed CC-Switch: `3.20.0`, binary timestamp `2026-08-24T02:14:52+08:00`.
 - Installed Codex CLI: `0.146.0`.
@@ -35,6 +35,7 @@
 - GREEN: Astra, Sol, Terra, and Luna catalog expectations pass; explicit user reasoning overrides remain higher priority.
 - Outbound preservation regressions cover both HTTP request preparation and Responses WebSocket `response.create`: a selected `reasoning.effort = xhigh` survives to the upstream request body.
 - Follow-up review RED found two external-catalog restore errors: the owned-path resolver received a file path instead of its parent directory, and verbatim restore trusted stale inline models before checking the prepared config's surviving external pointer. Commit `48decdb5` fixes both; the focused parent-directory and external-over-inline regressions pass.
+- A final review found the managed-official takeover early return still bypassed prepared-config reconciliation. Commit `5e6caf75` routes that branch through the same external-catalog-aware helper; the managed takeover test and all 43 provider-service tests pass.
 
 ## Implementation sequence
 
@@ -52,7 +53,7 @@
 ## Acceptance status
 
 - [x] Fresh SHA/version/worktree preflight.
-- [x] PR #5265 CI/root-path/restore issues fixed and pushed through `48decdb5`; fresh remote CI still needs maintainer approval.
+- [x] PR #5265 CI/root-path/restore/managed-takeover issues fixed and pushed through `5e6caf75`; fresh remote CI still needs maintainer approval.
 - [x] Reasoning picker chain has catalog/UI/request behavioral RED/GREEN evidence.
 - [x] Integration branch `codex/local-integration-3.20.1-20260905` created from pinned official main.
 - [x] PR #5265/#5799, Responses WebSocket, and Windows updater repair integrated.
