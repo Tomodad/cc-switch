@@ -55,7 +55,11 @@
 - [x] Reasoning picker chain has catalog/UI/request behavioral RED/GREEN evidence.
 - [x] Integration branch `codex/local-integration-3.20.1-20260905` created from pinned official main.
 - [x] PR #5265/#5799, Responses WebSocket, and Windows updater repair integrated.
-- [ ] Focused and regression validation complete.
-- [ ] Full serialized Rust and frontend validation complete, with honest environmental exceptions.
+- [x] Focused and regression validation complete: reasoning catalog, HTTP/WS effort forwarding, ToolSearch, xAI, Moonshot/Kimi, WebSocket, and updater tests are green.
+- [x] Rust formatting and Clippy `-D warnings` pass.
+- [x] Serialized Rust library run: 2839 passed, 3 failed, 6 ignored. The failures are environmental: two Windows symlink privilege 1314 cases and one live proxy port collision 10048. Integration suites passed except `skill_sync`, where the first symlink privilege 1314 failure poisoned the test mutex and caused the second failure; the `support` target contains zero tests and is not counted as a pass.
+- [x] Frontend typecheck and format check pass.
+- [x] Clean serialized frontend run after removing the nested temporary worktree: 135 files and 1075 tests passed. The earlier contaminated run discovered the nested worktree and duplicated tests, so it is retained as invalid evidence rather than a product failure.
+- [x] Renderer production build passes, with only existing dependency-age/chunk-size warnings.
 - [ ] NSIS installer built and archived with verified hashes.
 - [ ] Live UI picker/request acceptance (requires separate permission if restart/install/live-state change is necessary).
