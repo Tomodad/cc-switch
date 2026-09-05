@@ -3450,7 +3450,8 @@ fn codex_config_has_external_model_catalog_pointer(
         .get("model_catalog_json")
         .and_then(|item| item.as_str())
         .is_some_and(|path| !path.trim().is_empty());
-    has_pointer && resolve_cc_switch_catalog_path(config_text, generated_path).is_none()
+    let catalog_dir = generated_path.parent().unwrap_or(generated_path);
+    has_pointer && resolve_cc_switch_catalog_path(config_text, catalog_dir).is_none()
 }
 
 /// Pure reverse-parsing core: convert Codex catalog JSON text back into the
@@ -3688,7 +3689,21 @@ fn sync_codex_desktop_available_models_cache_after_restored_catalog_reload(
 /// Raw snapshots that point at the cc-switch-owned catalog reload its model IDs
 /// and repin them; user-managed external catalog pointers keep their cache
 /// free of cc-switch-owned additions without changing their existing pins.
+fn codex_live_restore_preserves_external_catalog(settings: &Value) -> bool {
+    let config_text = settings
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let generated_path = get_codex_model_catalog_path();
+    codex_config_has_external_model_catalog_pointer(config_text, &generated_path)
+}
+
 pub fn sync_codex_desktop_available_models_cache_after_live_restore(settings: &Value) {
+    if codex_live_restore_preserves_external_catalog(settings) {
+        remove_codex_desktop_owned_models_preserving_cache_pins();
+        return;
+    }
+
     if settings.get("modelCatalog").is_some() {
         sync_codex_desktop_available_models_cache_from_settings(settings);
         return;
@@ -3699,7 +3714,8 @@ pub fn sync_codex_desktop_available_models_cache_after_live_restore(settings: &V
         .and_then(Value::as_str)
         .unwrap_or_default();
     let generated_path = get_codex_model_catalog_path();
-    if resolve_cc_switch_catalog_path(config_text, &generated_path).is_some() {
+    let catalog_dir = generated_path.parent().unwrap_or(&generated_path);
+    if resolve_cc_switch_catalog_path(config_text, catalog_dir).is_some() {
         match read_codex_model_catalog_simplified_from_live() {
             Ok(model_catalog) => {
                 if !sync_codex_desktop_available_models_cache_after_restored_catalog_reload(
@@ -3721,14 +3737,7 @@ pub fn sync_codex_desktop_available_models_cache_after_live_restore(settings: &V
         return;
     }
 
-    let has_external_catalog_pointer =
-        codex_config_has_external_model_catalog_pointer(config_text, &generated_path);
-
-    if has_external_catalog_pointer {
-        remove_codex_desktop_owned_models_preserving_cache_pins();
-    } else {
-        sync_codex_desktop_available_models_cache_from_settings(settings);
-    }
+    sync_codex_desktop_available_models_cache_from_settings(settings);
 }
 
 fn codex_desktop_available_models_cache_ids_after_provider_write(
@@ -9619,6 +9628,19 @@ web_search = "disabled"
     }
 
     #[test]
+    fn external_catalog_detection_uses_generated_catalog_parent_directory() {
+        let config_dir = PathBuf::from("/tmp/.codex");
+        let generated_path = config_dir.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let config = r#"model_catalog_json = "../cc-switch-model-catalog.json"
+"#;
+
+        assert!(
+            codex_config_has_external_model_catalog_pointer(config, &generated_path),
+            "a same-name catalog outside the config directory must remain user-managed"
+        );
+    }
+
+    #[test]
     fn codex_restore_external_catalog_invalidates_stale_cache_worker() {
         let generation_before = CODEX_DESKTOP_CACHE_SYNC_GENERATION.load(Ordering::Acquire);
 
@@ -9632,6 +9654,17 @@ web_search = "disabled"
             generation_after, generation_before,
             "restoring a user-managed catalog must invalidate prior cc-switch cache work"
         );
+    }
+
+    #[test]
+    fn codex_restore_external_catalog_wins_over_inline_models() {
+        assert!(codex_live_restore_preserves_external_catalog(&json!({
+            "config": r#"model_catalog_json = "C:/Users/me/.codex/custom-models.json"
+        "#,
+            "modelCatalog": {
+                "models": [{"model": "stale-inline-model"}]
+            }
+        })));
     }
 
     #[test]
