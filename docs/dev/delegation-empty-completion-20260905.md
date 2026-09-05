@@ -175,5 +175,13 @@ No repository AGENTS.md existed (checked tracked files and hidden/unignored inst
 
 ## Outcome
 
+### Later executable-observer preparation
+
+The subsequent authorized preparation implemented a default-off native Responses observer and offline verdict CLI; see `E:\cc-switch\docs\dev\route-probe-preparation.md` for exact commands, schemas, the prepared disabled config and focused RED/GREEN evidence. This supersedes the earlier **plan-only** observer status, not the historical root-cause conclusion.
+
+The observer records actual selected provider and HTTP response receipt or separate local/upstream WS Upgrade and matched response.create send. An exact newest-input digest plus source/target/nonce, real upstream response-ID digest and target rollout completion must all correlate. A WS failure followed by a same-input HTTP/SSE completion is distinguishable from unrelated adjacent traffic. Headers not received on an HTTP timeout do not prove sending never started.
+
+These are new diagnostic production-code changes. Installed 3.20.0 and archived `096af5b9` do not contain the hook. To use this observation method, request one later diagnostic build/deployment containing it; do not make the user install the old candidate first and then install another package. No such package, live activation, provider change or probe was performed in the preparation step.
+
 - Goal A: **unresolved**. Existing evidence narrowed the failure, but cannot support a causal production fix; the controlled capture above is pending permission. Current OAuth and live software/config remain unchanged by this round.
-- Goal B: **implemented and verified in `a82cf10e`**. AGENTS.md has six rules and was not changed in the preparation follow-up. This follow-up changes only the present evidence report. No application tests/build are required for these documentation-only changes; the existing installer remains tied to source HEAD `096af5b9`.
+- Goal B: **implemented and verified in `a82cf10e`**. AGENTS.md has six rules and was not changed in the later preparation steps. The existing installer remains tied to source HEAD `096af5b9`; executable diagnostic tools and their focused tests are a later, separately recorded source change.

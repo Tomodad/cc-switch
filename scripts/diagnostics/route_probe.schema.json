@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CC-Switch one-shot native Responses route probe v1",
+  "oneOf": [
+    { "$ref": "#/$defs/config" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/result" }
+  ],
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid" },
+    "sha": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "host", "port", "path"],
+      "properties": {
+        "scheme": { "enum": ["http", "https", "ws", "wss"] },
+        "host": { "type": "string", "maxLength": 253 },
+        "port": { "type": ["integer", "null"] },
+        "path": {
+          "type": "string",
+          "description": "Known endpoint path or sha256 of an unknown path. No query, fragment or userinfo."
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "enabled",
+        "run_id",
+        "source_task",
+        "target_task",
+        "marker",
+        "provider_id",
+        "expires_ms"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "enabled": { "type": "boolean", "default": false },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "source_task": { "$ref": "#/$defs/uuid" },
+        "target_task": { "$ref": "#/$defs/uuid" },
+        "marker": {
+          "type": "string",
+          "pattern": "^CCSWITCH_ROUTE_PROBE_[a-f0-9]{32}$"
+        },
+        "provider_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "expires_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "arm sets now+120000; prepare sets 0"
+        }
+      }
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id_sha256": { "$ref": "#/$defs/sha" },
+        "route": { "$ref": "#/$defs/route" },
+        "upstream_transport": { "enum": ["http", "ws"] },
+        "adapter": {
+          "enum": ["native_responses", "chat", "anthropic", "unknown"]
+        },
+        "input_items": { "type": ["integer", "null"], "minimum": 0 },
+        "last_item_type": {
+          "enum": ["function_call_output", "user_message", null]
+        },
+        "call_id_present": { "type": "boolean" },
+        "matched_item_sha256": { "type": ["string", "null"] },
+        "model_sha256": { "type": ["string", "null"] },
+        "generate": { "type": ["boolean", "null"] },
+        "status": { "type": "integer" },
+        "sse": { "type": "boolean" },
+        "encoded": { "type": "boolean" },
+        "redirected": { "type": "boolean" },
+        "final_route": {
+          "oneOf": [{ "$ref": "#/$defs/route" }, { "type": "null" }]
+        },
+        "terminal": { "enum": ["completed", "failed", "incomplete"] },
+        "response_id_sha256": { "type": ["string", "null"] },
+        "output_present": { "type": "boolean" },
+        "text_bytes": { "type": "integer", "minimum": 0 },
+        "observed_frames": { "type": "integer", "minimum": 0 },
+        "observed_bytes": { "type": "integer", "minimum": 0 },
+        "marker_exact": { "type": "boolean" },
+        "other_items": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "pid",
+        "run_id",
+        "source_task",
+        "target_task",
+        "marker_sha256",
+        "attempt_id",
+        "seq",
+        "ts_ms",
+        "phase",
+        "detail"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "pid": { "type": "integer", "minimum": 1 },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "source_task": { "$ref": "#/$defs/uuid" },
+        "target_task": { "$ref": "#/$defs/uuid" },
+        "marker_sha256": { "$ref": "#/$defs/sha" },
+        "attempt_id": { "$ref": "#/$defs/uuid" },
+        "seq": { "type": "integer", "minimum": 0, "maximum": 63 },
+        "ts_ms": { "type": "integer" },
+        "phase": {
+          "enum": [
+            "selected",
+            "downstream_upgrade",
+            "upstream_upgrade",
+            "request_sent",
+            "response_headers",
+            "terminal",
+            "closed",
+            "send_failed",
+            "observation_limit"
+          ]
+        },
+        "detail": { "$ref": "#/$defs/detail" }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": { "$ref": "#/$defs/uuid" },
+        "pid": { "type": "integer" },
+        "transport": { "enum": ["http", "ws"] },
+        "adapter": { "const": "native_responses" },
+        "provider_id_sha256": { "$ref": "#/$defs/sha" },
+        "route": { "$ref": "#/$defs/route" },
+        "ws_send_recorded": { "type": "boolean" },
+        "http_response_received": { "type": "boolean" },
+        "upstream_upgrade": { "type": "boolean" },
+        "downstream_upgrade": { "type": "boolean" },
+        "routed": { "type": "boolean" },
+        "send_failed": { "type": "boolean" },
+        "terminal": { "enum": ["completed", "failed", "incomplete", null] }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "status", "reason"],
+      "properties": {
+        "version": { "const": 1 },
+        "status": { "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "reason": { "type": "string", "pattern": "^[a-z_]+$" },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "source_task": { "$ref": "#/$defs/uuid" },
+        "target_task": { "$ref": "#/$defs/uuid" },
+        "marker_sha256": { "$ref": "#/$defs/sha" },
+        "ws_to_sse_fallback": { "type": "boolean" },
+        "target_turn_id": { "$ref": "#/$defs/uuid" },
+        "response_id_sha256": { "type": ["string", "null"] },
+        "rollout_text_bytes": { "type": ["integer", "null"] },
+        "rollout_marker_exact": { "type": "boolean" },
+        "attempts": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/attempt" }
+        }
+      }
+    }
+  }
+}
