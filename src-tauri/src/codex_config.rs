@@ -2397,6 +2397,10 @@ fn codex_known_model_reasoning_metadata(
         )),
         "gpt-5.6-luna" => Some(("medium", &["low", "medium", "high", "xhigh", "max"])),
         "gpt-5.5" => Some(("medium", &["low", "medium", "high", "xhigh"])),
+        "gpt-6-astra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
         _ => None,
     }
 }
@@ -7913,7 +7917,8 @@ base_url = "https://production.api/v1"
                     { "model": "gpt-5.6" },
                     { "model": "gpt-5.6-terra" },
                     { "model": "gpt-5.6-luna" },
-                    { "model": "gpt-5.5" }
+                    { "model": "gpt-5.5" },
+                    { "model": "gpt-6-astra" }
                 ]
             }
         });
@@ -7949,11 +7954,18 @@ base_url = "https://production.api/v1"
         );
         assert_eq!(efforts(3), vec!["low", "medium", "high", "xhigh", "max"]);
         assert_eq!(efforts(4), vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            efforts(5),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
         let defaults = models
             .iter()
             .map(|model| model["default_reasoning_level"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(defaults, vec!["low", "low", "medium", "medium", "medium"]);
+        assert_eq!(
+            defaults,
+            vec!["low", "low", "medium", "medium", "medium", "medium"]
+        );
     }
 
     #[test]
