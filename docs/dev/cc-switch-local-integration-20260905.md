@@ -9,7 +9,7 @@
 ## Fresh preflight pins
 
 - Official `origin/main`: `db41d701879592b8eca938cbe5c5ac28dd732b9f` (`v3.20.1-28-gdb41d701`).
-- PR #5265 head: `2c427808e5f130f019bee50b539c8774ca9a6b11`.
+- PR #5265 initial preflight head: `2c427808e5f130f019bee50b539c8774ca9a6b11`; repaired head integrated later: `48decdb5`.
 - PR #5799 head: `7e6203ddcd0ebde3d04c7a006f15625cf8a57ad0`.
 - Installed CC-Switch: `3.20.0`, binary timestamp `2026-08-24T02:14:52+08:00`.
 - Installed Codex CLI: `0.146.0`.
@@ -34,6 +34,7 @@
 - Commit `81eb1784` adds only the exact Astra fallback from the official local model catalog. It does not assign one universal list and does not override explicit per-model `reasoningLevels`.
 - GREEN: Astra, Sol, Terra, and Luna catalog expectations pass; explicit user reasoning overrides remain higher priority.
 - Outbound preservation regressions cover both HTTP request preparation and Responses WebSocket `response.create`: a selected `reasoning.effort = xhigh` survives to the upstream request body.
+- Follow-up review RED found two external-catalog restore errors: the owned-path resolver received a file path instead of its parent directory, and verbatim restore trusted stale inline models before checking the prepared config's surviving external pointer. Commit `48decdb5` fixes both; the focused parent-directory and external-over-inline regressions pass.
 
 ## Implementation sequence
 
@@ -51,13 +52,13 @@
 ## Acceptance status
 
 - [x] Fresh SHA/version/worktree preflight.
-- [x] PR #5265 CI root cause fixed and pushed; fresh remote rerun pending.
+- [x] PR #5265 CI/root-path/restore issues fixed and pushed through `48decdb5`; fresh remote CI still needs maintainer approval.
 - [x] Reasoning picker chain has catalog/UI/request behavioral RED/GREEN evidence.
 - [x] Integration branch `codex/local-integration-3.20.1-20260905` created from pinned official main.
 - [x] PR #5265/#5799, Responses WebSocket, and Windows updater repair integrated.
 - [x] Focused and regression validation complete: reasoning catalog, HTTP/WS effort forwarding, ToolSearch, xAI, Moonshot/Kimi, WebSocket, and updater tests are green.
 - [x] Rust formatting and Clippy `-D warnings` pass.
-- [x] Serialized Rust library run: 2839 passed, 3 failed, 6 ignored. The failures are environmental: two Windows symlink privilege 1314 cases and one live proxy port collision 10048. Integration suites passed except `skill_sync`, where the first symlink privilege 1314 failure poisoned the test mutex and caused the second failure; the `support` target contains zero tests and is not counted as a pass.
+- [x] Final-tree serialized Rust library run: 2841 passed, 3 failed, 6 ignored. The failures are environmental: two Windows symlink privilege 1314 cases and one live proxy port collision 10048. Integration suites passed except `skill_sync`, where the first symlink privilege 1314 failure poisoned the test mutex and caused the second failure; the `support` target contains zero tests and is not counted as a pass.
 - [x] Frontend typecheck and format check pass.
 - [x] Clean serialized frontend run after removing the nested temporary worktree: 135 files and 1075 tests passed. The earlier contaminated run discovered the nested worktree and duplicated tests, so it is retained as invalid evidence rather than a product failure.
 - [x] Renderer production build passes, with only existing dependency-age/chunk-size warnings.
