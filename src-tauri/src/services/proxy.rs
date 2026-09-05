@@ -3660,8 +3660,9 @@ impl ProxyService {
                         .expect("managed official account checked"),
                 )
                 .map_err(|e| format!("记录 Codex 托管认证标记失败: {e}"))?;
-                crate::codex_config::sync_codex_desktop_available_models_cache_from_settings(
+                crate::codex_config::sync_codex_desktop_available_models_cache_after_provider_write(
                     config,
+                    Some(&prepared_config),
                 );
                 return Ok(());
             }
