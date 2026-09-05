@@ -8462,7 +8462,7 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
-    fn codex_desktop_cache_sync_keeps_discovering_after_only_legacy_layout_updates() {
+    fn codex_desktop_cache_sync_matches_platform_root_layout_status() {
         let temp_dir = tempfile::tempdir().expect("create temp root");
         let candidates = codex_desktop_leveldb_candidates_for_root(temp_dir.path());
         let legacy_path = &candidates[0];
@@ -8506,9 +8506,10 @@ base_url = "https://production.api/v1"
         .expect("sync candidate layouts");
 
         assert_eq!(result.updated_count, 2);
-        assert!(
+        assert_eq!(
             result.needs_discovery,
-            "updating only a legacy layout must keep short discovery active for the partitioned layout"
+            cfg!(target_os = "windows"),
+            "the root Local Storage layout is active on macOS/Linux but legacy on Windows"
         );
     }
 
