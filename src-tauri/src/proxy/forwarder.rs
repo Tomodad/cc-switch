@@ -1774,6 +1774,16 @@ impl RequestForwarder {
         );
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        // Diagnostic observation is disabled unless an explicit scoped probe is armed.
+        // Other adapters are deliberately outside this one-shot native Responses probe.
+        let route_probe = if matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            super::route_probe::begin(&filtered_body, provider, &url, "http", "native_responses")
+        } else {
+            None
+        };
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_anthropic
@@ -2457,6 +2467,11 @@ impl RequestForwarder {
                 upstream_proxy_url.as_deref(),
             )
             .await?
+        };
+
+        let response = match route_probe {
+            Some(probe) => probe.wrap_http(response),
+            None => response,
         };
 
         // 检查响应状态

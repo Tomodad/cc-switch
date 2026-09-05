@@ -97,20 +97,55 @@ async fn handle_connection_inner(
 
     let (first_text, mut restore_state) = transform_response_create(&first_text, &provider)?;
     let request = build_upstream_request(&provider, headers)?;
+    let route_probe = if super::route_probe::is_armed() {
+        serde_json::from_str::<Value>(&first_text)
+            .ok()
+            .and_then(|body| {
+                super::route_probe::begin(
+                    &body,
+                    &provider,
+                    &request.uri().to_string(),
+                    "ws",
+                    "native_responses",
+                )
+            })
+    } else {
+        None
+    };
+    if let Some(probe) = &route_probe {
+        probe.note("downstream_upgrade");
+    }
     let connect = tokio_tungstenite::connect_async(request);
     let (mut upstream, _) = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, connect)
         .await
-        .map_err(|_| ProxyError::Timeout("upstream WebSocket handshake timed out".to_string()))?
+        .map_err(|_| {
+            if let Some(probe) = &route_probe {
+                probe.note("send_failed");
+            }
+            ProxyError::Timeout("upstream WebSocket handshake timed out".to_string())
+        })?
         .map_err(|error| {
+            if let Some(probe) = &route_probe {
+                probe.note("send_failed");
+            }
             ProxyError::ForwardFailed(format!("upstream WebSocket handshake failed: {error}"))
         })?;
+    if let Some(probe) = &route_probe {
+        probe.note("upstream_upgrade");
+    }
 
     upstream
         .send(UpstreamMessage::Text(first_text))
         .await
         .map_err(|error| {
+            if let Some(probe) = &route_probe {
+                probe.note("send_failed");
+            }
             ProxyError::ForwardFailed(format!("failed to send response.create: {error}"))
         })?;
+    if let Some(probe) = &route_probe {
+        probe.note("request_sent");
+    }
 
     loop {
         let idle = tokio::time::sleep(UPSTREAM_IDLE_TIMEOUT);
@@ -184,6 +219,7 @@ async fn handle_connection_inner(
                 };
                 match upstream_message {
                     UpstreamMessage::Text(text) => {
+                        if let Some(probe) = &route_probe { probe.ws_text(&text); }
                         let terminal = websocket_event_is_terminal(&text);
                         let text = restore_upstream_text(text, &mut restore_state);
                         downstream.send(DownstreamMessage::Text(text)).await.map_err(|error| {
