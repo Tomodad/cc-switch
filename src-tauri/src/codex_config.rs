@@ -4444,6 +4444,16 @@ fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<Str
     doc.as_table_mut().remove("openai_base_url");
     doc["model_provider"] = toml_edit::value(migrated_id.as_str());
 
+    // The proxy projects this capability before an implicit OpenAI route
+    // receives its authenticated local alias. Move it with the route rather
+    // than leaving it at the root, where a repeated takeover would differ.
+    let supports_websockets = doc
+        .get("supports_websockets")
+        .and_then(toml_edit::Item::as_bool);
+    if supports_websockets.is_some() {
+        doc.as_table_mut().remove("supports_websockets");
+    }
+
     // Match the container's own style: a standard table gets a sub-table, an
     // inline `model_providers = { … }` gets an inline member.
     let container_is_inline = doc
@@ -4465,6 +4475,9 @@ fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<Str
         provider_table.insert("name", "Custom".into());
         provider_table.insert("base_url", base_url.into());
         provider_table.insert("wire_api", "responses".into());
+        if let Some(supports_websockets) = supports_websockets {
+            provider_table.insert("supports_websockets", supports_websockets.into());
+        }
         model_providers.insert(
             &migrated_id,
             toml_edit::Item::Value(toml_edit::Value::InlineTable(provider_table)),
@@ -4474,6 +4487,9 @@ fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<Str
         provider_table.insert("name", toml_edit::value("Custom"));
         provider_table.insert("base_url", toml_edit::value(base_url));
         provider_table.insert("wire_api", toml_edit::value("responses"));
+        if let Some(supports_websockets) = supports_websockets {
+            provider_table.insert("supports_websockets", toml_edit::value(supports_websockets));
+        }
         model_providers.insert(&migrated_id, toml_edit::Item::Table(provider_table));
     }
 

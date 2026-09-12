@@ -7298,6 +7298,8 @@ requires_openai_auth = true
             assert_eq!(table["base_url"].as_str(), Some(url));
             assert_eq!(table["wire_api"].as_str(), Some("responses"));
             assert_eq!(table["experimental_bearer_token"].as_str(), Some(PROXY_TOKEN_PLACEHOLDER));
+            assert_eq!(table.get("supports_websockets").and_then(toml::Value::as_bool), Some(false));
+            assert!(doc.get("supports_websockets").is_none());
             if input.contains("Existing") {
                 assert_eq!(doc["model_providers"]["cc-switch"]["base_url"].as_str(), Some("https://keep.example/v1"));
             }
