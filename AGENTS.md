@@ -1,0 +1,10 @@
+# Repository workflow
+
+These rules apply to work in this repository; use the task's agreed scope rather than imposing a full release workflow on every change.
+
+- Define each task's scope, acceptance checks, live-operation permissions, deliverable format, and progress checkpoints in its plan. Track separate user problems as fixed, verified, awaiting verification, or unresolved; source integration alone does not close them.
+- Keep temporary worktrees outside the main project's test-discovery tree when the destination is authorized. If a worktree must be inside it, explicitly exclude that directory and verify discovered test paths before running tests. Do not write outside permitted directories to satisfy this preference.
+- During development, run focused checks for the affected behavior. Once the candidate SHA is fixed, run its agreed final validation matrix once. Repeat checks only for a relevant source change, contaminated discovery, a prior failure, or a documented unresolved concern. Documentation-only edits do not require rebuilding the application.
+- Before packaging, inspect all pages of PR reviewThreads once, handle known delivery-blocking findings, check each requirement, and pin the candidate SHA. Triage later findings by delivery impact before rebuilding. Do not wait indefinitely for review silence; external CI approval or availability may be recorded as pending when the task permits a local candidate.
+- Serialize builds that share a Cargo target or other output directory, and wait for the actual process to finish before launching another build or deleting its worktree. Reuse caches only after confirming compatible build configuration and no concurrent writer.
+- Report observed results and remaining gates separately. Zero executed tests are not a pass; environment failures and remote `action_required` are not all-green. Obtain the task's required permission before installing, restarting active apps, switching providers, or changing live login/config/cache/DB state.

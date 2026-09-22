@@ -1527,6 +1527,42 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
+        // This compatibility hook only runs after the local proxy has selected
+        // the actual third-party provider. Direct/non-takeover Codex routing
+        // bypasses this forwarder, while official ChatGPT/OAuth providers are
+        // explicitly excluded by the provider gate.
+        let allow_tool_search_compat = super::supports_codex_tool_search_compat(app_type);
+        if allow_tool_search_compat
+            && super::providers::should_inject_codex_tool_search_shim(provider, endpoint)
+        {
+            let action = super::providers::transform_codex_chat::ensure_responses_tool_search_shim(
+                &mut mapped_body,
+                should_replace_native_tool_search(
+                    codex_responses_to_chat,
+                    codex_responses_to_anthropic,
+                ),
+            );
+            let provider_type = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_type.as_deref())
+                .unwrap_or("custom");
+            let compatibility_path = if codex_responses_to_chat {
+                "responses_to_chat"
+            } else if codex_responses_to_anthropic {
+                "responses_to_anthropic"
+            } else {
+                "native_responses"
+            };
+            log::debug!(
+                "[Codex] tool_search shim provider={} provider_type={} path={} action={}",
+                provider.id,
+                provider_type,
+                compatibility_path,
+                action.as_str()
+            );
+        }
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1546,9 +1582,10 @@ impl RequestForwarder {
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
-            let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+            let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning_and_tool_search_compat(
                 mapped_body,
                 reasoning_config.as_ref(),
+                allow_tool_search_compat,
             )?;
             super::providers::inject_codex_chat_prompt_cache_key(
                 provider,
@@ -1585,9 +1622,10 @@ impl RequestForwarder {
             // transform clamps any thinking budget below this value.
             const DEFAULT_CODEX_ANTHROPIC_MAX_TOKENS: u64 = 8192;
             let mut anthropic_body =
-                super::providers::transform_codex_anthropic::responses_request_to_anthropic(
+                super::providers::transform_codex_anthropic::responses_request_to_anthropic_with_tool_search_compat(
                     mapped_body,
                     DEFAULT_CODEX_ANTHROPIC_MAX_TOKENS,
+                    allow_tool_search_compat,
                 )?;
             // Handle the 1M-context marker [1m]: strip the model-name suffix (the
             // gateway doesn't recognize it) and set the flag so the beta header is
@@ -1634,29 +1672,62 @@ impl RequestForwarder {
             mapped_body
         };
 
-        // Native Responses passthrough to a strict third-party gateway (xAI).
-        // One gate so rebase conflicts stay here plus the isolate file, not
-        // scattered across sanitizers. Flatten namespaces first; then apply
-        // xAI request rewrites (schema, agent_message, unknown models).
+        // Native Responses passthrough: preserve the official xAI request
+        // sanitizer while also normalizing synthetic ToolSearch follow-ups for
+        // other third-party native Responses gateways.
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
-            && super::providers::provider_needs_responses_namespace_flatten(provider)
         {
-            if super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
-                &mut request_body,
-            )? {
-                log::debug!(
-                    "[Codex] Flattened namespace tools for native Responses upstream (provider={})",
-                    provider.id
+            let needs_xai_compat =
+                super::providers::provider_needs_responses_namespace_flatten(provider);
+            let needs_tool_search_compat = super::supports_codex_tool_search_compat(app_type)
+                && super::providers::should_inject_codex_tool_search_shim(provider, endpoint);
+            if needs_xai_compat || needs_tool_search_compat {
+                if super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
+                    &mut request_body,
+                )? {
+                    log::debug!(
+                        "[Codex] Flattened namespace tools for native Responses upstream (provider={})",
+                        provider.id
+                    );
+                }
+                if needs_xai_compat {
+                    super::providers::transform_codex_responses_xai_sanitize::apply_xai_native_responses_request_compat(
+                        &mut request_body,
+                        &provider.id,
+                        super::providers::codex_provider_upstream_model(provider).as_deref(),
+                        &provider.settings_config,
+                    );
+                }
+            }
+        }
+
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            let activated_names: Vec<&str> = request_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .filter(|name| name.contains("__") && *name != "tool_search")
+                .collect();
+            if !activated_names.is_empty() {
+                let tool_choice = request_body
+                    .get("tool_choice")
+                    .map(crate::proxy::json_canonical::canonical_json_string)
+                    .unwrap_or_else(|| "<absent>".to_string());
+                log::info!(
+                    "[Codex] Activated deferred tools for native Responses upstream                      (provider={}, count={}, tool_choice={}, names={:?})",
+                    provider.id,
+                    activated_names.len(),
+                    tool_choice,
+                    activated_names
                 );
             }
-            super::providers::transform_codex_responses_xai_sanitize::apply_xai_native_responses_request_compat(
-                &mut request_body,
-                &provider.id,
-                super::providers::codex_provider_upstream_model(provider).as_deref(),
-                &provider.settings_config,
-            );
         }
 
         // Moonshot / Kimi Chat Completions reject `$ref` nodes that carry sibling
@@ -1686,7 +1757,17 @@ impl RequestForwarder {
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
-        let mut filtered_body = prepare_upstream_request_body(request_body);
+        let prepare_body = |body| {
+            if matches!(app_type, AppType::Codex)
+                && !codex_responses_to_chat
+                && !codex_responses_to_anthropic
+            {
+                prepare_codex_native_request_body(body, provider)
+            } else {
+                prepare_upstream_request_body(body)
+            }
+        };
+        let mut filtered_body = prepare_body(request_body);
         if !is_copilot {
             if let Some(overrides) = provider
                 .meta
@@ -1694,7 +1775,7 @@ impl RequestForwarder {
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
             {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
-                    filtered_body = prepare_upstream_request_body(filtered_body);
+                    filtered_body = prepare_body(filtered_body);
                 }
             }
         }
@@ -1716,6 +1797,16 @@ impl RequestForwarder {
         );
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        // Diagnostic observation is disabled unless an explicit scoped probe is armed.
+        // Other adapters are deliberately outside this one-shot native Responses probe.
+        let route_probe = if matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            super::route_probe::begin(&filtered_body, provider, &url, "http", "native_responses")
+        } else {
+            None
+        };
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_anthropic
@@ -2399,6 +2490,11 @@ impl RequestForwarder {
                 upstream_proxy_url.as_deref(),
             )
             .await?
+        };
+
+        let response = match route_probe {
+            Some(probe) => probe.wrap_http(response),
+            None => response,
         };
 
         // 检查响应状态
@@ -3586,7 +3682,7 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn apply_local_proxy_body_overrides(
+pub(crate) fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,
 ) -> bool {
@@ -3640,7 +3736,7 @@ fn merge_json_override_inner(target: &mut Value, patch: &Value, is_top_level: bo
     }
 }
 
-fn apply_local_proxy_header_overrides(
+pub(crate) fn apply_local_proxy_header_overrides(
     headers: &mut http::HeaderMap,
     overrides: Option<&LocalProxyRequestOverrides>,
     is_copilot: bool,
@@ -3734,8 +3830,13 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
     )
 }
 
-fn prepare_upstream_request_body(request_body: Value) -> Value {
+pub(crate) fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
+}
+
+pub(crate) fn prepare_codex_native_request_body(mut body: Value, provider: &Provider) -> Value {
+    super::codex_delegation::normalize(&mut body, provider);
+    prepare_upstream_request_body(body)
 }
 
 fn log_prompt_cache_trace(
@@ -3835,6 +3936,14 @@ fn value_for_log(value: &Value) -> String {
         Value::Object(values) => format!("object(len={})", values.len()),
     }
 }
+/// Native Responses routes use the function shim because third-party gateways
+/// cannot be assumed to implement Codex's private native tool_search carrier.
+fn should_replace_native_tool_search(
+    codex_responses_to_chat: bool,
+    codex_responses_to_anthropic: bool,
+) -> bool {
+    !codex_responses_to_chat && !codex_responses_to_anthropic
+}
 
 #[cfg(test)]
 mod tests {
@@ -3867,6 +3976,18 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn native_tool_search_replacement_is_not_xai_only() {
+        assert!(!should_replace_native_tool_search(true, false));
+        assert!(!should_replace_native_tool_search(false, true));
+        let replace_native = should_replace_native_tool_search(false, false);
+
+        assert!(
+            replace_native,
+            "every shimmed native Responses route needs replacement"
+        );
     }
 
     fn test_forwarder(
@@ -3993,6 +4114,7 @@ mod tests {
         let body = json!({
             "z": 1,
             "_internal": "drop",
+            "reasoning": {"effort": "xhigh"},
             "tools": [
                 {
                     "name": "lookup",
@@ -4023,7 +4145,25 @@ mod tests {
             .is_none());
         assert_eq!(
             serde_json::to_string(&prepared).unwrap(),
-            r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
+            r#"{"a":2,"reasoning":{"effort":"xhigh"},"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
+        );
+    }
+
+    #[test]
+    fn codex_delegation_native_http_preparation_matches_ws_and_preserves_override_effort() {
+        let text = "<codex_delegation>\n<source_thread_id>10000000-0000-4000-8000-000000000001</source_thread_id>\n<input>Reply only synthetic.</input>\n</codex_delegation>";
+        let provider =
+            Provider::with_id("synthetic-api".into(), "Synthetic".into(), json!({}), None);
+        let body = json!({"input":[{"type":"function_call_output","namespace":"codex_app",
+            "name":"send_message_to_thread","output":text}],"reasoning":{"effort":"xhigh"},"_internal":"drop"});
+        let prepared = prepare_codex_native_request_body(body, &provider);
+        assert_eq!(prepared["input"][0]["role"], "user");
+        assert_eq!(prepared["input"][0]["content"][0]["text"], text);
+        assert_eq!(prepared["reasoning"]["effort"], "xhigh");
+        assert!(prepared.get("_internal").is_none());
+        assert_eq!(
+            prepare_codex_native_request_body(prepared.clone(), &provider),
+            prepared
         );
     }
 
