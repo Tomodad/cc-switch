@@ -3315,12 +3315,26 @@ fn codex_repair_command(bin_path: &str, real: &str) -> Option<String> {
     Some(format!("{uninstall} || true; {install}"))
 }
 
-/// Windows 暂不做平台分发自愈：Windows 上 codex 的破坏模式不同（EPERM 文件锁 / 版本 bump
-/// 残留，见 openai/codex#21872、#19824），且 `.bat` 链的错误处理与 POSIX `set -e` 语义不同，
-/// 需要单独设计；先在本问题实际发生的 POSIX 平台落地。返回 None → 上游走正常锚定命令。
+/// Repair broken Windows npm launchers by reinstalling their platform package.
+/// Only batch/PowerShell launchers with a real sibling npm qualify; native,
+/// Volta and pnpm installations retain their source-specific update paths.
+/// The lifecycle wrapper supplies the first `call`; the second npm.cmd needs
+/// its own `call` so control returns to the final errorlevel check.
 #[cfg(target_os = "windows")]
-fn codex_repair_command(_bin_path: &str, _real: &str) -> Option<String> {
-    None
+fn codex_repair_command(bin_path: &str, _real: &str) -> Option<String> {
+    if matches!(infer_install_source(Path::new(bin_path)), "volta" | "pnpm")
+        || !matches!(
+            Path::new(bin_path).extension().and_then(|ext| ext.to_str()),
+            Some("cmd" | "ps1")
+        )
+    {
+        return None;
+    }
+    let npm = sibling_bin_with_ext(bin_path, "npm", &["cmd", "exe"])?;
+    let npm = win_quote_path_for_batch(&npm);
+    Some(format!(
+        "{npm} uninstall -g @openai/codex & call {npm} i -g @openai/codex@latest"
+    ))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6562,6 +6576,43 @@ mod tests {
                 expect_quoted_path(&npm_full)
             );
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
+        }
+
+        #[test]
+        fn broken_npm_codex_windows_reinstalls_platform_package() {
+            let (_dir, sub, bin_path) = setup_sibling("v22.0.0", "codex.cmd", &["npm.cmd"]);
+            let broken = ToolInstallation {
+                path: bin_path.clone(),
+                version: None,
+                runnable: false,
+                error: Some("Missing optional dependency @openai/codex-win32-x64".to_string()),
+                source: infer_install_source(Path::new(&bin_path)).to_string(),
+                is_path_default: true,
+                real: PathBuf::from(&bin_path),
+            };
+            let npm = expect_quoted_path(&format!("{}\\npm.cmd", sub.to_string_lossy()));
+            let expected =
+                format!("{npm} uninstall -g @openai/codex & call {npm} i -g @openai/codex@latest");
+            assert_eq!(
+                installs_anchored_command("codex", &[broken]).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+
+        #[test]
+        fn broken_codex_windows_retains_non_npm_and_missing_sibling_paths() {
+            for (folder, launcher, siblings) in [
+                ("Volta", "codex.cmd", vec!["volta.exe", "npm.cmd"]),
+                ("pnpm", "codex.cmd", vec!["pnpm.cmd", "npm.cmd"]),
+                ("native", "codex.exe", vec!["npm.cmd"]),
+                ("missing", "codex.cmd", vec![]),
+            ] {
+                let (_dir, _sub, bin_path) = setup_sibling(folder, launcher, &siblings);
+                assert!(
+                    codex_repair_command(&bin_path, &bin_path).is_none(),
+                    "must not use npm reinstall for {folder}"
+                );
+            }
         }
 
         #[test]
