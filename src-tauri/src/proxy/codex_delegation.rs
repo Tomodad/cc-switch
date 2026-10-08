@@ -181,6 +181,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_delegation_survives_chat_protocol_conversion() {
+        let mut body = json!({"model":"synthetic-model", "input":[injected()]});
+        let text = body["input"][0]["output"].clone();
+        normalize(&mut body, &provider());
+        let chat =
+            super::super::providers::transform_codex_chat::responses_to_chat_completions(body)
+                .expect("normalized delegation must be accepted by the Chat converter");
+        assert_eq!(chat["messages"][0]["role"], "user");
+        assert_eq!(chat["messages"][0]["content"], text);
+    }
+
+    #[test]
     fn codex_delegation_supports_known_app_and_tui_tools_only() {
         for namespace in ["codex_app", "codex_tui"] {
             for name in ["create_thread", "send_message_to_thread"] {
