@@ -225,6 +225,9 @@ pub enum CodexCatalogToolProfile {
     /// hosted web-search endpoint, which Copilot does not expose.
     Copilot,
     NativeResponses,
+    /// Native Responses reached through CC Switch's local ToolSearch adapter.
+    /// Retains gateway restrictions; only the adapter's search capability differs.
+    ProxiedNativeResponses,
     /// Codex talks (through cc-switch's proxy) to a native Anthropic Messages
     /// gateway. Like `NativeResponses` it must suppress Codex's freeform custom
     /// tools — the Responses→Anthropic transform keeps only `function` tools.
@@ -232,6 +235,9 @@ pub enum CodexCatalogToolProfile {
     /// (the transform drops it), so it is always disabled — see
     /// `codex_disables_web_search`.
     Anthropic,
+    /// Anthropic reached through the local ToolSearch adapter, retaining the
+    /// function-only tool shape and disabled hosted web search.
+    ProxiedAnthropic,
 }
 
 impl CodexCatalogToolProfile {
@@ -1312,6 +1318,54 @@ fn apply_codex_reasoning_level_override(
     true
 }
 
+// Compatibility fallback for models absent from Codex's official catalog.
+// Official/vendor rows keep their metadata; explicit valid row levels win here.
+fn codex_known_model_reasoning_metadata(
+    model: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    let normalized_model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match normalized_model.as_str() {
+        "gpt-5.6" | "gpt-5.6-sol" => {
+            Some(("low", &["low", "medium", "high", "xhigh", "max", "ultra"]))
+        }
+        "gpt-5.6-terra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
+        "gpt-5.6-luna" => Some(("medium", &["low", "medium", "high", "xhigh", "max"])),
+        "gpt-5.5" => Some(("medium", &["low", "medium", "high", "xhigh"])),
+        "gpt-6-astra" => Some((
+            "medium",
+            &["low", "medium", "high", "xhigh", "max", "ultra"],
+        )),
+        _ => None,
+    }
+}
+
+fn apply_codex_known_model_reasoning_metadata(
+    entry_obj: &mut serde_json::Map<String, Value>,
+    model: &str,
+) -> bool {
+    let Some((default_level, efforts)) = codex_known_model_reasoning_metadata(model) else {
+        return false;
+    };
+    let levels = efforts
+        .iter()
+        .map(|effort| (*effort).to_string())
+        .collect::<Vec<_>>();
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        codex_supported_reasoning_levels(&levels),
+    );
+    entry_obj.insert("default_reasoning_level".to_string(), json!(default_level));
+    true
+}
+
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -1374,6 +1428,8 @@ fn codex_catalog_model_entry(
             entry_obj.remove(key);
         }
         entry_obj.insert("shell_type".to_string(), json!("shell_command"));
+        // Third-party native/Anthropic gateways do not implement Responses Lite.
+        entry_obj.insert("use_responses_lite".to_string(), json!(false));
 
         if let Some(base_instructions) = spec
             .base_instructions
@@ -1411,7 +1467,16 @@ fn codex_catalog_model_entry(
     let template_default = template
         .get("default_reasoning_level")
         .and_then(|value| value.as_str());
-    apply_codex_reasoning_level_override(entry_obj, template_default, spec);
+    if !apply_codex_reasoning_level_override(entry_obj, template_default, spec) {
+        apply_codex_known_model_reasoning_metadata(entry_obj, &spec.model);
+    }
+    if matches!(
+        profile,
+        CodexCatalogToolProfile::ProxiedNativeResponses | CodexCatalogToolProfile::ProxiedAnthropic
+    ) {
+        // This describes the local adapter, not an upstream hosted tool.
+        entry_obj.insert("supports_search_tool".to_string(), json!(true));
+    }
 
     entry
 }
@@ -1441,7 +1506,8 @@ struct CodexCatalogModelSpec {
     base_instructions: Option<String>,
     /// Per-row override for the generated catalog's `supported_reasoning_levels`
     /// (e.g. ["none", "low", "medium", "high", "xhigh", "max"]). When omitted
-    /// the template's conservative default (none/high) is kept. Consulted for
+    /// known unmatched models use compatibility defaults, otherwise the template
+    /// is kept. Consulted for
     /// every profile; the vendor-catalog path applies it on top of the
     /// official entry.
     reasoning_levels: Option<Vec<String>>,
@@ -2006,7 +2072,7 @@ fn load_codex_deepseek_official_catalog_models() -> Vec<Value> {
 }
 
 /// Official vendor catalog entries for the provider in `config_text`, if its
-/// gateway ships one. Only the `NativeResponses` profile qualifies: ProxyChat
+/// gateway ships one. Direct and proxied native Responses qualify: ProxyChat
 /// runs through cc-switch's converter (classic tool template contract) and the
 /// Anthropic transform drops custom tools, so both must keep their existing
 /// templates. Host-driven like the web_search blacklist, so existing providers
@@ -2015,7 +2081,10 @@ fn codex_official_vendor_catalog_models(
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Option<Vec<Value>> {
-    if profile != CodexCatalogToolProfile::NativeResponses {
+    if !matches!(
+        profile,
+        CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::ProxiedNativeResponses
+    ) {
         return None;
     }
     let base_url = extract_codex_base_url(config_text)?.to_ascii_lowercase();
@@ -2277,6 +2346,9 @@ fn codex_official_model_entry(
     obj.insert("upgrade".to_string(), Value::Null);
     // 第三方不支持 Responses Lite 协议。
     obj.insert("use_responses_lite".to_string(), Value::Bool(false));
+    if profile == CodexCatalogToolProfile::ProxiedNativeResponses {
+        obj.insert("supports_search_tool".to_string(), json!(true));
+    }
     if profile == CodexCatalogToolProfile::ProxyChat {
         // 同 `codex_catalog_model_entry`：严格的 Chat 网关拒收 `original` 精度的图片。
         obj.insert("supports_image_detail_original".to_string(), json!(false));
@@ -2315,7 +2387,13 @@ fn codex_catalog_from_specs_for_row(
         let entries: Vec<Value> = specs
             .iter()
             .enumerate()
-            .map(|(index, spec)| codex_vendor_catalog_model_entry(&vendor_models, spec, index))
+            .map(|(index, spec)| {
+                let mut entry = codex_vendor_catalog_model_entry(&vendor_models, spec, index);
+                if profile == CodexCatalogToolProfile::ProxiedNativeResponses {
+                    entry["supports_search_tool"] = json!(true);
+                }
+                entry
+            })
             .collect();
         return Ok(json!({ "models": entries }));
     }
@@ -2327,9 +2405,10 @@ fn codex_catalog_from_specs_for_row(
     // ProxyChat and Copilot clone the bundled classic tool template so their
     // proxy paths retain custom<->function tool support.
     let template = match profile {
-        CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
-            load_codex_native_responses_template()
-        }
+        CodexCatalogToolProfile::NativeResponses
+        | CodexCatalogToolProfile::ProxiedNativeResponses
+        | CodexCatalogToolProfile::Anthropic
+        | CodexCatalogToolProfile::ProxiedAnthropic => load_codex_native_responses_template(),
         CodexCatalogToolProfile::ProxyChat | CodexCatalogToolProfile::Copilot => {
             load_codex_classic_tool_template()
         }
@@ -2339,10 +2418,12 @@ fn codex_catalog_from_specs_for_row(
     // 官方条目里的 custom 工具，这条路不照搬。Copilot 仍按自身的目录配置生成，
     // 保留账号模型的上下文窗口和并行工具能力，而不是套用官方 GPT 的能力。
     let official = match profile {
-        CodexCatalogToolProfile::Anthropic | CodexCatalogToolProfile::Copilot => Vec::new(),
-        CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::ProxyChat => {
-            codex_openai_official_models()
-        }
+        CodexCatalogToolProfile::Anthropic
+        | CodexCatalogToolProfile::ProxiedAnthropic
+        | CodexCatalogToolProfile::Copilot => Vec::new(),
+        CodexCatalogToolProfile::NativeResponses
+        | CodexCatalogToolProfile::ProxiedNativeResponses
+        | CodexCatalogToolProfile::ProxyChat => codex_openai_official_models(),
     };
     let entries: Vec<Value> = specs
         .iter()
@@ -2379,8 +2460,11 @@ pub(crate) fn codex_disables_web_search(
     profile: CodexCatalogToolProfile,
 ) -> bool {
     match profile {
-        CodexCatalogToolProfile::Anthropic | CodexCatalogToolProfile::Copilot => true,
-        CodexCatalogToolProfile::NativeResponses => {
+        CodexCatalogToolProfile::Anthropic
+        | CodexCatalogToolProfile::ProxiedAnthropic
+        | CodexCatalogToolProfile::Copilot => true,
+        CodexCatalogToolProfile::NativeResponses
+        | CodexCatalogToolProfile::ProxiedNativeResponses => {
             !codex_catalog_model_specs(settings).is_empty()
                 && codex_native_gateway_rejects_web_search(config_text)
         }
@@ -4027,6 +4111,246 @@ experimental_bearer_token = "stale-table-key"
     }
 
     #[test]
+    fn known_reasoning_fallback_keeps_explicit_levels_and_unknown_model_defaults() {
+        let template = load_codex_native_responses_template();
+        for profile in [
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::ProxiedNativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+            CodexCatalogToolProfile::ProxiedAnthropic,
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::Copilot,
+        ] {
+            let specs = codex_catalog_model_specs(&json!({ "modelCatalog": { "models": [
+                { "model": "gpt-5.6-sol", "reasoningLevels": ["none"] },
+                { "model": "gpt-5.6-luna", "reasoningLevels": ["invalid"] },
+                { "model": "unknown-reasoner" }
+            ] }}));
+            let catalog = codex_model_catalog_from_specs(&specs, &template, profile, 128_000);
+            let rows = catalog["models"].as_array().unwrap();
+            assert_eq!(rows[0]["default_reasoning_level"], "none", "{profile:?}");
+            assert_eq!(
+                rows[0]["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(rows[1]["default_reasoning_level"], "medium", "{profile:?}");
+            assert_eq!(
+                rows[1]["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert_eq!(
+                rows[2]["default_reasoning_level"],
+                template["default_reasoning_level"]
+            );
+            assert_eq!(
+                rows[2]["supported_reasoning_levels"],
+                template["supported_reasoning_levels"]
+            );
+        }
+    }
+
+    #[test]
+    fn native_catalog_infers_known_model_reasoning_without_explicit_overrides() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "openai/gpt-5.6-sol" },
+                    { "model": "gpt-5.6" },
+                    { "model": "gpt-5.6-terra" },
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "gpt-5.5" },
+                    { "model": "gpt-6-astra" }
+                ]
+            }
+        });
+
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("catalog generation should not error")
+        .expect("non-empty modelCatalog must yield a catalog");
+        let models = catalog["models"].as_array().expect("models array");
+        let efforts = |index: usize| {
+            models[index]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .map(|level| level["effort"].as_str().expect("effort"))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            efforts(0),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            efforts(1),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            efforts(2),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(efforts(3), vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(efforts(4), vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            efforts(5),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        let defaults = models
+            .iter()
+            .map(|model| model["default_reasoning_level"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            defaults,
+            vec!["low", "low", "medium", "medium", "medium", "medium"]
+        );
+    }
+
+    #[test]
+    fn official_reasoning_wins_while_unmatched_models_keep_known_fallbacks() {
+        let models = with_official_models(official_gpt_rows(), || {
+            catalog_for(
+                json!([
+                    { "model": "gpt-6-astra", "reasoningLevels": ["none"] },
+                    { "model": "gpt-5.6-luna" },
+                    { "model": "gpt-5.6-terra", "reasoningLevels": ["high"] }
+                ]),
+                "",
+                CodexCatalogToolProfile::NativeResponses,
+            )
+        });
+
+        // Codex's longest-prefix match owns the harness and reasoning metadata.
+        // Neither the known-model fallback nor explicit row overrides replace it.
+        assert_eq!(
+            models[0]["model_messages"]["instructions_template"],
+            "GPT-6 base prompt"
+        );
+        assert_eq!(models[0]["default_reasoning_level"], "low");
+        assert_eq!(
+            models[0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            models[0]["supported_reasoning_levels"][1]["effort"],
+            "xhigh"
+        );
+
+        // Models absent from the official catalog still get the PR's fallback,
+        // with explicit valid levels taking precedence on that fallback path.
+        assert_eq!(models[1]["default_reasoning_level"], "medium");
+        let efforts: Vec<&str> = models[1]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(models[2]["default_reasoning_level"], "high");
+        assert_eq!(
+            models[2]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        for model in models {
+            assert_eq!(model["use_responses_lite"], false);
+        }
+    }
+
+    #[test]
+    fn proxied_anthropic_catalog_advertises_tool_search_without_enabling_direct_profile() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "claude-sonnet",
+                    "displayName": "Claude Sonnet",
+                    "contextWindow": 200_000
+                }]
+            }
+        });
+        let catalog_for = |profile| {
+            codex_model_catalog_from_settings(&settings, "", profile)
+                .expect("catalog generation should not error")
+                .expect("non-empty modelCatalog must yield a catalog")
+        };
+
+        let direct = catalog_for(CodexCatalogToolProfile::Anthropic);
+        let proxied = catalog_for(CodexCatalogToolProfile::ProxiedAnthropic);
+
+        assert_eq!(
+            direct["models"][0]
+                .get("supports_search_tool")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            proxied["models"][0]
+                .get("supports_search_tool")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn proxied_native_catalog_keeps_vendor_metadata_and_enables_tool_search() {
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "deepseek-v4-pro" }] }
+        });
+        let catalog_for = |profile| {
+            codex_model_catalog_from_settings(&settings, DEEPSEEK_NATIVE_CONFIG, profile)
+                .unwrap()
+                .unwrap()
+        };
+        let mut direct = catalog_for(CodexCatalogToolProfile::NativeResponses);
+        let proxied = catalog_for(CodexCatalogToolProfile::ProxiedNativeResponses);
+        assert_eq!(direct["models"][0]["supports_search_tool"], false);
+        assert_eq!(proxied["models"][0]["supports_search_tool"], true);
+        direct["models"][0]["supports_search_tool"] = json!(true);
+        assert_eq!(
+            proxied, direct,
+            "the official vendor harness must be preserved"
+        );
+    }
+
+    #[test]
+    fn proxied_native_gpt_rows_keep_the_official_harness_with_tool_search() {
+        let mut official = official_gpt_rows();
+        for row in &mut official {
+            row["supports_search_tool"] = json!(false);
+        }
+        with_official_models(official, || {
+            let request = json!([{ "model": "gpt-6-sol" }]);
+            let mut direct = catalog_for(
+                request.clone(),
+                "",
+                CodexCatalogToolProfile::NativeResponses,
+            );
+            let proxied = catalog_for(request, "", CodexCatalogToolProfile::ProxiedNativeResponses);
+            assert_eq!(direct[0]["supports_search_tool"], false);
+            assert_eq!(proxied[0]["supports_search_tool"], true);
+            direct[0]["supports_search_tool"] = json!(true);
+            assert_eq!(
+                proxied, direct,
+                "the official GPT harness must be preserved"
+            );
+        });
+    }
+
+    #[test]
     fn vendor_catalog_honors_per_model_reasoning_levels() {
         // The DeepSeek official catalog declares low/high/max; a per-model
         // override must win over the official entry.
@@ -4226,6 +4550,11 @@ experimental_bearer_token = "stale-table-key"
             "native entries must not carry the gpt-5.5 model_messages persona text"
         );
         assert_eq!(
+            entry.get("use_responses_lite"),
+            Some(&json!(false)),
+            "third-party native entries must explicitly opt out of Responses Lite"
+        );
+        assert_eq!(
             entry.get("supports_parallel_tool_calls"),
             Some(&json!(true)),
             "per-row supportsParallelToolCalls override must apply"
@@ -4306,7 +4635,9 @@ experimental_bearer_token = "stale-table-key"
             CodexCatalogToolProfile::ProxyChat,
             CodexCatalogToolProfile::Copilot,
             CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::ProxiedNativeResponses,
             CodexCatalogToolProfile::Anthropic,
+            CodexCatalogToolProfile::ProxiedAnthropic,
         ] {
             let catalog = codex_model_catalog_from_specs(&specs, &template, profile, 128_000);
             let models = catalog["models"].as_array().expect("models array");
@@ -4643,8 +4974,10 @@ wire_api = "responses"
             for (profile, disabled) in [
                 (CodexCatalogToolProfile::Copilot, true),
                 (CodexCatalogToolProfile::Anthropic, true),
+                (CodexCatalogToolProfile::ProxiedAnthropic, true),
                 (CodexCatalogToolProfile::ProxyChat, false),
                 (CodexCatalogToolProfile::NativeResponses, has_catalog),
+                (CodexCatalogToolProfile::ProxiedNativeResponses, has_catalog),
             ] {
                 assert_eq!(
                     codex_disables_web_search(&settings, config, profile),
