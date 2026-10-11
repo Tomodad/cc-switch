@@ -6750,7 +6750,7 @@ mod tests {
                     // Mirror build_tool_action_line/build_tool_lifecycle_command: the
                     // outer call covers uninstall, and repair must call install itself.
                     let script = format!(
-                        "@echo off\r\ncall {repair}\r\nif errorlevel 1 exit /b %errorlevel%\r\necho continued>{continued_path}\r\nexit /b 0\r\n"
+                        "@chcp 65001>nul\r\n@echo off\r\ncall {repair}\r\nif errorlevel 1 exit /b %errorlevel%\r\necho continued>{continued_path}\r\nexit /b 0\r\n"
                     );
                     let result = run_tool_lifecycle_silently(&script, "synthetic_codex_repair");
                     assert_eq!(result.is_ok(), install_code == 0, "{result:?}");

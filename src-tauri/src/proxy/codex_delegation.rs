@@ -195,6 +195,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_delegation_is_not_opaque_state_rectification() {
+        use super::super::opaque_state_rectifier::{rectify_opaque_state, OpaqueStateRejection};
+
+        let mut body = json!({"input":[injected()]});
+        let before = body.clone();
+        let result = rectify_opaque_state(
+            &mut body,
+            OpaqueStateRejection {
+                reasoning: true,
+                compaction: true,
+            },
+        );
+        assert!(!result.applied);
+        assert_eq!(body, before);
+
+        normalize(&mut body, &provider());
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            before["input"][0]["output"]
+        );
+    }
+
+    #[test]
     fn codex_delegation_survives_chat_protocol_conversion() {
         let mut body = json!({"model":"synthetic-model", "input":[injected()]});
         let text = body["input"][0]["output"].clone();
