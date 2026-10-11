@@ -3492,6 +3492,116 @@ command = "fs-server"
         assert_eq!(codex_text(), on_a);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codex_tool_search_catalog_follows_direct_and_proxy_mode() {
+        for format in ["openai_responses", "anthropic"] {
+            let _home = Home::new();
+            set_preservation(true);
+            seed_codex(CODEX_USER_LIVE, None);
+            let a = codex_row("a", "https://a.example/v1", "");
+            let mut b = codex_row("b", "https://b.example/v1", "");
+            b.meta = Some(crate::provider::ProviderMeta {
+                api_format: Some(format.to_string()),
+                ..Default::default()
+            });
+            b.settings_config["modelCatalog"] = json!({ "models": [{ "model": "gpt-b" }] });
+            let state = state_with(AppType::Codex, &[a, b], "a").await;
+            let catalog = || -> Value {
+                serde_json::from_slice(
+                    &fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap(),
+                )
+                .unwrap()
+            };
+
+            ProviderService::switch(&state, AppType::Codex, "b").expect("direct switch");
+            assert_eq!(
+                catalog()["models"][0]["supports_search_tool"],
+                false,
+                "{format}"
+            );
+            enter(&state, &AppType::Codex, false)
+                .await
+                .expect("enter proxy");
+            let proxied = catalog();
+            assert_eq!(
+                proxied["models"][0]["supports_search_tool"], true,
+                "{format}"
+            );
+            assert!(proxied["models"][0].get("apply_patch_tool_type").is_none());
+            assert_eq!(codex_user_parts(&codex_text()).len(), 6);
+            if format == "anthropic" {
+                assert_eq!(codex_doc()["web_search"].as_str(), Some("disabled"));
+            }
+            exit(&state, &AppType::Codex).await.expect("exit proxy");
+            assert_eq!(
+                catalog()["models"][0]["supports_search_tool"],
+                false,
+                "{format}"
+            );
+        }
+    }
+
+    // Public catalog publication must work without opening, creating or cleaning
+    // Desktop's private storage. The sentinel is synthetic, not a real database.
+    #[tokio::test]
+    #[serial]
+    async fn codex_catalog_publication_leaves_private_desktop_storage_untouched() {
+        for has_old_storage in [false, true] {
+            let home = Home::new();
+            set_preservation(true);
+            seed_codex(CODEX_USER_LIVE, None);
+            let private_root = home.dir.path().join("Codex Desktop");
+            let private_db = private_root.join("Local Storage/leveldb");
+            let sentinel = private_db.join("existing-private-data");
+            if has_old_storage {
+                fs::create_dir_all(&private_db).unwrap();
+                fs::write(&sentinel, b"uninterpreted legacy bytes").unwrap();
+            }
+            let assert_private_storage_untouched = || {
+                if has_old_storage {
+                    assert_eq!(fs::read(&sentinel).unwrap(), b"uninterpreted legacy bytes");
+                    assert_eq!(fs::read_dir(&private_db).unwrap().count(), 1);
+                } else {
+                    assert!(!private_root.exists(), "must not create private storage");
+                }
+            };
+            let assert_public_catalog = || {
+                let catalog: Value = serde_json::from_slice(
+                    &fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap(),
+                )
+                .unwrap();
+                let model = catalog["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["slug"] == "gpt-b")
+                    .expect("custom model published through the public catalog");
+                assert_eq!(model["visibility"], "list");
+                assert!(codex_doc()["model_catalog_json"].as_str().is_some());
+                assert_private_storage_untouched();
+            };
+            let a = codex_row("a", "https://a.example/v1", "");
+            let mut b = codex_row("b", "https://b.example/v1", "");
+            b.settings_config["modelCatalog"] = json!({ "models": [{ "model": "gpt-b" }] });
+            let official = codex_official();
+            let official_id = official.id.clone();
+            let state = state_with(AppType::Codex, &[a, b, official], "a").await;
+
+            ProviderService::switch(&state, AppType::Codex, "b").expect("direct switch");
+            assert_public_catalog();
+            enter(&state, &AppType::Codex, false)
+                .await
+                .expect("enter proxy");
+            assert_public_catalog();
+            exit(&state, &AppType::Codex).await.expect("exit proxy");
+            assert_public_catalog();
+            assert_eq!(codex_user_parts(&codex_text()).len(), 6);
+            ProviderService::switch(&state, AppType::Codex, &official_id).expect("official switch");
+            assert_private_storage_untouched();
+        }
+    }
+
     /// 行里自己指定的模型目录指针跟着这一家走：切走时删掉，切到生成了目录的那家就换成
     /// CC Switch 自己的指针；代理契约带进来的，退出代理时同样删掉。用户直接写进 live 的
     /// 指针一直留着。
