@@ -252,6 +252,39 @@ fn prepare_codex_tool_search_context(
     Some(super::providers::transform_codex_chat::build_codex_tool_context_from_request(body))
 }
 
+/// Native transport has its own request-scoped provenance. Neither an earlier
+/// failover attempt nor a client-chosen function name can authorize restoration.
+fn prepare_codex_native_tool_context(
+    app_type: &AppType,
+    provider: &Provider,
+    endpoint: &str,
+    body: &mut Value,
+) -> Result<
+    Option<super::providers::transform_codex_responses_namespace::NativeResponsesToolContext>,
+    ProxyError,
+> {
+    if !matches!(app_type, AppType::Codex)
+        || super::providers::is_codex_official_provider(provider)
+        || !matches!(
+            endpoint.split('?').next(),
+            Some("/responses" | "/v1/responses")
+        )
+        || super::providers::codex_compaction::is_compaction_request(body)
+        || provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+            .and_then(|overrides| overrides.body.as_ref())
+            .is_some_and(|body| body.get("tools").is_some() || body.get("tool_choice").is_some())
+    {
+        return Ok(None);
+    }
+    super::providers::transform_codex_responses_namespace::prepare_native_responses_request(
+        body, true,
+    )
+    .map(Some)
+}
+
 struct CopilotRequestContext {
     classification: super::copilot_optimizer::CopilotClassification,
     request_id: Option<String>,
@@ -314,6 +347,8 @@ struct ForwardedResponse {
     claude_api_format: Option<String>,
     outbound_model: Option<String>,
     codex_tool_context: Option<super::providers::transform_codex_chat::CodexToolContext>,
+    codex_native_tool_context:
+        Option<super::providers::transform_codex_responses_namespace::NativeResponsesToolContext>,
 }
 
 pub struct ForwardResult {
@@ -328,6 +363,9 @@ pub struct ForwardResult {
     /// Registry from the successful request that actually received a ToolSearch shim.
     /// Failed attempts must not authorize restoration on a later provider's response.
     pub(crate) codex_tool_context: Option<super::providers::transform_codex_chat::CodexToolContext>,
+    /// Namespace/search restoration context from the successful native request only.
+    pub(crate) codex_native_tool_context:
+        Option<super::providers::transform_codex_responses_namespace::NativeResponsesToolContext>,
     /// 实际发往上游的模型名（路由接管/模型映射后的真值）。
     ///
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
@@ -661,6 +699,7 @@ impl RequestForwarder {
             claude_api_format,
             outbound_model,
             codex_tool_context,
+            codex_native_tool_context,
         }: ForwardedResponse,
         codex_upstream_format: Option<CodexUpstreamFormat>,
     ) -> ForwardResult {
@@ -670,6 +709,7 @@ impl RequestForwarder {
             claude_api_format,
             codex_upstream_format,
             codex_tool_context,
+            codex_native_tool_context,
             outbound_model,
             connection_guard: None,
         };
@@ -1869,6 +1909,7 @@ impl RequestForwarder {
         let mut codex_anthropic_one_m = false;
 
         let mut codex_tool_context = None;
+        let mut codex_native_tool_context = None;
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -2004,6 +2045,11 @@ impl RequestForwarder {
             mapped_body
         };
 
+        if !codex_responses_to_chat && !codex_responses_to_anthropic {
+            codex_native_tool_context =
+                prepare_codex_native_tool_context(app_type, provider, endpoint, &mut request_body)?;
+        }
+
         // Codex 远程压缩，以及同一线程里别家回合留下的状态（见 `codex_compaction`）。
         // Chat / Anthropic 转换在转换器里处理；这里管原样转发的两种上游：官方清掉
         // CC Switch 产出、官方一定会拒的条目，原生 Responses 第三方把压缩触发和
@@ -2041,7 +2087,7 @@ impl RequestForwarder {
             && !codex_responses_to_anthropic
             && super::providers::provider_needs_responses_namespace_flatten(provider)
         {
-            if super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
+            if super::providers::transform_codex_responses_namespace::flatten_request_namespaces_only(
                 &mut request_body,
             )? {
                 log::debug!(
@@ -2894,6 +2940,7 @@ impl RequestForwarder {
                 claude_api_format: resolved_claude_api_format,
                 outbound_model,
                 codex_tool_context,
+                codex_native_tool_context,
             })
         } else {
             let status_code = status.as_u16();
@@ -4812,6 +4859,7 @@ mod tests {
                         claude_api_format: None,
                         outbound_model: Some("resolved-model".to_string()),
                         codex_tool_context: None,
+                        codex_native_tool_context: None,
                     },
                     format,
                 )
@@ -6498,6 +6546,77 @@ mod tests {
         .is_some());
     }
 
+    #[test]
+    fn managed_native_tool_search_gate_preserves_excluded_routes_and_overrides() {
+        let body =
+            json!({"tools": [{"type": "function", "name": "existing_tool"}], "input": "hello"});
+        let provider = test_provider_with_type(None);
+        for (app, endpoint) in [
+            (AppType::GrokBuild, "/responses"),
+            (AppType::Claude, "/responses"),
+            (AppType::Codex, "/responses/compact"),
+            (AppType::Codex, "/v1/responses/compact?beta=true"),
+            (AppType::Codex, "/chat/completions"),
+        ] {
+            let mut request = body.clone();
+            assert!(
+                prepare_codex_native_tool_context(&app, &provider, endpoint, &mut request)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(request, body);
+        }
+        let mut official = provider.clone();
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        let mut request = body.clone();
+        assert!(prepare_codex_native_tool_context(
+            &AppType::Codex,
+            &official,
+            "/responses",
+            &mut request
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(request, body);
+        for override_body in [
+            json!({"tools": []}),
+            json!({"tool_choice": "none"}),
+            json!({"tools": null}),
+        ] {
+            let mut provider = provider.clone();
+            provider.meta = Some(crate::provider::ProviderMeta {
+                local_proxy_request_overrides: Some(LocalProxyRequestOverrides {
+                    body: Some(override_body),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let mut request = body.clone();
+            assert!(prepare_codex_native_tool_context(
+                &AppType::Codex,
+                &provider,
+                "/responses",
+                &mut request
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(request, body);
+        }
+        let mut request = body;
+        let context = prepare_codex_native_tool_context(
+            &AppType::Codex,
+            &provider,
+            "/v1/responses?beta=true",
+            &mut request,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(context.restore_tool_search);
+        assert_eq!(request["tools"][1]["name"], "tool_search");
+        assert_eq!(request["tools"][1]["type"], "function");
+    }
+
     #[tokio::test]
     async fn managed_tool_search_provenance_follows_successful_failover() {
         for formats in [
@@ -6548,13 +6667,22 @@ mod tests {
                 result.codex_tool_context.is_some(),
                 formats[1] == "openai_chat"
             );
+            assert_eq!(
+                result
+                    .codex_native_tool_context
+                    .as_ref()
+                    .is_some_and(|context| context.restore_tool_search),
+                formats[1] == "openai_responses"
+            );
             let captured = captured.lock().await;
             assert_eq!(captured.len(), 2);
             for (body, format) in captured.iter().zip(formats) {
-                let has_shim = body["tools"].as_array().unwrap().iter().any(|tool| {
-                    tool["function"]["name"] == "tool_search" || tool["type"] == "tool_search"
-                });
-                assert_eq!(has_shim, format == "openai_chat");
+                let tools = body["tools"].as_array().unwrap();
+                assert!(tools.iter().any(|tool| if format == "openai_chat" {
+                    tool["function"]["name"] == "tool_search"
+                } else {
+                    tool["type"] == "function" && tool["name"] == "tool_search"
+                }));
             }
         }
     }
@@ -7432,7 +7560,8 @@ mod tests {
             .await;
             assert_eq!(seen.body["input"], own_history["input"]);
 
-            // 对照：普通请求逐字节不改。
+            // A normal managed native request keeps its tools/input and gains
+            // exactly one callable search shim; compaction above remains unchanged.
             let plain = body(
                 "listed",
                 json!([{ "type": "function", "name": "shell", "parameters": { "type": "object" } }]),
@@ -7445,7 +7574,12 @@ mod tests {
                 plain.clone(),
             )
             .await;
-            assert_eq!(seen.body["tools"], plain["tools"]);
+            let tools = seen.body["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 2);
+            assert_eq!(tools[0], plain["tools"][0]);
+            assert_eq!(tools[1]["type"], "function");
+            assert_eq!(tools[1]["name"], "tool_search");
+            assert_eq!(tools[1]["parameters"]["required"], json!(["query"]));
             assert_eq!(seen.body["input"], plain["input"]);
         }
 

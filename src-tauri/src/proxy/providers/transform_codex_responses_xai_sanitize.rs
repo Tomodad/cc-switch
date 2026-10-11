@@ -34,7 +34,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Number, Value};
 
-use super::transform_codex_responses_namespace::{restore_sse_event_namespaces, NamespacedName};
+use super::transform_codex_responses_namespace::{restore_sse_event_tool_calls, NamespacedName};
 use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 
 /// Codex plugin-private fields removed recursively at any nesting depth.
@@ -986,13 +986,16 @@ fn whole_float_to_json_int(number: &Number) -> Option<Number> {
 pub(crate) fn create_xai_native_responses_sse_stream<E>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     restore_map: HashMap<String, NamespacedName>,
+    restore_tool_search: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     E: std::error::Error + Send + 'static,
 {
+    let stream = super::responses_late_arguments::create_late_arguments_repair_stream(stream);
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut tool_search_item_ids = HashMap::new();
 
         tokio::pin!(stream);
 
@@ -1004,7 +1007,12 @@ where
                         if block.trim().is_empty() {
                             continue;
                         }
-                        yield Ok(rewrite_xai_native_sse_block(&block, &restore_map));
+                        yield Ok(rewrite_xai_native_sse_block(
+                            &block,
+                            &restore_map,
+                            restore_tool_search,
+                            &mut tool_search_item_ids,
+                        ));
                     }
                 }
                 Err(e) => {
@@ -1019,7 +1027,12 @@ where
         }
         let tail = std::mem::take(&mut buffer);
         if !tail.trim().is_empty() {
-            yield Ok(rewrite_xai_native_sse_block(&tail, &restore_map));
+            yield Ok(rewrite_xai_native_sse_block(
+                &tail,
+                &restore_map,
+                restore_tool_search,
+                &mut tool_search_item_ids,
+            ));
         }
     }
 }
@@ -1027,13 +1040,11 @@ where
 fn rewrite_xai_native_sse_block(
     block: &str,
     restore_map: &HashMap<String, NamespacedName>,
+    restore_tool_search: bool,
+    tool_search_item_ids: &mut HashMap<String, String>,
 ) -> Bytes {
-    let mut event_name: Option<&str> = None;
     let mut data_parts: Vec<&str> = Vec::new();
     for line in block.lines() {
-        if let Some(event) = strip_sse_field(line, "event") {
-            event_name = Some(event.trim());
-        }
         if let Some(data) = strip_sse_field(line, "data") {
             data_parts.push(data);
         }
@@ -1053,23 +1064,20 @@ fn rewrite_xai_native_sse_block(
         Err(_) => return Bytes::from(format!("{block}\n\n")),
     };
 
-    let mut changed = restore_sse_event_namespaces(&mut event, restore_map);
-    changed |= normalize_xai_function_call_integer_arguments(&mut event);
+    // Normalize while items still have the upstream function_call shape.
+    let mut changed = normalize_xai_function_call_integer_arguments(&mut event);
+    changed |= restore_sse_event_tool_calls(
+        &mut event,
+        restore_map,
+        restore_tool_search,
+        tool_search_item_ids,
+    );
     if !changed {
         return Bytes::from(format!("{block}\n\n"));
     }
 
     let restored = serde_json::to_string(&event).unwrap_or(data);
-    let mut out = String::new();
-    if let Some(name) = event_name {
-        out.push_str("event: ");
-        out.push_str(name);
-        out.push('\n');
-    }
-    out.push_str("data: ");
-    out.push_str(&restored);
-    out.push_str("\n\n");
-    Bytes::from(out)
+    super::transform_codex_responses_namespace::rewrite_sse_json_data(block, &restored)
 }
 
 #[cfg(test)]
@@ -1514,7 +1522,8 @@ mod tests {
             "event: response.function_call_arguments.done\n",
             r#"data: {"type":"response.function_call_arguments.done","arguments":"{\"session_id\":92116.0,\"yield_time_ms\":120000.0}"}"#,
         );
-        let rewritten = rewrite_xai_native_sse_block(done, &HashMap::new());
+        let rewritten =
+            rewrite_xai_native_sse_block(done, &HashMap::new(), false, &mut HashMap::new());
         let rewritten = String::from_utf8(rewritten.to_vec()).unwrap();
         let data = rewritten
             .lines()
@@ -1531,11 +1540,76 @@ mod tests {
             "event: response.function_call_arguments.delta\n",
             r#"data: {"type":"response.function_call_arguments.delta","delta":"{\"session_id\":92116.0"}"#,
         );
-        let passed = rewrite_xai_native_sse_block(delta, &HashMap::new());
+        let passed =
+            rewrite_xai_native_sse_block(delta, &HashMap::new(), false, &mut HashMap::new());
         assert_eq!(
             String::from_utf8(passed.to_vec()).unwrap(),
             format!("{delta}\n\n")
         );
+    }
+
+    #[test]
+    fn xai_sse_search_limits_normalize_before_type_restoration() {
+        let item = json!({"type":"function_call","id":"fc_search","name":"tool_search","call_id":"search","arguments":"{\"query\":\"docs\",\"limit\":8.0}"});
+        let events = [
+            json!({"type":"response.output_item.done","item":item}),
+            json!({"type":"response.completed","response":{"output":[item]}}),
+            json!({"type":"response.function_call_arguments.done","item_id":"fc_search","arguments":"{\"limit\":8.0}"}),
+        ];
+        let mut ids = HashMap::new();
+        for event in events {
+            let block = format!(
+                "id: event-42\nretry: 1500\n: upstream heartbeat\nevent: {}\ndata: {}",
+                event["type"].as_str().unwrap(),
+                event
+            );
+            let rewritten = rewrite_xai_native_sse_block(&block, &HashMap::new(), true, &mut ids);
+            let text = String::from_utf8(rewritten.to_vec()).unwrap();
+            assert!(text.starts_with("id: event-42\nretry: 1500\n: upstream heartbeat\n"));
+            let value: Value = serde_json::from_str(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap(),
+            )
+            .unwrap();
+            match value["type"].as_str().unwrap() {
+                "response.output_item.done" => {
+                    assert_eq!(value["item"]["arguments"]["limit"].as_u64(), Some(8))
+                }
+                "response.completed" => assert_eq!(
+                    value["response"]["output"][0]["arguments"]["limit"].as_u64(),
+                    Some(8)
+                ),
+                _ => {
+                    let arguments: Value =
+                        serde_json::from_str(value["arguments"].as_str().unwrap()).unwrap();
+                    assert_eq!(arguments["limit"].as_u64(), Some(8));
+                    assert_eq!(value["item_id"], "tsc_search");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xai_sse_restores_tool_search_function_calls() {
+        let added = concat!(
+            "event: response.output_item.added\n",
+            r#"data: {"type":"response.output_item.added","item":{"id":"fc_search-1","type":"function_call","name":"tool_search","call_id":"search-1","status":"in_progress","arguments":""}}"#,
+        );
+
+        let rewritten =
+            rewrite_xai_native_sse_block(added, &HashMap::new(), true, &mut HashMap::new());
+        let rewritten = String::from_utf8(rewritten.to_vec()).unwrap();
+        let data = rewritten
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(event["item"]["id"], "tsc_search-1");
+        assert_eq!(event["item"]["type"], "tool_search_call");
+        assert_eq!(event["item"]["execution"], "client");
+        assert_eq!(event["item"]["call_id"], "search-1");
     }
 
     #[test]
