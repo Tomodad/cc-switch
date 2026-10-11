@@ -1516,6 +1516,13 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        // Normalize each actual provider attempt before protocol conversion. Real
+        // tool results and official-provider failover inputs remain untouched.
+        if matches!(app_type, AppType::Codex)
+            && super::providers::is_codex_responses_endpoint(endpoint)
+        {
+            super::codex_delegation::normalize(&mut mapped_body, provider);
+        }
         let is_copilot_codex_responses = matches!(app_type, AppType::Codex)
             && is_copilot
             && super::providers::is_codex_responses_endpoint(endpoint);
