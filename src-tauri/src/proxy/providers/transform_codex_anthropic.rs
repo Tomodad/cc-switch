@@ -230,6 +230,7 @@ pub fn responses_request_to_anthropic(
     body: Value,
     default_max_tokens: u64,
 ) -> Result<Value, ProxyError> {
+    super::transform_codex_responses_namespace::ensure_client_tool_search(&body)?;
     let mut result = json!({});
     let tool_context = build_codex_tool_context_from_request(&body);
     let model = body
@@ -403,7 +404,7 @@ pub fn responses_request_to_anthropic(
     // unsupported hosted tools (for example web_search) must drop tool_choice too.
     if has_tools {
         if let Some(tc) = body.get("tool_choice") {
-            let mapped = map_tool_choice_to_anthropic(tc, &tool_context);
+            let mapped = map_tool_choice_to_anthropic(tc, &tool_context)?;
             let forced = matches!(
                 mapped.get("type").and_then(|value| value.as_str()),
                 Some("any" | "tool")
@@ -472,13 +473,21 @@ fn chat_tool_to_anthropic_tool(chat_tool: &Value) -> Option<Value> {
 }
 
 /// tool_choice: Responses → Anthropic (the reverse of `map_tool_choice_to_responses`)
-fn map_tool_choice_to_anthropic(tool_choice: &Value, tool_context: &CodexToolContext) -> Value {
-    match tool_choice {
+fn map_tool_choice_to_anthropic(
+    tool_choice: &Value,
+    tool_context: &CodexToolContext,
+) -> Result<Value, ProxyError> {
+    let unsupported = || {
+        ProxyError::InvalidRequest(
+            "Anthropic cannot preserve this tool_choice restriction".to_string(),
+        )
+    };
+    Ok(match tool_choice {
         Value::String(s) => match s.as_str() {
             "required" => json!({ "type": "any" }),
             "auto" => json!({ "type": "auto" }),
             "none" => json!({ "type": "none" }),
-            _ => json!({ "type": "auto" }),
+            _ => return Err(unsupported()),
         },
         Value::Object(obj) => match obj.get("type").and_then(|t| t.as_str()) {
             Some("function") => {
@@ -494,13 +503,12 @@ fn map_tool_choice_to_anthropic(tool_choice: &Value, tool_context: &CodexToolCon
             Some("tool_search") => {
                 json!({ "type": "tool", "name": TOOL_SEARCH_PROXY_NAME })
             }
-            // Other object shapes (allowed_tools / hosted-tool selectors, etc.) are
-            // not recognized by Anthropic; downgrade to auto to avoid passing OpenAI's
-            // raw structure through and causing a 400.
-            _ => json!({ "type": "auto" }),
+            // Anthropic cannot represent an allowed set or namespace-wide forced
+            // choice. Fail closed instead of silently broadening it to auto.
+            _ => return Err(unsupported()),
         },
-        _ => json!({ "type": "auto" }),
-    }
+        _ => return Err(unsupported()),
+    })
 }
 
 /// Re-nests the flat Responses input[] back into Anthropic messages.
@@ -2919,7 +2927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_unknown_object_tool_choice_degrades_to_auto() {
+    fn test_request_unknown_object_tool_choice_is_rejected() {
         let input = json!({
             "model": "c",
             "max_output_tokens": 100,
@@ -2927,8 +2935,44 @@ mod tests {
             "tools": [{ "type": "function", "name": "x", "parameters": {"type": "object"} }],
             "tool_choice": { "type": "allowed_tools", "tools": [] }
         });
-        let result = responses_request_to_anthropic(input, 4096).unwrap();
-        assert_eq!(result["tool_choice"], json!({ "type": "auto" }));
+        assert!(responses_request_to_anthropic(input, 4096).is_err());
+    }
+
+    #[test]
+    fn loaded_tools_do_not_relax_unsupported_anthropic_choices() {
+        for choice in [
+            json!({"type":"allowed_tools","mode":"auto","tools":[]}),
+            json!({"type":"namespace","name":"docs"}),
+            json!("unknown"),
+        ] {
+            let body = json!({"model":"c","input":[{"role":"user","content":"Read docs"},{"type":"tool_search_output","call_id":"search","tools":[{"type":"function","name":"read","defer_loading":true,"input_schema":{}}]}],"tool_choice":choice});
+            assert!(responses_request_to_anthropic(body, 4096).is_err());
+        }
+    }
+
+    #[test]
+    fn test_response_tool_search_use_has_typed_item_id() {
+        let context = build_codex_tool_context_from_request(&json!({
+            "tools": [{"type": "tool_search"}]
+        }));
+        let result = anthropic_response_to_responses_with_context(
+            json!({
+                "id": "msg_search",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_search_1",
+                    "name": "tool_search",
+                    "input": {"query": "calendar tools"}
+                }],
+                "stop_reason": "tool_use"
+            }),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(result["output"][0]["type"], "tool_search_call");
+        assert_eq!(result["output"][0]["id"], "tsc_call_search_1");
+        assert_eq!(result["output"][0]["call_id"], "call_search_1");
     }
 
     // ==================== SSE aggregation fallback ====================

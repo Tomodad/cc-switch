@@ -1005,6 +1005,26 @@ pub async fn handle_grokbuild_responses(
     .await
 }
 
+/// Legacy xAI namespace flattening predates request-scoped native context. A
+/// saved tool override owns the final tool identities, so incoming declarations
+/// cannot authorize restoration of those replacement function names.
+fn codex_native_namespace_fallback_map(
+    provider: &crate::provider::Provider,
+    map: std::collections::HashMap<String, transform_codex_responses_namespace::NamespacedName>,
+) -> std::collections::HashMap<String, transform_codex_responses_namespace::NamespacedName> {
+    let overrides_tools = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+        .and_then(|overrides| overrides.body.as_ref())
+        .is_some_and(|body| body.get("tools").is_some());
+    if super::providers::provider_needs_responses_namespace_flatten(provider) && !overrides_tools {
+        map
+    } else {
+        Default::default()
+    }
+}
+
 async fn handle_responses_for_app(
     state: ProxyState,
     request: axum::extract::Request,
@@ -1051,7 +1071,11 @@ async fn handle_responses_for_app(
     // Captured before `body` is moved into the forwarder: the flat-name →
     // {namespace, name} map used to restore the native Responses upstream's
     // function-call names (see the namespace-restore dispatch below).
-    let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(&body);
+    // Legacy xAI fallback knows only the original top-level declarations. Loaded
+    // search-output identities require the successful native preparation context.
+    let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(
+        &json!({"tools": body.get("tools")}),
+    );
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -1078,6 +1102,23 @@ async fn handle_responses_for_app(
 
     let connection_guard = result.connection_guard.take();
     let codex_upstream_format = result.codex_upstream_format;
+    let codex_tool_context = result.codex_tool_context.take().unwrap_or_else(|| {
+        let mut context = codex_tool_context;
+        if result
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+            .and_then(|overrides| overrides.body.as_ref())
+            .is_some_and(|body| body.get("tools").is_some())
+        {
+            // The final provider override owns those tool names. The incoming
+            // registry cannot reinterpret an application-owned tool_search call.
+            context.clear_tool_identities();
+        }
+        context
+    });
+    let native_tool_context = result.codex_native_tool_context.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
@@ -1120,13 +1161,31 @@ async fn handle_responses_for_app(
     // Native Responses passthrough to a strict gateway (xAI): restore flattened
     // function-call names *and* rewrite whole-float tool arguments. The integer
     // rewrite must run even when the request had no namespace tools.
-    if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
-        return handle_codex_xai_native_responses_rewrite(
+    let xai_compat = super::providers::provider_needs_responses_namespace_flatten(&ctx.provider);
+    let native_tool_context = native_tool_context.unwrap_or_else(|| {
+        transform_codex_responses_namespace::NativeResponsesToolContext {
+            // Only the original xAI route flattens without the new native prep.
+            // A skipped prep (overrides, another app, official route) must not
+            // authorize generic restoration from the incoming declarations.
+            namespace_restore_map: codex_native_namespace_fallback_map(
+                &ctx.provider,
+                namespace_restore_map,
+            ),
+            restore_tool_search: false,
+        }
+    });
+    if xai_compat
+        || native_tool_context.restore_tool_search
+        || !native_tool_context.namespace_restore_map.is_empty()
+    {
+        return handle_codex_native_responses_rewrite(
             response,
             &ctx,
             &state,
             connection_guard,
-            namespace_restore_map,
+            native_tool_context.namespace_restore_map,
+            native_tool_context.restore_tool_search,
+            xai_compat,
         )
         .await;
     }
@@ -1380,7 +1439,11 @@ async fn handle_responses_compact_for_app(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
-    let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(&body);
+    // Legacy xAI fallback knows only the original top-level declarations. Loaded
+    // search-output identities require the successful native preparation context.
+    let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(
+        &json!({"tools": body.get("tools")}),
+    );
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -1407,6 +1470,22 @@ async fn handle_responses_compact_for_app(
 
     let connection_guard = result.connection_guard.take();
     let codex_upstream_format = result.codex_upstream_format;
+    let codex_tool_context = result.codex_tool_context.take().unwrap_or_else(|| {
+        let mut context = codex_tool_context;
+        if result
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+            .and_then(|overrides| overrides.body.as_ref())
+            .is_some_and(|body| body.get("tools").is_some())
+        {
+            // The final provider override owns those tool names. The incoming
+            // registry cannot reinterpret an application-owned tool_search call.
+            context.clear_tool_identities();
+        }
+        context
+    });
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
@@ -1436,12 +1515,14 @@ async fn handle_responses_compact_for_app(
     }
 
     if super::providers::provider_needs_responses_namespace_flatten(&ctx.provider) {
-        return handle_codex_xai_native_responses_rewrite(
+        return handle_codex_native_responses_rewrite(
             response,
             &ctx,
             &state,
             connection_guard,
-            namespace_restore_map,
+            codex_native_namespace_fallback_map(&ctx.provider, namespace_restore_map),
+            false,
+            true,
         )
         .await;
     }
@@ -1511,11 +1592,11 @@ async fn handle_codex_late_arguments_repair(
         })
 }
 
-/// Response handler for the native Responses passthrough to xAI: restore
-/// flattened `function_call` names and rewrite whole-float tool arguments.
+/// Restore only identities established by the successful native request. The xAI
+/// path additionally keeps its existing whole-float argument normalization.
 /// Error bodies pass through unchanged. Usage is collected exactly as
 /// `process_response` would (same `CODEX_PARSER_CONFIG`).
-async fn handle_codex_xai_native_responses_rewrite(
+async fn handle_codex_native_responses_rewrite(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
@@ -1524,6 +1605,8 @@ async fn handle_codex_xai_native_responses_rewrite(
         String,
         transform_codex_responses_namespace::NamespacedName,
     >,
+    restore_tool_search: bool,
+    xai_compat: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -1545,11 +1628,25 @@ async fn handle_codex_xai_native_responses_rewrite(
     if response.is_sse() {
         let builder = rewritten_sse_response_builder(status, response.headers());
 
-        let restore_stream =
-            transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
-                response.bytes_stream(),
-                restore_map,
-            );
+        let restore_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+        > = if xai_compat {
+            Box::pin(
+                transform_codex_responses_xai_sanitize::create_xai_native_responses_sse_stream(
+                    response.bytes_stream(),
+                    restore_map,
+                    restore_tool_search,
+                ),
+            )
+        } else {
+            Box::pin(
+                transform_codex_responses_namespace::create_tool_call_restore_sse_stream(
+                    response.bytes_stream(),
+                    restore_map,
+                    restore_tool_search,
+                ),
+            )
+        };
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
         let logged_stream = create_logged_passthrough_stream(
@@ -1585,12 +1682,15 @@ async fn handle_codex_xai_native_responses_rewrite(
     // this only guards against a malformed upstream).
     let restored_bytes = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(mut value) => {
-            transform_codex_responses_namespace::restore_response_namespaces(
+            if xai_compat {
+                transform_codex_responses_xai_sanitize::normalize_xai_function_call_integer_arguments(
+                    &mut value,
+                );
+            }
+            transform_codex_responses_namespace::restore_response_tool_calls(
                 &mut value,
                 &restore_map,
-            );
-            transform_codex_responses_xai_sanitize::normalize_xai_function_call_integer_arguments(
-                &mut value,
+                restore_tool_search,
             );
             if let Some(usage) =
                 TokenUsage::from_codex_response_auto(&value).filter(TokenUsage::has_billable_tokens)
@@ -4181,5 +4281,490 @@ mod stack_tests {
         .await
         .expect("models");
         assert_eq!(body, json!({ "data": [], "has_more": false }));
+    }
+}
+
+#[cfg(test)]
+mod tool_search_handler_tests {
+    use super::*;
+    use crate::{database::Database, provider::Provider};
+    use std::{ffi::OsString, sync::Arc, time::Duration};
+
+    // RequestContext reads device settings before selecting the in-memory provider.
+    // Isolate that read (and any stale-pointer cleanup) from the real user home.
+    struct TestHome {
+        _dir: tempfile::TempDir,
+        previous: Option<OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::reload_settings().unwrap();
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
+
+    fn upstream_tool_search_response(api_format: &str, streaming: bool) -> String {
+        let arguments = json!({"query": "Find the email search tool", "limit": 2});
+        let encoded = arguments.to_string();
+        let (first, last) = encoded.split_at(encoded.len() / 2);
+        if api_format == "openai_responses" {
+            let item = json!({"type": "function_call", "id": "fc_search", "call_id": "call_search", "name": "tool_search", "arguments": encoded, "status": "completed"});
+            let response = json!({"id": "resp_search", "object": "response", "model": "test-model", "status": "completed", "output": [item]});
+            if !streaming {
+                return response.to_string();
+            }
+            return [
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "fc_search", "call_id": "call_search", "name": "tool_search", "arguments": "", "status": "in_progress"}}),
+                json!({"type": "response.function_call_arguments.delta", "item_id": "fc_search", "output_index": 0, "delta": first}),
+                json!({"type": "response.function_call_arguments.delta", "item_id": "fc_search", "output_index": 0, "delta": last}),
+                json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+                json!({"type": "response.completed", "response": response}),
+            ].iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect();
+        }
+        if api_format == "anthropic" {
+            if !streaming {
+                return json!({
+                    "id": "msg_search", "type": "message", "role": "assistant",
+                    "model": "test-model", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "call_search", "name": "tool_search", "input": arguments}]
+                }).to_string();
+            }
+            return [
+                json!({"type": "message_start", "message": {"id": "msg_search", "type": "message", "role": "assistant", "model": "test-model", "content": []}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "call_search", "name": "tool_search", "input": {}}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": first}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": last}}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+                json!({"type": "message_stop"}),
+            ].iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect();
+        }
+        if !streaming {
+            return json!({
+                "id": "chatcmpl_search", "object": "chat.completion", "model": "test-model",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "call_search", "type": "function", "function": {"name": "tool_search", "arguments": encoded}}]
+                }}]
+            }).to_string();
+        }
+        let events = [
+            json!({"id": "chatcmpl_search", "model": "test-model", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_search", "type": "function", "function": {"name": "tool_search", "arguments": first}}]}}]}),
+            json!({"id": "chatcmpl_search", "model": "test-model", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": last}}]}, "finish_reason": "tool_calls"}]}),
+        ];
+        let mut body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn assert_tool_search_call(item: &Value) {
+        assert_eq!(item["type"], "tool_search_call", "{item}");
+        assert_eq!(item["call_id"], "call_search");
+        assert_eq!(item["execution"], "client");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(
+            item["arguments"],
+            json!({"query": "Find the email search tool", "limit": 2})
+        );
+    }
+
+    fn assert_roundtrip_tool_call(item: &Value, override_owned: bool) {
+        if override_owned {
+            assert_eq!(item["type"], "function_call", "{item}");
+            assert_eq!(item["name"], "tool_search", "{item}");
+            assert!(item.get("execution").is_none(), "{item}");
+        } else {
+            assert_tool_search_call(item);
+        }
+    }
+
+    async fn assert_injected_tool_search_roundtrip(api_format: &str, streaming: bool) {
+        assert_tool_search_roundtrip(api_format, streaming, false).await;
+    }
+
+    async fn assert_tool_search_roundtrip(api_format: &str, streaming: bool, override_owned: bool) {
+        let _home = TestHome::new();
+        // Never send this fixture or its fake credentials through a configured proxy.
+        assert!(super::super::http_client::get_current_proxy_url().is_none());
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let response_body = upstream_tool_search_response(api_format, streaming);
+        let content_type = if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let app = axum::Router::new().fallback(axum::routing::post({
+            let captured = captured.clone();
+            move |uri: axum::http::Uri, Json(body): Json<Value>| {
+                let captured = captured.clone();
+                let response_body = response_body.clone();
+                async move {
+                    captured.lock().await.push((uri, body));
+                    ([("content-type", content_type)], response_body)
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let db = Arc::new(Database::memory().unwrap());
+        let mut provider = Provider::with_id(
+            "tool-search-handler-test".to_string(),
+            "Local ToolSearch test".to_string(),
+            json!({
+                "base_url": format!("http://{address}/v1"), "api_format": api_format,
+                "auth": {"OPENAI_API_KEY": "fake-local-test-key"}
+            }),
+            None,
+        );
+        if override_owned {
+            let tool = if api_format == "openai_chat" {
+                json!({"type": "function", "function": {"name": "tool_search", "parameters": {"type": "object"}}})
+            } else if api_format == "anthropic" {
+                json!({"name": "tool_search", "input_schema": {"type": "object"}})
+            } else {
+                json!({"type": "function", "name": "tool_search", "parameters": {"type": "object"}})
+            };
+            provider.meta = Some(crate::provider::ProviderMeta {
+                local_proxy_request_overrides: Some(crate::provider::LocalProxyRequestOverrides {
+                    body: Some(json!({"tools": [tool]})),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let state = ProxyState::for_test(db);
+        // The client did not advertise tool_search. Only the successful forwarder's
+        // effective context can restore its native item type in the handler.
+        let mut body = json!({
+            "model": "test-model", "input": "Find an available tool", "stream": streaming,
+            "tools": [{"type": "function", "name": "existing_tool", "parameters": {"type": "object"}}]
+        });
+        if override_owned {
+            body["tools"] = json!([{"type": "tool_search"}]);
+        }
+        if streaming {
+            body["tool_choice"] = json!("auto");
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(if streaming {
+                "/responses"
+            } else {
+                "/v1/responses"
+            })
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = handle_responses(State(state), request).await.unwrap();
+            let status = response.status();
+            let media_type = response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, media_type, bytes)
+        })
+        .await;
+        server.abort();
+        let (status, media_type, bytes) = result.expect("local handler roundtrip timed out");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(media_type.starts_with(content_type));
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].0.path(),
+            if api_format == "anthropic" {
+                "/v1/messages"
+            } else if api_format == "openai_responses" {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            }
+        );
+        let upstream = &captured[0].1;
+        assert_eq!(upstream["stream"], streaming);
+        let tools = upstream["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            if override_owned { 1 } else { 2 },
+            "effective tools must survive: {upstream}"
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "tool_search"
+                    || tool["function"]["name"] == "tool_search")
+                .count(),
+            1
+        );
+        if streaming {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let events: Vec<Value> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["type"] == "response.failed"),
+                "{text}"
+            );
+            let completed: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "response.completed")
+                .collect();
+            assert_eq!(completed.len(), 1, "{text}");
+            let output = completed[0]["response"]["output"].as_array().unwrap();
+            assert_eq!(output.len(), 1);
+            assert_roundtrip_tool_call(&output[0], override_owned);
+            let done: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_item.done")
+                .collect();
+            assert_eq!(done.len(), 1, "{text}");
+            assert_roundtrip_tool_call(&done[0]["item"], override_owned);
+        } else {
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            let output = response["output"].as_array().unwrap();
+            assert_eq!(output.len(), 1);
+            assert_roundtrip_tool_call(&output[0], override_owned);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn provider_tool_override_owns_search_identity_across_all_transports() {
+        for api_format in ["openai_chat", "anthropic", "openai_responses"] {
+            for streaming in [false, true] {
+                assert_tool_search_roundtrip(api_format, streaming, true).await;
+            }
+        }
+    }
+
+    #[test]
+    fn xai_tool_override_cannot_restore_incoming_namespace_identity() {
+        let mut provider = Provider::with_id(
+            "xai-api".into(),
+            "xAI fixture".into(),
+            json!({"config": "model_provider=\"xai\"\n[model_providers.xai]\nbase_url=\"https://api.x.ai/v1\"\nwire_api=\"responses\""}),
+            None,
+        );
+        assert!(super::super::providers::provider_needs_responses_namespace_flatten(&provider));
+        let map = transform_codex_responses_namespace::namespace_restore_map(
+            &json!({"tools": [{"type": "namespace", "name": "docs", "tools": [{"type": "function", "name": "read"}]}]}),
+        );
+        assert_eq!(
+            codex_native_namespace_fallback_map(&provider, map.clone()).len(),
+            1
+        );
+        for override_body in [
+            json!({"tools": [{"type": "function", "name": "docs__read"}]}),
+            json!({"tools": null}),
+        ] {
+            provider.meta = Some(crate::provider::ProviderMeta {
+                local_proxy_request_overrides: Some(crate::provider::LocalProxyRequestOverrides {
+                    body: Some(override_body),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let restored_map = codex_native_namespace_fallback_map(&provider, map.clone());
+            assert!(restored_map.is_empty());
+            let mut response = json!({"output": [{"type": "function_call", "name": "docs__read", "call_id": "call1", "arguments": "{}"}]});
+            let original = response.clone();
+            transform_codex_responses_namespace::restore_response_tool_calls(
+                &mut response,
+                &restored_map,
+                false,
+            );
+            assert_eq!(response, original);
+        }
+        for choice in [
+            json!("none"),
+            json!("auto"),
+            json!({"type": "function", "name": "docs__read"}),
+        ] {
+            provider.meta = Some(crate::provider::ProviderMeta {
+                local_proxy_request_overrides: Some(crate::provider::LocalProxyRequestOverrides {
+                    body: Some(json!({"tool_choice": choice})),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            assert_eq!(
+                codex_native_namespace_fallback_map(&provider, map.clone()),
+                map
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_native_json_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("openai_responses", false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_native_sse_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("openai_responses", true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_chat_json_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("openai_chat", false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_chat_sse_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("openai_chat", true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_anthropic_json_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("anthropic", false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_codex_anthropic_sse_restores_injected_tool_search() {
+        assert_injected_tool_search_roundtrip("anthropic", true).await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_search_followup_loads_only_completed_tools_and_respects_none() {
+        let _home = TestHome::new();
+        assert!(super::super::http_client::get_current_proxy_url().is_none());
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let app = axum::Router::new().fallback(axum::routing::post({
+            let captured = captured.clone();
+            move |Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let loaded = body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "docs__read"));
+                    let none = body["tool_choice"] == "none";
+                    captured.lock().await.push(body);
+                    if loaded && !none {
+                        Json(json!({"id": "resp_read", "object": "response", "status": "completed", "model": "test-model", "output": [{"id": "fc_read", "type": "function_call", "call_id": "call_read", "name": "docs__read", "arguments": "{\"path\":\"README.md\"}", "status": "completed"}]}))
+                    } else if none {
+                        Json(json!({"id": "resp_none", "object": "response", "status": "completed", "model": "test-model", "output": []}))
+                    } else {
+                        Json(serde_json::from_str::<Value>(&upstream_tool_search_response("openai_responses", false)).unwrap())
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "native-followup".into(),
+            "Local native follow-up".into(),
+            json!({"base_url": format!("http://{address}/v1"), "api_format": "openai_responses", "auth": {"OPENAI_API_KEY": "fake-local-test-key"}}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        db.set_current_provider("codex", &provider.id).unwrap();
+        let state = ProxyState::for_test(db);
+        async fn send(state: ProxyState, body: Value) -> Value {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_responses(State(state), request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let tools = json!([{"type": "function", "name": "existing_tool", "parameters": {"type": "object"}}]);
+        let first = send(
+            state.clone(),
+            json!({"model": "test-model", "input": "Find docs", "tools": tools}),
+        )
+        .await;
+        assert_tool_search_call(&first["output"][0]);
+        let history = json!([first["output"][0], {"type": "tool_search_output", "call_id": "call_search", "execution": "client", "status": "completed", "tools": [{"type": "namespace", "name": "docs", "tools": [{"type": "function", "name": "read", "defer_loading": true, "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}]}]}]);
+        let second = send(
+            state.clone(),
+            json!({"model": "test-model", "tools": tools, "tool_choice": "auto", "input": history}),
+        )
+        .await;
+        assert_eq!(second["output"][0]["type"], "function_call");
+        assert_eq!(second["output"][0]["namespace"], "docs");
+        assert_eq!(second["output"][0]["name"], "read");
+        assert_eq!(second["output"][0]["call_id"], "call_read");
+        let third = send(
+            state,
+            json!({"model": "test-model", "tools": tools, "tool_choice": "none", "input": history}),
+        )
+        .await;
+        assert!(third["output"].as_array().unwrap().is_empty());
+        server.abort();
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 3);
+        let loaded = captured[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "docs__read")
+            .unwrap();
+        assert_eq!(loaded["parameters"]["required"], json!(["path"]));
+        assert!(loaded.get("inputSchema").is_none());
+        assert!(loaded.get("defer_loading").is_none());
+        assert_eq!(captured[1]["input"][0]["type"], "function_call");
+        assert_eq!(captured[1]["input"][1]["type"], "function_call_output");
+        assert_eq!(captured[2]["tool_choice"], "none");
+        assert!(!captured[2]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "docs__read"));
     }
 }
