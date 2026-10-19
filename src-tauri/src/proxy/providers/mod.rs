@@ -67,8 +67,8 @@ pub use codex::{
     is_codex_official_provider, is_codex_responses_endpoint,
     provider_needs_responses_late_arguments_repair, provider_needs_responses_namespace_flatten,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
-    should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
-    strip_codex_hosted_web_search,
+    resolve_codex_proxy_catalog_tool_profile, should_convert_codex_responses_to_anthropic,
+    should_convert_codex_responses_to_chat, strip_codex_hosted_web_search,
 };
 pub use gemini::GeminiAdapter;
 

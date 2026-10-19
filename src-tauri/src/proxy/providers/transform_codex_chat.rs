@@ -45,11 +45,38 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
 ];
 
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
+const TOOL_SEARCH_DESCRIPTION: &str = "Search and load deferred Codex tools, plugins, connectors, MCP namespaces, and desktop task tools for the current task.";
+const TOOL_SEARCH_QUERY_DESCRIPTION: &str =
+    "Search query describing the tool or capability to load.";
+const TOOL_SEARCH_LIMIT_DESCRIPTION: &str = "Maximum number of matching tool groups to return.";
+
 const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const ORPHAN_TOOL_OUTPUT_MARKER: &str = "[tool_result without a matching tool_call]";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+pub(crate) fn tool_search_responses_function_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": TOOL_SEARCH_PROXY_NAME,
+        "description": TOOL_SEARCH_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": TOOL_SEARCH_QUERY_DESCRIPTION
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": TOOL_SEARCH_LIMIT_DESCRIPTION
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
     Function,
@@ -76,6 +103,14 @@ pub(crate) struct CodexToolContext {
 }
 
 impl CodexToolContext {
+    /// Saved tool overrides invalidate identities, but not compaction semantics.
+    pub(crate) fn clear_tool_identities(&mut self) {
+        self.chat_tools.clear();
+        self.seen_chat_names.clear();
+        self.chat_name_to_spec.clear();
+        self.namespace_name_to_chat_name.clear();
+    }
+
     pub(crate) fn chat_tools(&self) -> &[Value] {
         &self.chat_tools
     }
@@ -132,6 +167,15 @@ impl CodexToolContext {
             .map(|namespace| flatten_namespace_tool_name(namespace, &original_name))
             .unwrap_or_else(|| original_name.clone());
 
+        if super::transform_codex_responses_namespace::tool_is_deferred(tool) {
+            return;
+        }
+        let mut normalized = tool.clone();
+        super::transform_codex_responses_namespace::normalize_response_function_tool(
+            &mut normalized,
+        );
+        let tool = &normalized;
+
         let Some(chat_tool) = responses_function_tool_to_chat_tool(tool, &chat_name) else {
             return;
         };
@@ -148,6 +192,9 @@ impl CodexToolContext {
     }
 
     fn add_custom_tool(&mut self, tool: &Value) {
+        if super::transform_codex_responses_namespace::tool_is_deferred(tool) {
+            return;
+        }
         let Some(name) = responses_tool_name(tool) else {
             return;
         };
@@ -219,6 +266,16 @@ impl CodexToolContext {
             return;
         };
 
+        if super::transform_codex_responses_namespace::tool_is_deferred(namespace_tool) {
+            for child in children {
+                if let Some(name) = responses_tool_name(child) {
+                    self.seen_chat_names
+                        .insert(flatten_namespace_tool_name(namespace, &name));
+                }
+            }
+            return;
+        }
+
         for child in children {
             if child.get("type").and_then(|v| v.as_str()) == Some("function") {
                 self.add_function_tool(child, Some(namespace));
@@ -249,18 +306,119 @@ impl CodexToolContext {
 pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolContext {
     let mut context = CodexToolContext::default();
 
-    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        for tool in tools {
-            context.add_response_tool(tool);
-        }
-    }
-
-    if let Some(input) = body.get("input") {
-        collect_input_declared_tools(input, &mut context);
+    for tool in super::transform_codex_responses_namespace::request_declared_tools(body) {
+        context.add_response_tool(&tool);
     }
     context.compaction_request = codex_compaction::is_compaction_request(body);
 
     context
+}
+
+pub(crate) fn contains_application_tool_search_name(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_application_tool_search_name),
+        Value::Object(obj) => {
+            (matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) && responses_tool_name(value).as_deref() == Some(TOOL_SEARCH_PROXY_NAME))
+                || obj
+                    .values()
+                    .filter(|value| value.is_array() || value.is_object())
+                    .any(contains_application_tool_search_name)
+        }
+        Value::String(name) => name == TOOL_SEARCH_PROXY_NAME,
+        _ => false,
+    }
+}
+
+fn contains_native_tool_search_marker(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_native_tool_search_marker),
+        Value::Object(obj) => {
+            obj.get("type").and_then(Value::as_str) == Some("tool_search")
+                || obj.values().any(contains_native_tool_search_marker)
+        }
+        _ => false,
+    }
+}
+
+/// Supply the existing native ToolSearch declaration for a managed bridge only.
+/// The caller owns the route gate; ordinary conversion must never opt in by itself.
+/// Restrictive tool choices, clean requests, and application-owned names stay intact.
+pub(crate) fn inject_missing_tool_search(body: &mut Value) -> bool {
+    if !body.is_object()
+        || body.get("tools").is_some_and(|tools| !tools.is_array())
+        || body
+            .get("tool_choice")
+            .is_some_and(|choice| choice.as_str() != Some("auto"))
+        || codex_compaction::is_compaction_request(body)
+    {
+        return false;
+    }
+
+    // Only protocol-level declarations establish eligibility. Inventory clones
+    // count valid deferred tools without making those tools callable in the registry.
+    let mut declared = CodexToolContext::default();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let mut eligible = tool.clone();
+            super::transform_codex_responses_namespace::normalize_loaded_response_tool(
+                &mut eligible,
+            );
+            declared.add_response_tool(&eligible);
+        }
+    }
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        for item in input {
+            if matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("additional_tools")
+            ) || super::transform_codex_responses_namespace::is_loaded_tool_search_output(item)
+            {
+                if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                    for tool in tools {
+                        let mut eligible = tool.clone();
+                        super::transform_codex_responses_namespace::normalize_loaded_response_tool(
+                            &mut eligible,
+                        );
+                        declared.add_response_tool(&eligible);
+                    }
+                }
+            }
+        }
+    }
+    let has_effective_tool = declared.chat_tools().iter().any(|tool| {
+        tool.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+    });
+    // Honor every name the unchanged registry would use, including declarations
+    // carried by history. Never steal an application's function/custom tool name.
+    if !has_effective_tool
+        || contains_application_tool_search_name(body.get("tools").unwrap_or(&Value::Null))
+        || body
+            .get("input")
+            .is_some_and(contains_application_tool_search_name)
+        || body
+            .get("input")
+            .is_some_and(contains_native_tool_search_marker)
+        || build_codex_tool_context_from_request(body)
+            .lookup_chat_name(TOOL_SEARCH_PROXY_NAME)
+            .is_some()
+    {
+        return false;
+    }
+    let tools = body
+        .as_object_mut()
+        .unwrap()
+        .entry("tools")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
+    tools.push(json!({"type": "tool_search"}));
+    true
 }
 
 /// Convert an OpenAI Responses request into an OpenAI Chat Completions request.
@@ -275,6 +433,7 @@ pub fn responses_to_chat_completions_with_reasoning(
     body: Value,
     reasoning_config: Option<&CodexChatReasoningConfig>,
 ) -> Result<Value, ProxyError> {
+    super::transform_codex_responses_namespace::ensure_client_tool_search(&body)?;
     let mut result = json!({});
     let tool_context = build_codex_tool_context_from_request(&body);
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -1587,39 +1746,6 @@ fn responses_input_file_to_chat_file(part: &Value) -> Option<Value> {
     chat_file_from_input_file(part)
 }
 
-/// Collect tools declared inline in the request `input` instead of top-level
-/// `tools`: `tool_search_output` items (dynamically loaded tool groups) and
-/// `additional_tools` carriers (Codex 0.154+ ships extra tools — the
-/// `functions`/`collaboration` exec sandbox, plugins — in this Responses
-/// private-extension carrier). The xAI Responses passthrough already promotes
-/// the same carriers (`promote_additional_tools`); the Chat and Anthropic
-/// converters go through this registry so they keep the carried tools too.
-fn collect_input_declared_tools(value: &Value, context: &mut CodexToolContext) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_input_declared_tools(item, context);
-            }
-        }
-        Value::Object(obj) => {
-            if matches!(
-                obj.get("type").and_then(|v| v.as_str()),
-                Some("tool_search_output" | "additional_tools")
-            ) {
-                if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
-                    for tool in tools {
-                        context.add_response_tool(tool);
-                    }
-                }
-            }
-            for value in obj.values() {
-                collect_input_declared_tools(value, context);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub(crate) fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     let full_name = format!("{namespace}__{name}");
     if full_name.len() <= CHAT_TOOL_NAME_MAX_LEN {
@@ -1828,6 +1954,15 @@ fn responses_tool_choice_to_chat(tool_choice: &Value, tool_context: &CodexToolCo
                     "name": name
                 }
             })
+        }
+        Value::Object(obj) if obj.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
+            let mut choice = tool_choice.clone();
+            if let Some(tools) = choice.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools {
+                    *tool = responses_tool_choice_to_chat(tool, tool_context);
+                }
+            }
+            choice
         }
         _ => tool_choice.clone(),
     }
@@ -2153,10 +2288,13 @@ pub(crate) fn response_tool_call_item_id_from_chat_name(
     chat_name: &str,
     tool_context: &CodexToolContext,
 ) -> String {
-    if tool_context.is_custom_tool_chat_name(chat_name) {
-        format!("ctc_{call_id}")
-    } else {
-        format!("fc_{call_id}")
+    match tool_context
+        .lookup_chat_name(chat_name)
+        .map(|spec| &spec.kind)
+    {
+        Some(CodexToolKind::ToolSearch) => format!("tsc_{call_id}"),
+        Some(CodexToolKind::Custom) => format!("ctc_{call_id}"),
+        _ => format!("fc_{call_id}"),
     }
 }
 
@@ -2171,7 +2309,7 @@ pub(crate) fn response_tool_call_item_from_chat_name(
 ) -> Value {
     match tool_context.lookup_chat_name(chat_name) {
         Some(spec) if spec.kind == CodexToolKind::ToolSearch => {
-            response_tool_search_call_item(call_id, status, arguments, reasoning)
+            response_tool_search_call_item(item_id, call_id, status, arguments, reasoning)
         }
         Some(spec) if spec.kind == CodexToolKind::Custom => response_custom_tool_call_item(
             item_id, status, call_id, &spec.name, arguments, reasoning,
@@ -2192,13 +2330,15 @@ pub(crate) fn response_tool_call_item_from_chat_name(
 }
 
 fn response_tool_search_call_item(
+    item_id: &str,
     call_id: &str,
     status: &str,
     arguments: &str,
     reasoning: Option<&str>,
 ) -> Value {
-    let parsed_arguments = parse_tool_arguments_object(arguments);
+    let parsed_arguments = parse_tool_search_arguments_str(arguments);
     let mut item = json!({
+        "id": item_id,
         "type": "tool_search_call",
         "call_id": call_id,
         "status": status,
@@ -2230,14 +2370,51 @@ fn response_custom_tool_call_item(
     item
 }
 
-fn parse_tool_arguments_object(arguments: &str) -> Value {
-    if arguments.trim().is_empty() {
-        return json!({});
+fn parse_tool_search_arguments_str(arguments: &str) -> Value {
+    let parsed = if arguments.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "query": arguments }))
+    };
+    normalize_tool_search_arguments(parsed)
+}
+
+pub(crate) fn tool_search_arguments_from_value(arguments: Option<&Value>) -> Value {
+    match arguments {
+        Some(Value::String(arguments)) => parse_tool_search_arguments_str(arguments),
+        Some(Value::Object(_)) => normalize_tool_search_arguments(arguments.cloned().unwrap()),
+        _ => json!({}),
     }
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| json!({ "query": arguments }))
+}
+
+fn normalize_tool_search_arguments(mut arguments: Value) -> Value {
+    if let Some(limit) = arguments.get_mut("limit") {
+        if let Some(parsed) = limit
+            .as_str()
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            *limit = json!(parsed);
+        } else if let Some(number) = limit
+            .as_f64()
+            .filter(|_| !limit.is_u64() && !limit.is_i64())
+        {
+            if number.is_finite()
+                && number >= 0.0
+                && number.fract() == 0.0
+                && number < u64::MAX as f64
+            {
+                let integer = number as u64;
+                if integer as f64 == number {
+                    *limit = json!(integer);
+                }
+            }
+        }
+    }
+    arguments
 }
 
 pub(crate) fn custom_tool_input_from_chat_arguments(arguments: &str) -> String {
@@ -2435,9 +2612,229 @@ pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
 }
 
 #[cfg(test)]
+mod missing_tool_search_tests {
+    use super::*;
+
+    #[test]
+    fn missing_tool_search_uses_existing_registry_and_is_idempotent() {
+        let tool = json!({"type": "function", "name": "existing_tool"});
+        for mut body in [
+            json!({"tools": [tool.clone()]}),
+            json!({"tool_choice": "auto", "input": [{"type": "additional_tools", "tools": [tool.clone()]}]}),
+            json!({"input": [{"type": "tool_search_output", "call_id": "search", "tools": [tool]}]}),
+        ] {
+            assert!(inject_missing_tool_search(&mut body));
+            assert!(!inject_missing_tool_search(&mut body));
+            let context = build_codex_tool_context_from_request(&body);
+            assert_eq!(context.chat_tools().len(), 2);
+            assert_eq!(
+                context.lookup_chat_name("tool_search").unwrap().kind,
+                CodexToolKind::ToolSearch
+            );
+            let item = response_tool_call_item_from_chat_name(
+                "item",
+                "completed",
+                "call_search",
+                "tool_search",
+                r#"{"query":"find tool","limit":2}"#,
+                None,
+                &context,
+            );
+            assert_eq!(
+                item,
+                json!({"id": "item", "type": "tool_search_call", "status": "completed", "call_id": "call_search", "execution": "client", "arguments": {"query": "find tool", "limit": 2}})
+            );
+        }
+    }
+
+    #[test]
+    fn missing_tool_search_preserves_controls_clean_requests_and_owned_names() {
+        let valid = json!({"type": "function", "name": "existing_tool"});
+        let mut cases = vec![
+            json!(null),
+            json!({}),
+            json!({"tools": []}),
+            json!({"tools": null}),
+            json!({"tools": {}}),
+            json!({"tools": [{"type": "function"}]}),
+            json!({"tools": [{"type": "function", "name": "x", "function": null}]}),
+            json!({"tools": [{"type": "web_search"}]}),
+            json!({"tools": [valid.clone()], "input": [{"type": "compaction_trigger"}]}),
+            json!({"tool_choice": "none", "input": [{"type": "tool_search_output", "tools": [valid.clone()]}]}),
+            json!({"input": [{"type": "tool_search_call", "call_id": "call", "arguments": {}}]}),
+            json!({"input": [{"type": "function_call", "name": "tool_search", "arguments": "{}"}]}),
+            json!({"input": [{"type": "function_call_output", "output": {"type": "additional_tools", "tools": [valid.clone()]}}]}),
+        ];
+        for choice in [
+            json!("none"),
+            json!("required"),
+            json!(null),
+            json!(0),
+            json!({"type": "function", "name": "existing_tool"}),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": [valid.clone()]}),
+        ] {
+            cases.push(json!({"tools": [valid.clone()], "tool_choice": choice}));
+        }
+        for collision in [
+            json!({"type": "tool_search"}),
+            json!({"type": "function", "name": "tool_search"}),
+            json!({"type": "custom", "name": "tool_search"}),
+            json!("tool_search"),
+        ] {
+            cases.push(json!({"tools": [valid.clone(), collision.clone()]}));
+            cases.push(json!({"tools": [valid.clone()], "input": [{"type": "additional_tools", "tools": [collision.clone()]}]}));
+            // Even inherited nested registrations must never be displaced by injection.
+            cases.push(json!({"tools": [valid.clone()], "input": [{"type": "function_call_output", "output": {"type": "additional_tools", "tools": [collision]}}]}));
+        }
+        for body in cases {
+            let mut actual = body.clone();
+            assert!(
+                !inject_missing_tool_search(&mut actual),
+                "unexpected injection: {body}"
+            );
+            assert_eq!(actual, body);
+        }
+    }
+
+    #[test]
+    fn ordinary_conversion_does_not_opt_into_missing_tool_search() {
+        let body = json!({"model": "test-model", "input": "Hello", "tools": [{"type": "function", "name": "existing_tool"}]});
+        let converted = responses_to_chat_completions(body.clone()).unwrap();
+        assert_eq!(converted["tools"].as_array().unwrap().len(), 1);
+        let context = build_codex_tool_context_from_request(&body);
+        let item = response_tool_call_item_from_chat_name(
+            "item",
+            "completed",
+            "call",
+            "tool_search",
+            "{}",
+            None,
+            &context,
+        );
+        assert_eq!(item["type"], "function_call");
+        assert!(item.get("execution").is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn discovered_schema_aliases_roundtrip_chat_and_anthropic_without_implicit_search() {
+        for alias in ["inputSchema", "input_schema"] {
+            let mut tool = json!({"type":"function","name":"read","deferLoading":true});
+            tool[alias] = json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]});
+            let body = json!({"model":"test","input":[{"role":"user","content":"Read the file"},{"type":"tool_search_output","call_id":"search","execution":"client","status":"completed","tools":[{"type":"namespace","name":"desktop","tools":[tool]}]}]});
+            let chat = responses_to_chat_completions(body.clone()).unwrap();
+            assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(chat["tools"][0]["function"]["name"], "desktop__read");
+            assert_eq!(
+                chat["tools"][0]["function"]["parameters"]["required"],
+                json!(["path"])
+            );
+            let anthropic =
+                super::super::transform_codex_anthropic::responses_request_to_anthropic(
+                    body.clone(),
+                    4096,
+                )
+                .unwrap();
+            assert_eq!(anthropic["tools"][0]["name"], "desktop__read");
+            assert_eq!(
+                anthropic["tools"][0]["input_schema"]["required"],
+                json!(["path"])
+            );
+            let context = build_codex_tool_context_from_request(&body);
+            let call = response_tool_call_item_from_chat_name(
+                "fc_read",
+                "completed",
+                "read",
+                "desktop__read",
+                r#"{"path":"README.md"}"#,
+                None,
+                &context,
+            );
+            assert_eq!(call["name"], "read");
+            assert_eq!(call["namespace"], "desktop");
+        }
+    }
+
+    #[test]
+    fn loaded_tool_choice_none_remains_restricted_on_both_bridges() {
+        let mut body = json!({"model":"test","tool_choice":"none","tools":[{"type":"function","name":"existing","parameters":{}}],"input":[{"role":"user","content":"Read the file"},{"type":"tool_search_output","call_id":"search","tools":[{"type":"function","name":"loaded","defer_loading":true,"inputSchema":{}}]}]});
+        assert!(!inject_missing_tool_search(&mut body));
+        let chat = responses_to_chat_completions(body.clone()).unwrap();
+        assert_eq!(chat["tool_choice"], "none");
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+        let anthropic =
+            super::super::transform_codex_anthropic::responses_request_to_anthropic(body, 4096)
+                .unwrap();
+        assert_eq!(anthropic["tool_choice"], json!({"type":"none"}));
+        assert_eq!(anthropic["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_allowed_tool_names_preserve_restriction() {
+        let body = json!({"model":"test","input":"hi","tools":[{"type":"namespace","name":"docs","tools":[{"type":"function","name":"read","parameters":{}}]}],"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","namespace":"docs","name":"read"}]}});
+        let result = responses_to_chat_completions(body).unwrap();
+        assert_eq!(
+            result["tool_choice"],
+            json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","function":{"name":"docs__read"}}]})
+        );
+    }
+
+    #[test]
+    fn tool_search_limit_normalizes_only_exact_nonnegative_integers() {
+        assert_eq!(
+            tool_search_arguments_from_value(Some(&json!({"limit":8.0})))["limit"].as_u64(),
+            Some(8)
+        );
+        assert_eq!(
+            tool_search_arguments_from_value(Some(&json!({"limit":"8"})))["limit"].as_u64(),
+            Some(8)
+        );
+        for value in [
+            json!(1.5),
+            json!(-1.0),
+            json!(18446744073709551616.0),
+            json!("invalid"),
+        ] {
+            assert_eq!(
+                tool_search_arguments_from_value(Some(&json!({"limit":value})))["limit"],
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_custom_tools_wait_for_protocol_loaded_subset() {
+        let custom = json!({"type":"custom","name":"apply_patch","defer_loading":true});
+        let body = json!({"tools":[custom.clone()]});
+        assert!(build_codex_tool_context_from_request(&body)
+            .chat_tools()
+            .is_empty());
+        let body = json!({"tools":[custom.clone()],"input":[{"type":"tool_search_output","call_id":"search","status":"completed","execution":"client","tools":[custom]}]});
+        assert_eq!(
+            build_codex_tool_context_from_request(&body)
+                .lookup_chat_name("apply_patch")
+                .unwrap()
+                .kind,
+            CodexToolKind::Custom
+        );
+    }
+
+    #[test]
+    fn clearing_override_identities_preserves_compaction_state() {
+        let mut context = build_codex_tool_context_from_request(
+            &json!({"tools":[{"type":"tool_search"}],"input":[{"type":"compaction_trigger"}]}),
+        );
+        assert!(context.is_compaction_request());
+        context.clear_tool_identities();
+        assert!(context.is_compaction_request());
+        assert!(context.lookup_chat_name("tool_search").is_none());
+        assert!(context.chat_tools().is_empty());
+    }
 
     fn large_test_image_data_url() -> String {
         let bytes = b"CC_SWITCH_TOOL_MEDIA_SENTINEL".repeat(400);

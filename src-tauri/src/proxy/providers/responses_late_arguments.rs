@@ -21,18 +21,13 @@ use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 /// 一个 SSE 块，解析出的事件（不是 JSON 的块为 None）。
 struct Block {
     raw: String,
-    event_name: Option<String>,
     event: Option<Value>,
 }
 
 impl Block {
     fn parse(raw: &str) -> Self {
-        let mut event_name = None;
         let mut data_parts = Vec::new();
         for line in raw.lines() {
-            if let Some(event) = strip_sse_field(line, "event") {
-                event_name = Some(event.trim().to_string());
-            }
             if let Some(data) = strip_sse_field(line, "data") {
                 data_parts.push(data);
             }
@@ -42,7 +37,6 @@ impl Block {
             .flatten();
         Self {
             raw: raw.to_string(),
-            event_name,
             event,
         }
     }
@@ -104,16 +98,10 @@ impl Block {
             "arguments".to_string(),
             Value::String(arguments.to_string()),
         );
-        let mut out = String::new();
-        if let Some(name) = &self.event_name {
-            out.push_str("event: ");
-            out.push_str(name);
-            out.push('\n');
-        }
-        out.push_str("data: ");
-        out.push_str(&serde_json::to_string(event).unwrap_or_default());
-        out.push_str("\n\n");
-        Bytes::from(out)
+        super::transform_codex_responses_namespace::rewrite_sse_json_data(
+            &self.raw,
+            &serde_json::to_string(event).unwrap_or_default(),
+        )
     }
 
     fn into_bytes(self) -> Bytes {
@@ -282,6 +270,32 @@ mod tests {
     fn call_item(arguments: &str) -> Value {
         json!({ "type": "function_call", "id": "x_fc_0", "call_id": "call_1",
                 "name": "exec_command", "arguments": arguments })
+    }
+
+    #[test]
+    fn late_argument_repair_preserves_sse_resume_fields_and_comments() {
+        let mut repair = Repair::default();
+        let pending = format!(
+            "id: end-42\nretry: 2500\n: keep this heartbeat\n{}\nx-gateway: preserved",
+            sse(json!({"type":"response.output_item.done","item":call_item("")})),
+        );
+        assert!(repair.push(&pending).is_empty());
+        repair.push(&sse(json!({"type":"response.function_call_arguments.delta","item_id":"x_fc_0","delta":"{\"cmd\":\"ls\"}"})));
+        let repaired = repair.push(&sse(
+            json!({"type":"response.completed","response":{"output":[]}}),
+        ));
+        let text = std::str::from_utf8(&repaired[0]).unwrap();
+        assert!(text.starts_with(
+            "id: end-42\nretry: 2500\n: keep this heartbeat\nevent: response.output_item.done\n"
+        ));
+        assert!(text.ends_with("x-gateway: preserved\n\n"));
+        let event: Value = serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event["item"]["arguments"], "{\"cmd\":\"ls\"}");
     }
 
     /// 实测的 MiniMax 乱序：结束事件先到、参数为空，唯一的增量排在后面。
