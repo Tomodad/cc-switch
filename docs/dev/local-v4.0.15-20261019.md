@@ -7,6 +7,8 @@ The integration retains missing ToolSearch declarations with scoped gates, nativ
 
 The two local Windows `ToolInstallation` test fixtures now set the official `exited_with_error` field. A failed npm launcher may qualify for repair; a healthy launcher does not. The official timeout-does-not-uninstall behavior is preserved.
 
+Two existing directory-link tests initially failed with Windows error 1314. Their Windows-only, test-only fixture now falls back to a temporary directory junction when symbolic-link privilege is unavailable. The same canonical-path escape and cycle assertions still run; privileges are not changed and production code is unaffected.
+
 No Desktop private LevelDB/Statsig cache behavior, tool-choice permission widening, or removed WebSocket extensions are restored. Production identity remains `com.ccswitch.desktop`.
 
 Validation logs, results, source provenance, installer payload verification, and checksums are delivered with the versioned archive. Prior v4.0.11 test results do not count toward this candidate. The user will perform installation separately; building and archiving do not imply a completed production installer transaction or real-client acceptance.

@@ -1400,7 +1400,7 @@ mod tests {
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&enc, sub.join("cycle"));
         #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_dir(&enc, sub.join("cycle"));
+        let linked = crate::config::create_test_directory_link(&enc, &sub.join("cycle"));
         if let Err(err) = linked {
             // Windows 在 \\wsl.localhost 上建不了符号链接（Incorrect function），夹具无从构造
             assert!(crate::config::is_wsl_path(temp.path()), "symlink: {err}");

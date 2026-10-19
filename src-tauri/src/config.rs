@@ -6,6 +6,36 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
+/// Keep directory-reparse-point tests runnable without changing Windows privileges.
+#[cfg(all(test, windows))]
+pub(crate) fn create_test_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            // Junctions exercise the same canonical-path escape/cycle boundaries.
+            // Pass paths as environment values, never as executable shell text.
+            let output = std::process::Command::new("pwsh.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CC_SWITCH_TEST_LINK_PATH -Target $env:CC_SWITCH_TEST_LINK_TARGET | Out-Null",
+                ])
+                .env("CC_SWITCH_TEST_LINK_PATH", link)
+                .env("CC_SWITCH_TEST_LINK_TARGET", target)
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "test junction failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )))
+            }
+        }
+        result => result,
+    }
+}
+
 /// 获取用户主目录，带回退和日志
 ///
 /// ## Windows 注意事项
