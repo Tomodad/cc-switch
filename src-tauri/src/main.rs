@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--verify-embedded-ui") {
+        std::process::exit(if verify_embedded_ui() { 0 } else { 1 });
+    }
     // 在 Linux 上设置 WebKit 环境变量以解决 DMA-BUF 渲染问题
     // 某些 Linux 系统（如 Debian 13.2、Nvidia GPU）上 WebKitGTK 的 DMA-BUF 渲染器可能导致白屏/黑屏
     // 参考: https://github.com/tauri-apps/tauri/issues/9394
@@ -32,4 +35,55 @@ fn main() {
     }
 
     cc_switch_lib::run();
+}
+
+fn verify_embedded_ui() -> bool {
+    use tauri::utils::assets::AssetKey;
+    let context = cc_switch_lib::application_context();
+    let index = context.assets().get(&AssetKey::from("index.html"));
+    let html = index
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or("");
+    let mut references = Vec::new();
+    for tag in html.split('<') {
+        let attribute = if tag.starts_with("script ") {
+            "src=\""
+        } else if tag.starts_with("link ") && tag.contains("rel=\"stylesheet\"") {
+            "href=\""
+        } else {
+            continue;
+        };
+        let Some((_, value)) = tag.split_once(attribute) else {
+            continue;
+        };
+        let Some((path, _)) = value.split_once('"') else {
+            continue;
+        };
+        let path = path.trim_start_matches("./");
+        let bytes = context
+            .assets()
+            .get(&AssetKey::from(path))
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        references.push(serde_json::json!({"path":path,"bytes":bytes}));
+    }
+    let valid = !tauri::is_dev()
+        && !html.is_empty()
+        && !html.contains("localhost:3000")
+        && references
+            .iter()
+            .any(|asset| asset["path"].as_str().is_some_and(|p| p.ends_with(".js")))
+        && references
+            .iter()
+            .any(|asset| asset["path"].as_str().is_some_and(|p| p.ends_with(".css")))
+        && references
+            .iter()
+            .all(|asset| asset["bytes"].as_u64().unwrap_or(0) > 0);
+    println!(
+        "{}",
+        serde_json::json!({"production_protocol":!tauri::is_dev(),
+        "identifier":context.config().identifier,"index_bytes":html.len(),"assets":references,"passed":valid})
+    );
+    valid
 }

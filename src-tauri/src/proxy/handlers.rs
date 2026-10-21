@@ -1201,6 +1201,9 @@ async fn handle_responses_for_app(
     if xai_compat
         || native_tool_context.restore_tool_search
         || !native_tool_context.namespace_restore_map.is_empty()
+        || (matches!(app_type, AppType::Codex)
+            && crate::settings::unify_codex_session_history()
+            && !super::providers::is_codex_official_provider(&ctx.provider))
     {
         return handle_codex_native_responses_rewrite(
             response,
@@ -1633,6 +1636,8 @@ async fn handle_codex_native_responses_rewrite(
     xai_compat: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
+    let portable_history = crate::settings::unify_codex_session_history()
+        && !super::providers::is_codex_official_provider(&ctx.provider);
 
     // Error bodies (and any non-SSE, non-success response) never contain
     // restorable function calls; hand them to the generic passthrough so error
@@ -1670,6 +1675,15 @@ async fn handle_codex_native_responses_rewrite(
                     restore_tool_search,
                 ),
             )
+        };
+        let restore_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+        > = if portable_history {
+            Box::pin(super::codex_portable_history::project_stream(
+                restore_stream,
+            ))
+        } else {
+            restore_stream
         };
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
@@ -1716,6 +1730,9 @@ async fn handle_codex_native_responses_rewrite(
                 &restore_map,
                 restore_tool_search,
             );
+            if portable_history {
+                super::codex_portable_history::project_response(&mut value);
+            }
             if let Some(usage) =
                 TokenUsage::from_codex_response_auto(&value).filter(TokenUsage::has_billable_tokens)
             {

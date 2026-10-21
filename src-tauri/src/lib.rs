@@ -344,6 +344,11 @@ async fn update_tray_menu(
     }
 }
 
+/// Shared by normal startup and the read-only packaged-UI verification command.
+pub fn application_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
@@ -1815,7 +1820,7 @@ pub fn run() {
         ]);
 
     let app = builder
-        .build(tauri::generate_context!())
+        .build(application_context())
         .expect("error while running tauri application");
 
     app.run(|app_handle, event| {
