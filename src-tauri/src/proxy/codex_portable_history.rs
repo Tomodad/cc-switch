@@ -1,6 +1,6 @@
 //! Native web-search handles are scoped to their issuing backend. Preserve the
 //! visible activity as messages when sharing history across upstreams; keep the
-//! persisted original untouched. Never inspect or rewrite reasoning ciphertext.
+//! original in migration backups. Never inspect or rewrite reasoning ciphertext.
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -165,5 +165,28 @@ mod tests {
         assert!(text.contains("\"total_tokens\":42"));
         assert!(!text.contains("\"type\":\"web_search_call\""));
         assert_eq!(text.matches("msg_ccswitch_ws_1").count(), 2);
+    }
+
+    #[test]
+    fn nonstream_projection_preserves_usage_reasoning_and_tool_results() {
+        let reasoning = json!({"type":"reasoning","encrypted_content":"opaque"});
+        let tool = json!({"type":"function_call_output","call_id":"call_1","output":"evidence"});
+        let mut response = json!({
+            "id":"resp_1","status":"completed","usage":{"total_tokens":42},
+            "output":[{"type":"web_search_call","status":"completed",
+                       "action":{"type":"open_page","url":"https://example.com"}}, reasoning, tool]
+        });
+        assert_eq!(project_response(&mut response), 1);
+        assert_eq!(response["id"], "resp_1");
+        assert_eq!(response["usage"]["total_tokens"], 42);
+        assert_eq!(response["output"][1], reasoning);
+        assert_eq!(response["output"][2], tool);
+        assert!(response["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.com"));
+        let once = response.clone();
+        assert_eq!(project_response(&mut response), 0);
+        assert_eq!(response, once);
     }
 }

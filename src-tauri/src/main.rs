@@ -38,9 +38,21 @@ fn main() {
 }
 
 fn verify_embedded_ui() -> bool {
+    let pages = ["index.html", "tray-panel.html"].map(verify_embedded_page);
+    let context = cc_switch_lib::application_context();
+    let passed = pages.iter().all(|page| page["passed"] == true);
+    println!(
+        "{}",
+        serde_json::json!({"production_protocol":!tauri::is_dev(),
+            "identifier":context.config().identifier,"pages":pages,"passed":passed})
+    );
+    passed
+}
+
+fn verify_embedded_page(path: &str) -> serde_json::Value {
     use tauri::utils::assets::AssetKey;
     let context = cc_switch_lib::application_context();
-    let index = context.assets().get(&AssetKey::from("index.html"));
+    let index = context.assets().get(&AssetKey::from(path));
     let html = index
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
@@ -80,10 +92,5 @@ fn verify_embedded_ui() -> bool {
         && references
             .iter()
             .all(|asset| asset["bytes"].as_u64().unwrap_or(0) > 0);
-    println!(
-        "{}",
-        serde_json::json!({"production_protocol":!tauri::is_dev(),
-        "identifier":context.config().identifier,"index_bytes":html.len(),"assets":references,"passed":valid})
-    );
-    valid
+    serde_json::json!({"page":path,"index_bytes":html.len(),"assets":references,"passed":valid})
 }
