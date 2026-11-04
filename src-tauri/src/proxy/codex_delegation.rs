@@ -205,6 +205,7 @@ mod tests {
             OpaqueStateRejection {
                 reasoning: true,
                 compaction: true,
+                item_ids: false,
             },
         );
         assert!(!result.applied);
