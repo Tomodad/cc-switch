@@ -70,7 +70,7 @@ impl SystemKeychain {
     }
 
     /// 真机测试用的另一条，别动 agy 那条。
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn named(service: &'static str, account: &'static str) -> Self {
         Self { service, account }
     }

@@ -63,3 +63,9 @@ Retain the new verified 4.0.25 release and previous 4.0.17 release. Do not remov
 Cloud pre-publication checks: frontend TypeScript, Prettier and production renderer build passed; Vitest passed **3,535 / 3,535 tests in 274 files**. Rust formatting passed after additive-conflict module ordering. Full Windows backend and package checks are separately recorded by the release workflow; these frontend results do not imply backend success.
 
 Build entry point: [Local Windows release workflow](https://github.com/Tomodad/cc-switch/actions/workflows/local-windows-release.yml). Its push trigger is limited to the dedicated integration branch; publication is gated on all validation and package checks.
+
+## Backend verification and test maintenance
+
+Full Linux application verification (not a subset harness) passed on `1f14a132e6b6ffdfbfdcec454575bc49bbaa1e55`: **4,681 tests passed, 0 failed, 10 ignored**, across 19 binaries. Production Clippy with warnings denied passed. Dependencies were supplied through an isolated user-writable GTK/WebKit/libsoup sysroot, without changing the host system or user configuration.
+
+Three test-only compatibility cleanups are retained: the delegation fixture explicitly sets the new official `OpaqueStateRejection.item_ids` field to false; the real macOS keychain test constructor is compiled only for macOS tests; a DeepSeek Harness test uses `std::slice::from_ref` instead of cloning a one-item slice. The latter two address upstream all-target Clippy warnings. No runtime behavior or test assertions are relaxed. Final strict all-target Clippy and Windows results are tracked separately in validation output; Linux results do not establish Windows GUI acceptance.
