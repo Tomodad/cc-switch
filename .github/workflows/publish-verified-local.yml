@@ -1,3 +1,4 @@
+# Original artifact SHA256: df3758359f6ab8b42c43a1380d5489a9c23f6baeed557cbcffa8c786356e0892
 name: Publish verified local Windows package
 on:
   push:
