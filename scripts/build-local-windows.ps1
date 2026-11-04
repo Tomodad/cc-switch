@@ -8,7 +8,8 @@ function Invoke-Logged {
 New-Item -ItemType Directory -Force validation, release-assets | Out-Null
 Invoke-Logged 'typecheck.log' 'pnpm' @('typecheck')
 Invoke-Logged 'frontend-format.log' 'pnpm' @('format:check')
-Invoke-Logged 'frontend-tests.log' 'pnpm' @('test:unit')
+# Avoid cross-file CPU contention on hosted Windows; preserve every test and timeout.
+Invoke-Logged 'frontend-tests.log' 'pnpm' @('exec', 'vitest', 'run', '--maxWorkers=1', '--minWorkers=1')
 Invoke-Logged 'frontend-build.log' 'pnpm' @('build:renderer')
 Invoke-Logged 'rust-format.log' 'cargo' @('fmt', '--check', '--manifest-path', 'src-tauri/Cargo.toml')
 Invoke-Logged 'clippy.log' 'cargo' @('clippy', '--locked', '--all-targets', '--manifest-path', 'src-tauri/Cargo.toml', '--', '-D', 'warnings')

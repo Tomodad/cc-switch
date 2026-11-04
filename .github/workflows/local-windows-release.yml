@@ -47,6 +47,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
           shared-key: local-windows
+          cache-on-failure: true
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
         with:
           tool: cargo-nextest
