@@ -24,7 +24,28 @@ fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
 
 #[cfg(windows)]
 fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
-    std::os::windows::fs::symlink_dir(src, dest).expect("create symlink");
+    match std::os::windows::fs::symlink_dir(src, dest) {
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            // Preserve directory-link cleanup coverage without elevated privileges.
+            let output = std::process::Command::new("pwsh.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CC_SWITCH_TEST_LINK_PATH -Target $env:CC_SWITCH_TEST_LINK_TARGET | Out-Null",
+                ])
+                .env("CC_SWITCH_TEST_LINK_PATH", dest)
+                .env("CC_SWITCH_TEST_LINK_TARGET", src)
+                .output()
+                .expect("create test junction");
+            assert!(
+                output.status.success(),
+                "test junction: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        result => result.expect("create symlink"),
+    }
 }
 
 #[test]

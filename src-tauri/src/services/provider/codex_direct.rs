@@ -607,9 +607,6 @@ pub(crate) fn plan(
                 None => AuthGoal::ThirdParty,
             };
             match &projection.route {
-                Route::Official if crate::settings::unify_codex_session_history() => {
-                    (RouteWrite::OfficialMirror, None, auth)
-                }
                 Route::Official => (
                     RouteWrite::Official {
                         dormant_base_url: configured_proxy_base_url(db),
@@ -645,10 +642,22 @@ pub(crate) fn plan(
                 (
                     RouteWrite::OfficialProxy {
                         base_url: base_url.to_string(),
-                        unified: crate::settings::unify_codex_session_history(),
+                        unified: false,
                     },
                     None,
                     auth,
+                )
+            } else if crate::settings::unify_codex_session_history() {
+                // Keep the native ChatGPT login and built-in provider identity.
+                // Only the loopback proxy receives that login; its upstream
+                // adapter replaces credentials for the selected API provider.
+                (
+                    RouteWrite::OfficialProxy {
+                        base_url: base_url.to_string(),
+                        unified: false,
+                    },
+                    None,
+                    AuthGoal::KeepNative,
                 )
             } else {
                 // The proxy owns its URL/auth, but the route still owns the remote
@@ -722,7 +731,14 @@ pub(crate) fn plan(
             plan_codex_model_catalog(
                 &provider.settings_config,
                 &projection.catalog_input_text(),
-                crate::proxy::providers::resolve_codex_catalog_tool_profile(provider),
+                match target {
+                    Target::Proxy { .. } => {
+                        crate::proxy::providers::resolve_codex_proxy_catalog_tool_profile(provider)
+                    }
+                    Target::Direct(_) => {
+                        crate::proxy::providers::resolve_codex_catalog_tool_profile(provider)
+                    }
+                },
             )?
             .catalog
         }
@@ -946,7 +962,7 @@ fn stack_catalog(
         CodexStackRoute::ThirdParty(CodexCatalogRow {
             settings: &route.settings_config,
             config_text: &route_text,
-            profile: crate::proxy::providers::resolve_codex_catalog_tool_profile(route),
+            profile: crate::proxy::providers::resolve_codex_proxy_catalog_tool_profile(route),
         })
     };
 
@@ -958,7 +974,7 @@ fn stack_catalog(
             Ok(projection) => Some((
                 member,
                 projection.catalog_input_text(),
-                crate::proxy::providers::resolve_codex_catalog_tool_profile(&member.provider),
+                crate::proxy::providers::resolve_codex_proxy_catalog_tool_profile(&member.provider),
             )),
             Err(error) => {
                 log::warn!(
@@ -1338,6 +1354,47 @@ mod tests {
     use super::{is_proxy_base_url, stack_subagent_nested};
     use serde_json::json;
 
+    #[test]
+    #[serial_test::serial]
+    fn oauth_unified_proxy_keeps_builtin_identity_and_provider_key_out_of_live_config() {
+        use super::*;
+        let previous = crate::settings::get_settings();
+        let mut settings = previous.clone();
+        settings.unify_codex_session_history = true;
+        crate::settings::update_settings(settings).unwrap();
+        let db = Database::memory().unwrap();
+        let provider = Provider::with_id(
+            "api".to_string(),
+            "API".to_string(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"sk-provider-only"},
+                "config":"model = \"gpt-6.1-sol\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"API\"\nbase_url = \"https://api.example/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        let target = Target::Proxy {
+            route: &provider,
+            base_url: "http://127.0.0.1:15721/v1",
+            stack: &[],
+        };
+        let planned = plan(&db, &Owner::None, &target, &Prepared::default());
+        crate::settings::update_settings(previous).unwrap();
+        let planned = planned.unwrap();
+        assert!(matches!(planned.auth, AuthGoal::KeepNative));
+        let mut doc = "model_provider = \"custom\"\n[model_providers.custom]\nexperimental_bearer_token = \"sk-old\"\n".parse::<toml_edit::DocumentMut>().unwrap();
+        planned
+            .config
+            .apply_to(std::path::Path::new("config.toml"), &mut doc)
+            .unwrap();
+        assert!(doc.get("model_provider").is_none(), "{doc}");
+        assert_eq!(
+            doc["openai_base_url"].as_str(),
+            Some("http://127.0.0.1:15721/v1")
+        );
+        assert!(!doc.to_string().contains("sk-provider-only"));
+        assert!(!doc.to_string().contains("sk-old"));
+    }
+
     /// 子代理设置按合并目录校验：不在目录里、或者父 agent 用新版工具时会拒收的
     /// （`multi_agent_version = "disabled"`）都不写；强度不在档位里只写模型。
     #[test]
@@ -1375,6 +1432,57 @@ mod tests {
         assert!(written(Some("ccs-gone/v4"), Some("high")).is_empty());
         assert!(written(Some("ccs-ds/off"), None).is_empty());
         assert!(written(None, Some("high")).is_empty());
+    }
+
+    #[test]
+    fn stacked_catalog_advertises_tool_search_for_each_proxied_transport() {
+        let provider = |id: &str, format: &str| {
+            crate::provider::Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                serde_json::json!({
+                    "apiFormat": format,
+                    "auth": { "OPENAI_API_KEY": "sk-test" },
+                    "config": format!(
+                        "model = \"{id}-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://{id}.example/v1\"\nwire_api = \"responses\"\n"
+                    ),
+                    "modelCatalog": { "models": [{ "model": format!("{id}-model") }] }
+                }),
+                None,
+            )
+        };
+        let route = provider("route", "openai_responses");
+        let stack = [
+            super::Member {
+                provider: provider("native", "openai_responses"),
+                key: "native".to_string(),
+                route: false,
+                model_ids: vec![],
+            },
+            super::Member {
+                provider: provider("anthropic", "anthropic"),
+                key: "anthropic".to_string(),
+                route: false,
+                model_ids: vec![],
+            },
+        ];
+        let catalog = super::stack_catalog(
+            &route,
+            &super::project(&route).unwrap(),
+            &stack,
+            &super::Prepared::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        for model in models {
+            assert_eq!(model["supports_search_tool"], true, "{model}");
+            assert!(model.get("apply_patch_tool_type").is_none(), "{model}");
+        }
+        assert_eq!(models[0]["slug"], "route-model");
+        assert_eq!(models[1]["slug"], "ccs-native/native-model");
+        assert_eq!(models[2]["slug"], "ccs-anthropic/anthropic-model");
     }
 
     #[test]

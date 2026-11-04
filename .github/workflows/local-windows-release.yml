@@ -1,0 +1,112 @@
+name: Local Windows release
+
+on:
+  push:
+    branches: [codex/integration-v4.0.25-20261104]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: local-v4.0.25-20261104
+  UPSTREAM_TAG: v4.0.25
+  UPSTREAM_SHA: a3eafa408ae679db2e3401fca767ed2b89d9a2b2
+
+jobs:
+  build:
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - name: Read pinned Rust version
+        id: rust
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          if (!$channel) { throw 'Missing Rust toolchain' }
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+          shared-key: local-windows
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
+        with:
+          tool: cargo-nextest
+      - name: Install frontend dependencies
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          corepack enable
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          corepack install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Validate, build and verify Windows package
+        run: ./scripts/build-local-windows.ps1
+      - name: Keep validation logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-validation-${{ github.sha }}
+          path: validation/
+          if-no-files-found: warn
+      - name: Upload verified release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: local-windows-release-${{ github.sha }}
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: local-windows-release-${{ github.sha }}
+          path: release-assets
+      - name: Verify checksums and publish new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check SHA256SUMS.txt
+          # Never overwrite an existing release or silently move an existing tag.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; review it before publishing another build.' >&2
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Tag already exists; refusing to move or reuse it.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" ./* \
+            --target "$SOURCE_SHA" \
+            --title 'CC Switch 4.0.25 local integration (Windows x64)' \
+            --notes-file RELEASE-NOTES.md --latest=false

@@ -459,6 +459,40 @@ pub fn resolve_codex_catalog_tool_profile(
     CodexCatalogToolProfile::from_api_format(api_format)
 }
 
+/// Resolve the catalog profile used while CC-Switch owns the local Codex route.
+/// Direct native Responses configs stay conservative, while a non-official
+/// native Responses provider can advertise ToolSearch because the local proxy
+/// supplies the compatibility transport.
+pub fn resolve_codex_proxy_catalog_tool_profile(
+    provider: &Provider,
+) -> crate::codex_config::CodexCatalogToolProfile {
+    use crate::codex_config::CodexCatalogToolProfile;
+    let profile = resolve_codex_catalog_tool_profile(provider);
+    let overrides_tools = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.local_proxy_request_overrides.as_ref())
+        .and_then(|overrides| overrides.body.as_ref())
+        .is_some_and(|body| body.get("tools").is_some() || body.get("tool_choice").is_some());
+    if !is_codex_official_provider(provider)
+        && !overrides_tools
+        && matches!(
+            profile,
+            CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic
+        )
+    {
+        match profile {
+            CodexCatalogToolProfile::NativeResponses => {
+                CodexCatalogToolProfile::ProxiedNativeResponses
+            }
+            CodexCatalogToolProfile::Anthropic => CodexCatalogToolProfile::ProxiedAnthropic,
+            _ => unreachable!(),
+        }
+    } else {
+        profile
+    }
+}
+
 /// Extract the real upstream model configured for a Codex provider.
 pub fn codex_provider_upstream_model(provider: &Provider) -> Option<String> {
     provider
