@@ -33,7 +33,17 @@ def main():
         assert path.stat().st_size > 1_000_000, f'{name} is unexpectedly small'
     ui = json.loads((logs / 'embedded-ui.json').read_text(encoding='utf-8-sig'))
     payload = json.loads((logs / 'installer-verification.json').read_text(encoding='utf-8-sig'))
+    payload_ui = json.loads((logs / 'payload-embedded-ui.json').read_text(encoding='utf-8-sig'))
+    comparison = json.loads((logs / 'payload-comparison.json').read_text(encoding='utf-8-sig'))
     assert ui['passed'] and ui['production_protocol'] and payload['passed']
+    assert payload_ui['passed'] and payload_ui['production_protocol']
+    assert payload['payload_ui_verified'] and payload['published_payload_identical']
+    assert comparison['passed'] and comparison['normalized_equal']
+    assert comparison['comparison'] == 'exact-first-tauri-bundle-marker-substitution'
+    assert comparison['normalized_payload_sha256'] == comparison['build_executable_sha256']
+    assert comparison['build_executable_sha256'] == payload['build_executable_sha256']
+    assert comparison['payload_executable_sha256'] == payload['payload_executable_sha256']
+    assert payload['payload_executable_sha256'] == payload['executable_sha256']
     assert payload['executable_sha256'] == digest(assets / 'cc-switch.exe')
     assert payload['installer_sha256'] == digest(assets / 'CC-Switch-4.0.25-x64-setup.exe')
     with zipfile.ZipFile(assets / 'source.zip') as archive:
@@ -55,7 +65,7 @@ Source commit: {sha}
 Official baseline: {os.environ['UPSTREAM_TAG']} ({base})
 Build and test run: {url}
 
-Frontend formatting, typecheck, unit tests and production build passed. Windows backend formatting, all-target Clippy with warnings denied, nextest and doctests passed. Existing ignored tests remain ignored; consult validation.zip for complete output. The executable verified its embedded production pages and assets, and the NSIS installer executable payload matches it byte-for-byte.
+Frontend formatting, typecheck, unit tests and production build passed. Windows backend formatting, all-target Clippy with warnings denied, nextest and doctests passed. Existing ignored tests remain ignored; consult validation.zip for complete output. Both the build executable and extracted NSIS payload independently verified their embedded production pages and assets. Their complete bytes match after exactly one documented Tauri bundle marker substitution (UNK to NSS); any other difference fails validation. The published cc-switch.exe is the verified installer payload and matches it byte-for-byte. Raw and normalized hashes are recorded in validation.zip.
 
 Database schema upgrades from 20 to 24. Before first launch, fully exit CC Switch and separately back up its configuration directory and database (including any WAL/SHM files), plus relevant Codex configuration/history. The built-in pre-migration backup can fail without blocking migration. Downgrading to 4.0.17 requires restoring the pre-upgrade backup, not merely replacing the executable. Do not upload private backups.
 
@@ -69,6 +79,8 @@ Retained compatibility changes against the official release are in local-patches
         'release_tag': os.environ['RELEASE_TAG'], 'build_run': url,
         'platform': 'windows-x86_64', 'unsigned': True,
         'embedded_ui_verified': True, 'installer_payload_verified': True,
+        'payload_embedded_ui_verified': True, 'published_payload_identical': True,
+        'payload_comparison': comparison,
         'gui_acceptance_performed': False,
         'files': [{'name': p.name, 'size': p.stat().st_size, 'sha256': digest(p)}
                   for p in sorted(assets.iterdir()) if p.is_file() and p.name not in ('manifest.json', 'SHA256SUMS.txt')],

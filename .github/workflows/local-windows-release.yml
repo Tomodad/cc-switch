@@ -61,8 +61,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Validate, build and verify Windows package
-        run: ./scripts/build-local-windows.ps1
+      - name: Validate frontend and build UI
+        run: ./scripts/build-local-windows.ps1 -Stage frontend
+      - name: Validate Windows backend
+        run: ./scripts/build-local-windows.ps1 -Stage backend
+      - name: Build Windows NSIS package
+        run: ./scripts/build-local-windows.ps1 -Stage build
+      - name: Verify payload and prepare release files
+        run: ./scripts/build-local-windows.ps1 -Stage verify
       - name: Keep validation logs even on failure
         if: always()
         uses: actions/upload-artifact@v7
