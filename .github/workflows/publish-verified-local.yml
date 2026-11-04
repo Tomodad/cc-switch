@@ -1,0 +1,69 @@
+name: Publish verified local Windows package
+on:
+  push:
+    branches: [codex/publish-verified-v4.0.25-20261104]
+permissions:
+  contents: read
+jobs:
+  publish-verified-artifact:
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: local-windows-release-e328c06ed685eb18caf9c9d7ec99fb14ad8dfbda
+          path: release-assets
+          github-token: ${{ github.token }}
+          repository: Tomodad/cc-switch
+          run-id: 41872100391
+      - name: Check immutable build artifacts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          python - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          manifest=json.loads(Path('manifest.json').read_text())
+          assert manifest['source_commit']=='e328c06ed685eb18caf9c9d7ec99fb14ad8dfbda'
+          assert manifest['build_run']=='https://github.com/Tomodad/cc-switch/actions/runs/41872100391'
+          assert manifest['installer_payload_verified'] and manifest['payload_embedded_ui_verified'] and manifest['published_payload_identical']
+          checksum=Path('SHA256SUMS.txt')
+          # Checksum text is not self-hashed. Normalize only its platform line endings.
+          checksum.write_bytes(checksum.read_bytes().replace(b'\r\n',b'\n'))
+          for line in checksum.read_text().splitlines():
+              expected,name=line.split('  ',1)
+              assert Path(name).name==name and len(expected)==64
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==expected,name
+          assert hashlib.sha256(Path('CC-Switch-4.0.25-x64-setup.exe').read_bytes()).hexdigest()=='10846b42ec2e81931e0b601fd46db9aaee5df22832dfa781eeaf124f9128d4a2'
+          assert hashlib.sha256(Path('cc-switch.exe').read_bytes()).hexdigest()=='2a016deefe5c302d0bb7543a2234b6dfb6f803e237c367dc0e95127990929b35'
+          note=Path('RELEASE-NOTES.md').read_text()+f"\nPublication verification: https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}\nOnly SHA256SUMS.txt line endings were normalized to LF for portability; application, installer, source and validation bytes are unchanged from the successful build.\n"
+          Path('../publication-notes.md').write_text(note,encoding='utf-8')
+          PY
+          sha256sum --check SHA256SUMS.txt
+          TAG=local-v4.0.25-20261104
+          if gh release view "$TAG" >/dev/null 2>&1; then echo 'Release already exists; refusing overwrite'; exit 1; fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then echo 'Tag already exists; refusing overwrite'; exit 1; fi
+          gh release create "$TAG" ./* --target e328c06ed685eb18caf9c9d7ec99fb14ad8dfbda --title 'CC Switch 4.0.25 local integration (Windows x64)' --notes-file ../publication-notes.md --latest
+          gh api "repos/$GH_REPO/releases/tags/$TAG" > ../published.json
+          gh api "repos/$GH_REPO/git/ref/tags/$TAG" > ../published-tag.json
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          release=json.loads(Path('../published.json').read_text())
+          tag=json.loads(Path('../published-tag.json').read_text())
+          assert not release['draft'] and tag['object']['sha']=='e328c06ed685eb18caf9c9d7ec99fb14ad8dfbda'
+          files={p.name:p for p in Path('.').iterdir() if p.is_file()}
+          assert {a['name'] for a in release['assets']}==set(files)
+          for asset in release['assets']:
+              p=files[asset['name']]
+              assert asset['size']==p.stat().st_size
+              assert asset['digest']=='sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
+          print(release['html_url'])
+          PY
