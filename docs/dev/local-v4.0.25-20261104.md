@@ -61,3 +61,5 @@ The fork-only Windows workflow must pass frontend type checking, formatting, uni
 Retain the new verified 4.0.25 release and previous 4.0.17 release. Do not remove 4.0.15 before the new assets and checksums have been verified. Source tags/history are preserved independently of release asset retention; any cleanup must respect recoverability and authorization.
 
 Cloud pre-publication checks: frontend TypeScript, Prettier and production renderer build passed; Vitest passed **3,535 / 3,535 tests in 274 files**. Rust formatting passed after additive-conflict module ordering. Full Windows backend and package checks are separately recorded by the release workflow; these frontend results do not imply backend success.
+
+Build entry point: [Local Windows release workflow](https://github.com/Tomodad/cc-switch/actions/workflows/local-windows-release.yml). Its push trigger is limited to the dedicated integration branch; publication is gated on all validation and package checks.
