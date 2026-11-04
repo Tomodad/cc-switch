@@ -7618,6 +7618,41 @@ mod tests {
         use super::*;
         use tokio::sync::Mutex;
 
+        // Each nextest process needs its own settings file. `serial` on the
+        // callers also protects the environment and settings cache in cargo test.
+        struct IsolatedSettings {
+            _home: tempfile::TempDir,
+            previous_home: Option<std::ffi::OsString>,
+        }
+
+        impl IsolatedSettings {
+            fn new(unify_history: bool) -> Self {
+                let home = tempfile::tempdir().expect("isolated settings home");
+                let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+                std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+                // Construct the guard first so failures restore the environment.
+                let guard = Self {
+                    _home: home,
+                    previous_home,
+                };
+                crate::settings::reload_settings().expect("reload isolated settings");
+                let mut settings = crate::settings::get_settings();
+                settings.unify_codex_session_history = unify_history;
+                crate::settings::update_settings(settings).expect("set isolated history mode");
+                guard
+            }
+        }
+
+        impl Drop for IsolatedSettings {
+            fn drop(&mut self) {
+                match &self.previous_home {
+                    Some(home) => std::env::set_var("CC_SWITCH_TEST_HOME", home),
+                    None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+                }
+                let _ = crate::settings::reload_settings();
+            }
+        }
+
         struct Seen {
             headers: HeaderMap,
             body: Value,
@@ -7736,10 +7771,7 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn oauth_unified_routes_replace_credentials_and_strip_account_headers() {
-            let previous = crate::settings::get_settings();
-            let mut settings = previous.clone();
-            settings.unify_codex_session_history = true;
-            crate::settings::update_settings(settings).unwrap();
+            let _settings = IsolatedSettings::new(true);
             let upstream = upstream().await;
             let mut request = body("listed", json!([]));
             request["client_metadata"] = json!({"mcp_attribution": "official-account"});
@@ -7753,7 +7785,6 @@ mod tests {
                 request,
             )
             .await;
-            crate::settings::update_settings(previous).unwrap();
             for name in [
                 "chatgpt-account-id",
                 "originator",
@@ -7778,7 +7809,9 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn stacked_requests_drop_chatgpt_identity_but_keep_native_responses_beta_marker() {
+            let _settings = IsolatedSettings::new(false);
             let upstream = upstream().await;
             for api_format in ["openai_responses", "openai_chat", "anthropic"] {
                 let seen = send(
