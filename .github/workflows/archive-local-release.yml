@@ -1,0 +1,59 @@
+name: Archive previous local release
+on:
+  push:
+    branches: [codex/archive-v4.0.15-20261104]
+permissions:
+  contents: write
+jobs:
+  retain-two-published-releases:
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify new release and archive only 4.0.15 reversibly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEW=local-v4.0.25-20261104
+          OLD=local-v4.0.15-20261019
+          gh api "repos/$GH_REPO/releases/tags/$NEW" > new.json
+          gh api "repos/$GH_REPO/git/ref/tags/$NEW" > new-tag.json
+          gh api "repos/$GH_REPO/releases/tags/$OLD" > old-before.json
+          gh release download "$NEW" --dir verified
+          (cd verified && sha256sum --check SHA256SUMS.txt)
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          new=json.loads(Path('new.json').read_text())
+          tag=json.loads(Path('new-tag.json').read_text())
+          old=json.loads(Path('old-before.json').read_text())
+          manifest=json.loads(Path('verified/manifest.json').read_text())
+          expected='e328c06ed685eb18caf9c9d7ec99fb14ad8dfbda'
+          assert new['tag_name']=='local-v4.0.25-20261104' and not new['draft']
+          assert tag['object']['type']=='commit' and tag['object']['sha']==expected
+          assert manifest['source_commit']==expected
+          assert manifest['installer_payload_verified'] and manifest['payload_embedded_ui_verified']
+          installer=next(x for x in manifest['files'] if x['name']=='CC-Switch-4.0.25-x64-setup.exe')
+          assert installer['sha256']=='10846b42ec2e81931e0b601fd46db9aaee5df22832dfa781eeaf124f9128d4a2'
+          assert old['tag_name']=='local-v4.0.15-20261019' and old['assets']
+          PY
+          NEW_ID=$(python -c "import json; print(json.load(open('new.json'))['id'])")
+          OLD_ID=$(python -c "import json; print(json.load(open('old-before.json'))['id'])")
+          gh api --method PATCH "repos/$GH_REPO/releases/$NEW_ID" -f make_latest=true > new-after.json
+          # Draft is reversible. Never delete the release, its tag or any asset.
+          gh api --method PATCH "repos/$GH_REPO/releases/$OLD_ID" -F draft=true > old-after.json
+          gh api "repos/$GH_REPO/releases?per_page=100" > releases.json
+          python - <<'PY'
+          import json
+          before=json.load(open('old-before.json'))
+          after=json.load(open('old-after.json'))
+          fields=('id','name','size','digest')
+          snapshot=lambda r: sorted(tuple(a.get(k) for k in fields) for a in r['assets'])
+          assert after['draft'] and after['id']==before['id']
+          assert snapshot(before)==snapshot(after), 'Archived release assets changed'
+          published={r['tag_name'] for r in json.load(open('releases.json')) if not r['draft']}
+          assert published=={'local-v4.0.25-20261104','local-v4.0.17-20261021'},published
+          print('Verified: two published releases; 4.0.15 archived as a draft with all assets intact.')
+          PY
