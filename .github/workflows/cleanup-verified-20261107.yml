@@ -1,0 +1,21 @@
+name: Verify and retain two local releases
+on:
+  push:
+    branches: [codex/cleanup-verified-v4.0.27-20261107]
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+jobs:
+  cleanup:
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify source and assets, archive old release, remove merged refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/cleanup-verified-20261107.py
