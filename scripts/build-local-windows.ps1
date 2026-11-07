@@ -53,7 +53,7 @@ $payloadHash = (Get-FileHash $payloads[0].FullName -Algorithm SHA256).Hash.ToLow
 $publishedHash = (Get-FileHash release-assets/cc-switch.exe -Algorithm SHA256).Hash.ToLower()
 if ($publishedHash -ne $payloadHash) { throw 'Published executable differs from installer payload' }
 @{passed=$true; executable_sha256=$publishedHash; payload_executable_sha256=$payloadHash; build_executable_sha256=(Get-FileHash $exe -Algorithm SHA256).Hash.ToLower(); installer_sha256=(Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLower(); payload_ui_verified=$true; published_payload_identical=$true} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM validation/installer-verification.json
-Copy-Item $installer.FullName release-assets/CC-Switch-4.0.25-x64-setup.exe
+Copy-Item $installer.FullName release-assets/CC-Switch-4.0.27-x64-setup.exe
 Invoke-Logged 'source-archive.log' 'git' @('archive', '--format=zip', '--output=release-assets/source.zip', 'HEAD')
 # git writes the patch directly, avoiding Windows newline/encoding transformations.
 Invoke-Logged 'source-patch.log' 'git' @('diff', '--binary', '--output=release-assets/local-patches-vs-official.patch', "$env:UPSTREAM_SHA..HEAD")
