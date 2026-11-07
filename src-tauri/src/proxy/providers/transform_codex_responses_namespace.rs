@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use super::transform_codex_chat::{flatten_namespace_tool_name, tool_search_arguments_from_value};
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::canonical_json_string;
-use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, SseBuffer};
 
 /// Reverse map entry: a flattened tool name resolves back to its original
 /// namespace and bare child name.
@@ -935,8 +935,7 @@ where
 {
     let stream = super::responses_late_arguments::create_late_arguments_repair_stream(stream);
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut sse = SseBuffer::new();
         let mut tool_search_item_ids = HashMap::new();
 
         tokio::pin!(stream);
@@ -944,13 +943,13 @@ where
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    sse.push_bytes(&bytes);
+                    while let Some(block) = sse.next_block() {
                         if block.trim().is_empty() {
                             continue;
                         }
                         yield Ok(restore_sse_block(
-                            &block,
+                            block,
                             &map,
                             restore_tool_search,
                             &mut tool_search_item_ids,
@@ -966,10 +965,7 @@ where
 
         // Flush any trailing partial block (streams normally end on a delimiter,
         // but be defensive so no bytes are dropped).
-        if !utf8_remainder.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
-        }
-        let tail = std::mem::take(&mut buffer);
+        let tail = sse.take_tail();
         if !tail.trim().is_empty() {
             yield Ok(restore_sse_block(
                 &tail,

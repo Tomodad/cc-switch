@@ -92,14 +92,13 @@ where
 {
     async_stream::stream! {
         futures::pin_mut!(stream);
-        let mut buffer = String::new();
-        let mut remainder = Vec::new();
+        let mut sse = super::sse::SseBuffer::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    super::sse::append_utf8_safe(&mut buffer, &mut remainder, &bytes);
-                    while let Some(block) = super::sse::take_sse_block(&mut buffer) {
-                        yield Ok(project_block(&block));
+                    sse.push_bytes(&bytes);
+                    while let Some(block) = sse.next_block() {
+                        yield Ok(project_block(block));
                     }
                 }
                 Err(error) => {
@@ -108,10 +107,8 @@ where
                 }
             }
         }
-        if !remainder.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&remainder));
-        }
-        if !buffer.trim().is_empty() { yield Ok(project_block(&buffer)); }
+        let tail = sse.take_tail();
+        if !tail.trim().is_empty() { yield Ok(project_block(&tail)); }
     }
 }
 
@@ -165,6 +162,59 @@ mod tests {
         assert!(text.contains("\"total_tokens\":42"));
         assert!(!text.contains("\"type\":\"web_search_call\""));
         assert_eq!(text.matches("msg_ccswitch_ws_1").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sse_buffer_preserves_crlf_unicode_and_unterminated_tail() {
+        let search = json!({"type":"web_search_call","id":"ws_unicode","status":"completed",
+                            "action":{"type":"search","query":"工具检索🧰"}});
+        let block = format!(
+            "id: unicode-event\r\nevent: response.output_item.done\r\ndata: {}",
+            json!({"type":"response.output_item.done","item":search})
+        );
+        let tail = "data: [DONE]";
+        let wire = format!("{block}\r\n\r\n{tail}");
+        let expected = [project_block(&block), project_block(tail)].concat();
+        for chunk_size in 1..=16 {
+            let chunks: Vec<_> = wire
+                .as_bytes()
+                .chunks(chunk_size)
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                .collect();
+            let output = project_stream(futures::stream::iter(chunks));
+            futures::pin_mut!(output);
+            let mut actual = Vec::new();
+            while let Some(chunk) = output.next().await {
+                actual.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(actual, expected, "chunk size {chunk_size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_buffer_flushes_incomplete_utf8_and_propagates_stream_errors() {
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: incomplete \xe4\xbd",
+        ))]);
+        let output = project_stream(stream);
+        futures::pin_mut!(output);
+        assert_eq!(
+            output.next().await.unwrap().unwrap(),
+            "data: incomplete �\n\n"
+        );
+        assert!(output.next().await.is_none());
+
+        let stream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: pending")),
+            Err(std::io::Error::other("transport failed")),
+        ]);
+        let output = project_stream(stream);
+        futures::pin_mut!(output);
+        assert_eq!(
+            output.next().await.unwrap().unwrap_err().to_string(),
+            "transport failed"
+        );
+        assert!(output.next().await.is_none());
     }
 
     #[test]

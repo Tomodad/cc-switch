@@ -61,10 +61,12 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Validate frontend and build UI
-        run: ./scripts/build-local-windows.ps1 -Stage frontend
+      # Catch backend API regressions before the slower Windows frontend suite.
+      # All checks still gate packaging and publication on this exact commit.
       - name: Validate Windows backend
         run: ./scripts/build-local-windows.ps1 -Stage backend
+      - name: Validate frontend and build UI
+        run: ./scripts/build-local-windows.ps1 -Stage frontend
       - name: Build Windows NSIS package
         run: ./scripts/build-local-windows.ps1 -Stage build
       - name: Verify payload and prepare release files
