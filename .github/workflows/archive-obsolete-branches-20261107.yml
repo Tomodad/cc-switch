@@ -1,0 +1,20 @@
+name: Archive obsolete branches after installed release
+on:
+  push:
+    branches: [codex/archive-obsolete-branches-20261107]
+permissions:
+  contents: write
+  pull-requests: read
+jobs:
+  archive:
+    if: github.repository == 'Tomodad/cc-switch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preserve exact commits under tags then remove obsolete branch refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/archive-obsolete-branches-20261107.py
