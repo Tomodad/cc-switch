@@ -9718,7 +9718,9 @@ mod tests {
                     let script = format!(
                         "@chcp 65001>nul\r\n@echo off\r\ncall {repair}\r\nif errorlevel 1 exit /b %errorlevel%\r\necho continued>{continued_path}\r\nexit /b 0\r\n"
                     );
-                    let result = run_tool_lifecycle_silently(&script, "synthetic_codex_repair");
+                    let progress = ToolLifecycleProgress::noop();
+                    let result =
+                        run_tool_lifecycle_silently(&script, "synthetic_codex_repair", &progress);
                     assert_eq!(result.is_ok(), install_code == 0, "{result:?}");
                     assert_eq!(
                         std::fs::read_to_string(sub.join("calls.txt"))

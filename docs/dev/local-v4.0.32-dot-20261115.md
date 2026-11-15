@@ -43,6 +43,8 @@ The fork-only `local-windows-release.yml` triggers on this candidate branch. It 
 
 Actual CI result and artifact hashes must be read from the exact final commit's run and manifest; this document does not declare those checks passed in advance. Local Linux backend checking is blocked by missing GLib development libraries; Windows CI is authoritative. Cloud validation is not Windows GUI acceptance.
 
+The initial complete Windows check on `c44c3631ffaa04ecbb85204d57c2f840ce5d8bb3` failed at strict Clippy (run 43682396180): local Windows npm repair test needed the new official no-op progress argument; a custom-bucket test helper needed `cfg(test)`; upstream WorkBuddy's Unix-only permission path variable was unused on Windows. These are fixed without relaxing assertions or warnings. Superseded preparation runs were canceled. Final run results must still be checked.
+
 ## Private backup, rollback and local acceptance
 
 Database schema changes **24 to 26**. The official automatic backup logs a warning and continues on failure. Before first launch, close CC Switch and Codex and independently copy/verify their configuration, CC Switch database plus any WAL/SHM, and Codex history/native login into private storage. Verify an isolated restore, not just existence of a backup. Never upload private data to this repository or CI.
