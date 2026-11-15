@@ -3668,7 +3668,26 @@ mod mode_tests {
                 settings.unify_codex_session_history = false;
                 crate::settings::update_settings(settings.clone()).unwrap();
                 crate::services::provider::reapply_current_codex_official_live(&state).unwrap();
+                // .32 also keeps openai outside unified mode when a native login
+                // is available and no client-owned provider-table keys require custom.
+                assert_eq!(selector(), None);
+                let with_login = fs::read_to_string(&config_path).unwrap();
+                assert!(with_login.contains("openai_base_url"));
+                assert!(!with_login.contains("sk-api-only"));
+                let auth_path = crate::codex_config::get_codex_auth_path();
+                assert_eq!(
+                    crate::config::read_json_file::<Value>(&auth_path).unwrap(),
+                    native_auth
+                );
+                // Without a native login, non-unified mode must fall back to the
+                // separate API identity rather than leave Codex on its login page.
+                fs::remove_file(&auth_path).unwrap();
+                crate::services::provider::reapply_current_codex_official_live(&state).unwrap();
                 assert_eq!(selector().as_deref(), Some("custom"));
+                assert!(!fs::read_to_string(&config_path)
+                    .unwrap()
+                    .contains("openai_base_url"));
+                fs::write(&auth_path, serde_json::to_vec(&native_auth).unwrap()).unwrap();
                 settings.unify_codex_session_history = true;
                 crate::settings::update_settings(settings).unwrap();
                 crate::services::provider::reapply_current_codex_official_live(&state).unwrap();

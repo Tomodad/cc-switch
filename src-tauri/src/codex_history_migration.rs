@@ -3297,7 +3297,7 @@ model_provider = "aihubmix"
 
     #[test]
     #[serial]
-    fn unify_migration_keeps_moving_new_official_sessions_after_opt_in() {
+    fn unify_v2_moves_legacy_custom_once_without_reversing_official_history() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
         }
@@ -3305,71 +3305,157 @@ model_provider = "aihubmix"
         enable_unify_toggle(true);
         let codex_dir = home.codex_dir();
         let session_dir = codex_dir.join("sessions/2026/11/08");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        fs::write(codex_dir.join("config.toml"), UNIFIED_CONFIG).expect("write config");
+        fs::create_dir_all(&session_dir).unwrap();
         fs::write(
-            session_dir.join("rollout-s1.jsonl"),
-            session_meta_line("s1", "openai"),
+            codex_dir.join("config.toml"),
+            "model_provider = \"openai\"\n",
         )
-        .expect("write s1");
+        .unwrap();
+        let official = session_meta_line("s1", "openai");
+        fs::write(session_dir.join("rollout-s1.jsonl"), &official).unwrap();
         fs::write(
             session_dir.join("rollout-s2.jsonl"),
             session_meta_line("s2", "custom"),
         )
-        .expect("write s2");
+        .unwrap();
         let state_db = codex_dir.join(CODEX_STATE_DB_FILENAME);
-        seed_threads(&state_db, &[("s1", "openai"), ("s2", "custom")]);
+        seed_threads(
+            &state_db,
+            &[("s1", "openai"), ("s2", "custom"), ("other", "unrelated")],
+        );
 
-        let first = maybe_migrate_codex_official_history_to_unified_bucket().expect("first pass");
+        let first = maybe_migrate_codex_official_history_to_unified_bucket().unwrap();
         assert_eq!(first.skipped_reason, None);
+        assert_eq!(first.source_provider_ids, vec!["custom"]);
         assert_eq!(first.migrated_jsonl_files, 1);
         assert_eq!(first.migrated_state_rows, 1);
-        assert_eq!(thread_provider(&state_db, "s1"), "custom");
+        assert_eq!(thread_provider(&state_db, "s1"), "openai");
+        assert_eq!(thread_provider(&state_db, "s2"), "openai");
+        assert_eq!(thread_provider(&state_db, "other"), "unrelated");
+        assert_eq!(
+            fs::read_to_string(session_dir.join("rollout-s1.jsonl")).unwrap(),
+            official
+        );
+        assert!(fs::read_to_string(session_dir.join("rollout-s2.jsonl"))
+            .unwrap()
+            .contains("\"model_provider\":\"openai\""));
 
-        // 之后又冒出一个 openai 会话（例如开关关过又开、或绕过 CC Switch 用过 Codex）：
-        // 完成标记不再挡住，下一次照样迁。
-        fs::write(
-            session_dir.join("rollout-s3.jsonl"),
-            session_meta_line("s3", "openai"),
-        )
-        .expect("write s3");
+        // A later official session is already in the correct bucket. Startup must
+        // neither reverse it nor create another migration generation.
+        let later = session_meta_line("s3", "openai");
+        fs::write(session_dir.join("rollout-s3.jsonl"), &later).unwrap();
         Connection::open(&state_db)
-            .expect("open state db")
+            .unwrap()
             .execute(
                 "INSERT INTO threads (id, model_provider) VALUES ('s3', 'openai')",
                 [],
             )
-            .expect("insert s3");
-        let second = maybe_migrate_codex_official_history_to_unified_bucket().expect("second pass");
-        assert_eq!(second.skipped_reason, None);
-        assert_eq!(second.migrated_state_rows, 1);
-        assert_eq!(thread_provider(&state_db, "s3"), "custom");
-        assert!(fs::read_to_string(session_dir.join("rollout-s3.jsonl"))
-            .expect("read s3")
-            .contains("\"model_provider\":\"custom\""));
-
-        // 再没有 openai 线程：只查一次 state DB 就返回，不扫会话目录。
-        let third = maybe_migrate_codex_official_history_to_unified_bucket().expect("third pass");
-        assert_eq!(third.skipped_reason.as_deref(), Some("nothing_to_migrate"));
+            .unwrap();
+        for _ in 0..2 {
+            let outcome = maybe_migrate_codex_official_history_to_unified_bucket().unwrap();
+            assert_eq!(outcome.skipped_reason.as_deref(), Some("already_migrated"));
+            assert_eq!(outcome.migrated_jsonl_files, 0);
+            assert_eq!(outcome.migrated_state_rows, 0);
+            assert_eq!(thread_provider(&state_db, "s3"), "openai");
+            assert_eq!(
+                fs::read_to_string(session_dir.join("rollout-s3.jsonl")).unwrap(),
+                later
+            );
+        }
+        let backups = get_app_config_dir().join("backups/codex-unified-openai-history-v2");
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
     }
 
     #[test]
     #[serial]
-    fn unify_migration_waits_until_live_selects_the_shared_bucket() {
+    fn unify_v2_waits_for_builtin_openai_in_the_actual_live_profile() {
         if crate::config::sqlite_unsupported_in_temp_dir() {
             return;
         }
-        let home = IsolatedHome::new();
-        enable_unify_toggle(true);
-        let codex_dir = home.codex_dir();
-        fs::create_dir_all(&codex_dir).expect("create codex dir");
-        fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.5\"\n").expect("write config");
-        let state_db = codex_dir.join(CODEX_STATE_DB_FILENAME);
-        seed_threads(&state_db, &[("s1", "openai")]);
+        for (config, allowed) in [
+            (UNIFIED_CONFIG, false),
+            ("model_provider = \"unrelated\"\n", false),
+            ("not = [valid", false),
+            ("model = \"gpt-5.5\"\n", true),
+            ("model_provider = \"openai\"\n", true),
+            ("model_provider = \"openai\"\nprofile = \"p\"\n[profiles.p]\nmodel_provider = \"custom\"\n", false),
+            ("model_provider = \"custom\"\nprofile = \"p\"\n[profiles.p]\nmodel_provider = \"openai\"\n", true),
+        ] {
+            let home = IsolatedHome::new();
+            enable_unify_toggle(true);
+            let codex_dir = home.codex_dir();
+            fs::create_dir_all(codex_dir.join("sessions")).unwrap();
+            fs::write(codex_dir.join("config.toml"), config).unwrap();
+            let file = codex_dir.join("sessions/rollout-api.jsonl");
+            let original = session_meta_line("api", "custom");
+            fs::write(&file, &original).unwrap();
+            let state_db = codex_dir.join(CODEX_STATE_DB_FILENAME);
+            seed_threads(&state_db, &[("api", "custom"), ("official", "openai")]);
+            let outcome = maybe_migrate_codex_official_history_to_unified_bucket().unwrap();
+            assert_eq!(outcome.skipped_reason.as_deref(), if allowed { None } else { Some("live_not_unified") }, "{config}");
+            assert_eq!(outcome.migrated_jsonl_files, usize::from(allowed), "{config}");
+            assert_eq!(outcome.migrated_state_rows, usize::from(allowed), "{config}");
+            assert_eq!(thread_provider(&state_db, "api"), if allowed { "openai" } else { "custom" }, "{config}");
+            assert_eq!(thread_provider(&state_db, "official"), "openai");
+            if !allowed {
+                assert_eq!(fs::read_to_string(&file).unwrap(), original);
+            }
+        }
+    }
 
-        let outcome = maybe_migrate_codex_official_history_to_unified_bucket().expect("check");
-        assert_eq!(outcome.skipped_reason.as_deref(), Some("live_not_unified"));
-        assert_eq!(thread_provider(&state_db, "s1"), "openai");
+    #[test]
+    #[serial]
+    fn unify_v2_completion_marker_is_bound_to_both_directory_and_target() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        for (target, same_dir, skipped) in [
+            ("custom", true, false),
+            ("openai", false, false),
+            ("openai", true, true),
+        ] {
+            let home = IsolatedHome::new();
+            enable_unify_toggle(true);
+            let codex_dir = home.codex_dir();
+            fs::create_dir_all(&codex_dir).unwrap();
+            fs::write(
+                codex_dir.join("config.toml"),
+                "model_provider = \"openai\"\n",
+            )
+            .unwrap();
+            let state_db = codex_dir.join(CODEX_STATE_DB_FILENAME);
+            seed_threads(&state_db, &[("api", "custom")]);
+            assert!(
+                crate::settings::mark_codex_official_history_unify_migrated_if_enabled(
+                    CodexOfficialHistoryUnifyMigration {
+                        completed_at: Utc::now().to_rfc3339(),
+                        target_provider_id: target.to_string(),
+                        migrated_jsonl_files: 0,
+                        migrated_state_rows: 0,
+                        codex_config_dir: Some(canonical_dir_string(&if same_dir {
+                            codex_dir.clone()
+                        } else {
+                            home.dir.path().join("other-codex")
+                        })),
+                    }
+                )
+                .unwrap()
+            );
+            let outcome = maybe_migrate_codex_official_history_to_unified_bucket().unwrap();
+            assert_eq!(
+                outcome.skipped_reason.as_deref(),
+                if skipped {
+                    Some("already_migrated")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(outcome.migrated_state_rows, usize::from(!skipped));
+            assert_eq!(
+                thread_provider(&state_db, "api"),
+                if skipped { "custom" } else { "openai" }
+            );
+        }
     }
 
     #[test]

@@ -71,6 +71,8 @@ Database schema changes from 24 to 26 when upgrading from the installed local 4.
 
 Exit CC Switch, then install CC-Switch-{version}-x64-setup.exe. This is an unsigned fork build; Windows may show a publisher warning. Signing and automatic-updater artifacts are not included. Existing official updater endpoints and public key are unchanged. Installation and live-client/GUI acceptance have not been performed by this CI build.
 
+Dot identity has priority: unified history retains built-in openai and the native login, and uses the local proxy for API routes. Pause official login and unified history are mutually exclusive. Opt-in legacy history migration is custom-to-openai only, with backups; official sessions are never automatically moved into custom. Dot still requires a valid eligible official account. See docs/dev/local-v4.0.32-dot-20261115.md in source.zip for the retained patch matrix, conflict decisions, failed-run history and local acceptance checklist.
+
 Retained compatibility changes against the official release are in local-patches-vs-official.patch; full source is source.zip. SHA256SUMS.txt covers all other release assets. No user profiles, databases or authentication files are included.
 '''
     (assets / 'RELEASE-NOTES.md').write_text(notes, encoding='utf-8', newline='\n')
