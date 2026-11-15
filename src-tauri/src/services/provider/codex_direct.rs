@@ -1412,7 +1412,10 @@ mod tests {
         let previous = crate::settings::get_settings();
         let mut settings = previous.clone();
         settings.unify_codex_session_history = true;
+        // A legacy conflicting preference must not replace the Dot identity.
+        settings.codex_proxy_without_official_login = true;
         crate::settings::update_settings(settings).unwrap();
+        assert!(!crate::settings::codex_proxy_without_official_login());
         let db = Database::memory().unwrap();
         let provider = Provider::with_id(
             "api".to_string(),

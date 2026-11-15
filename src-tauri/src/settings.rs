@@ -554,15 +554,12 @@ pub struct AppSettings {
     /// 手动开关，默认关。
     #[serde(default)]
     pub codex_proxy_without_official_login: bool,
-    /// Run official Codex providers under the shared "custom" model_provider id
-    /// so official sessions share one resume-history bucket with third-party
-    /// providers. Opt-in: defaults to false.
+    /// Preserve built-in openai identity and native login for unified history and Dot.
+    /// Third-party routes require the local proxy. Mutually exclusive with login pause.
     #[serde(default)]
     pub unify_codex_session_history: bool,
-    /// User opted in (via the enable dialog checkbox) to migrate official
-    /// sessions ("openai" bucket) into the shared bucket. While set, every
-    /// launch also moves official sessions left behind since; cleared when the
-    /// toggle turns off.
+    /// Opt in to backed-up legacy custom-to-openai history migration.
+    /// The v2 directory/target marker prevents repeated migration; cleared on disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unify_codex_migrate_existing: Option<bool>,
     /// Codex 聚合模式下，合并目录里的每个模型都改用经典子 agent 工具（`multi_agent_version`

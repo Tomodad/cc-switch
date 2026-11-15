@@ -4396,8 +4396,7 @@ model_provider = "c"
         exit(&state, &AppType::Codex).await.expect("exit");
     }
 
-    /// 有登录也仍写 custom 表的两种情况：统一会话历史开着（本来全在 custom 组），行里写了
-    /// 内置 openai 表达不了的客户端设置（流空闲超时等，Codex 只认 provider 表上的）。
+    /// Unified history preserves Dot; outside it, client-owned settings require custom.
     #[tokio::test]
     #[serial]
     async fn codex_third_party_route_keeps_the_custom_table_when_openai_cannot_carry_it() {
@@ -4424,6 +4423,17 @@ model_provider = "c"
             ProviderService::switch(&state, AppType::Codex, route).expect("direct");
             enter(&state, &AppType::Codex, false).await.expect("enter");
             let doc = codex_doc();
+            if unified {
+                assert!(doc.get("model_provider").is_none(), "{}", codex_text());
+                assert!(
+                    doc["openai_base_url"].as_str().is_some(),
+                    "{}",
+                    codex_text()
+                );
+                assert_eq!(codex_login_file(), Some(chatgpt_login("acct")));
+                exit(&state, &AppType::Codex).await.expect("exit");
+                continue;
+            }
             assert_eq!(
                 doc.get("model_provider").and_then(|v| v.as_str()),
                 Some("custom"),

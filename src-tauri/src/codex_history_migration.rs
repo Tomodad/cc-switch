@@ -3083,6 +3083,13 @@ model_provider = "aihubmix"
         let source = session_meta_line("api", "custom") + search;
         let file = sessions.join("rollout-api.jsonl");
         fs::write(&file, &source).unwrap();
+        let old_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
         let official = session_meta_line("official", "openai") + search;
         fs::write(sessions.join("rollout-official.jsonl"), &official).unwrap();
         let db = dir.join(CODEX_STATE_DB_FILENAME);
@@ -3101,6 +3108,7 @@ model_provider = "aihubmix"
         let result = maybe_migrate_codex_official_history_to_unified_bucket().unwrap();
         assert_eq!(result.migrated_jsonl_files, 1);
         assert_eq!(result.migrated_state_rows, 1);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), old_mtime);
         assert_eq!(thread_provider(&db, "api"), "openai");
         assert_eq!(thread_provider(&db, "other"), "unrelated");
         let migrated = fs::read_to_string(&file).unwrap();
