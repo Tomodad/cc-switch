@@ -9751,6 +9751,10 @@ mod tests {
                 request["input"].as_array_mut().unwrap().extend([
                     json!({"type":"web_search_call", "id":"ws_foreign", "status":"completed", "action":{"type":"search", "query":"history"}}),
                     json!({"type":"function_call_output", "namespace":"codex_app", "name":"create_thread", "output":"<codex_delegation><source_thread_id>12345678-1234-4234-8234-123456789abc</source_thread_id><input>Review the file</input></codex_delegation>"}),
+                    json!({"type":"agent_message", "author":"/root", "recipient":"/root/worker", "content":[
+                        {"type":"input_text", "text":"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+                        {"type":"encrypted_content", "encrypted_content":"gAAAAB-active-task"}
+                    ]}),
                 ]);
                 let result = forwarder(true)
                     .forward_with_retry(
@@ -9792,6 +9796,7 @@ mod tests {
                         .iter()
                         .any(|tool| tool["name"] == "tool_search"));
                     assert!(!attempt.headers.contains_key("chatgpt-account-id"));
+                    assert_eq!(task_ciphertext(attempt), "gAAAAB-active-task");
                 }
             }
         }
