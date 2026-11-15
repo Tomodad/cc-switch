@@ -156,7 +156,10 @@ export function CodexAuthSettings({
           body: t("settings.unifyCodexSessionHistoryDescription"),
         }}
         description={t("settings.codexPauseOfficialLogin.unifiedPriority")}
-        disabled={settings.codexProxyWithoutOfficialLogin ?? false}
+        disabled={
+          (settings.codexProxyWithoutOfficialLogin ?? false) &&
+          !(settings.unifyCodexSessionHistory ?? false)
+        }
         checked={settings.unifyCodexSessionHistory ?? false}
         onCheckedChange={handleUnifyHistoryChange}
       />
