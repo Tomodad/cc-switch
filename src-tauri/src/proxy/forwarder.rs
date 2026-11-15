@@ -2219,12 +2219,6 @@ impl RequestForwarder {
             {
                 mapped_body["max_output_tokens"] = Value::from(max_out);
             }
-            // Anthropic requires max_tokens; fall back to this default only when the
-            // Codex request omits max_output_tokens (rare — Codex normally sends it).
-            // Kept conservative so a low-output-ceiling model or relay does not hard-400
-            // on the fallback (a too-high default 400s and is non-retryable); 8192 is
-            // accepted by every current Claude model and virtually all gateways. The
-            // transform clamps any thinking budget below this value.
             codex_tool_context = prepare_codex_tool_search_context(
                 app_type,
                 provider,
@@ -2233,7 +2227,6 @@ impl RequestForwarder {
                 apply_body_overrides,
                 &mut mapped_body,
             );
-            const DEFAULT_CODEX_ANTHROPIC_MAX_TOKENS: u64 = 8192;
             let mut anthropic_body =
                 super::providers::transform_codex_anthropic::responses_request_to_anthropic(
                     mapped_body,
