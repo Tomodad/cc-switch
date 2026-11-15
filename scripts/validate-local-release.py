@@ -24,9 +24,9 @@ def main():
     base = git('rev-parse', os.environ['UPSTREAM_SHA'] + '^{commit}')
     subprocess.run(['git', 'merge-base', '--is-ancestor', base, sha], check=True)
     version = json.loads(Path('package.json').read_text())['version']
-    assert version == '4.0.27'
+    assert version == '4.0.32'
     assert json.loads(Path('src-tauri/tauri.conf.json').read_text())['version'] == version
-    for name in ['cc-switch.exe', 'CC-Switch-4.0.27-x64-setup.exe']:
+    for name in ['cc-switch.exe', 'CC-Switch-4.0.32-x64-setup.exe']:
         path = assets / name
         with path.open('rb') as stream:
             assert stream.read(2) == b'MZ', f'{name} is not a Windows executable'
@@ -45,7 +45,7 @@ def main():
     assert comparison['payload_executable_sha256'] == payload['payload_executable_sha256']
     assert payload['payload_executable_sha256'] == payload['executable_sha256']
     assert payload['executable_sha256'] == digest(assets / 'cc-switch.exe')
-    assert payload['installer_sha256'] == digest(assets / 'CC-Switch-4.0.27-x64-setup.exe')
+    assert payload['installer_sha256'] == digest(assets / 'CC-Switch-4.0.32-x64-setup.exe')
     with zipfile.ZipFile(assets / 'source.zip') as archive:
         assert archive.testzip() is None
         assert json.loads(archive.read('package.json'))['version'] == version
@@ -67,7 +67,7 @@ Build and test run: {url}
 
 Frontend formatting, typecheck, unit tests and production build passed. Windows backend formatting, all-target Clippy with warnings denied, nextest and doctests passed. Existing ignored tests remain ignored; consult validation.zip for complete output. Both the build executable and extracted NSIS payload independently verified their embedded production pages and assets. Their complete bytes match after exactly one documented Tauri bundle marker substitution (UNK to NSS); any other difference fails validation. The published cc-switch.exe is the verified installer payload and matches it byte-for-byte. Raw and normalized hashes are recorded in validation.zip.
 
-Database schema remains 24 when upgrading from 4.0.25. Upgrading from 4.0.17 still changes schema 20 to 24. Before first launch, fully exit CC Switch and separately back up its configuration directory and database (including any WAL/SHM files), plus relevant Codex configuration/history. The built-in pre-migration backup can fail without blocking migration. Downgrading to 4.0.17 requires restoring the pre-upgrade backup, not merely replacing the executable. Do not upload private backups.
+Database schema changes from 24 to 26 when upgrading from the installed local 4.0.27. Independently verify a private backup and a restore in isolation before first launch. Before first launch, fully exit CC Switch and separately back up its configuration directory and database (including any WAL/SHM files), plus relevant Codex configuration/history. The built-in pre-migration backup can fail without blocking migration. Rollback to local 4.0.27 requires restoring the pre-upgrade schema-24 backup, not merely replacing the executable. Never open a schema-26 database with the old executable. Do not upload private backups.
 
 Exit CC Switch, then install CC-Switch-{version}-x64-setup.exe. This is an unsigned fork build; Windows may show a publisher warning. Signing and automatic-updater artifacts are not included. Existing official updater endpoints and public key are unchanged. Installation and live-client/GUI acceptance have not been performed by this CI build.
 

@@ -2,7 +2,7 @@ name: Local Windows release
 
 on:
   push:
-    branches: [codex/integration-v4.0.27-20261107]
+    branches: [candidate/v4.0.32-dot-20261115]
   workflow_dispatch:
 
 permissions:
@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: local-v4.0.27-20261107
-  UPSTREAM_TAG: v4.0.27
-  UPSTREAM_SHA: 26629ff49f0ca3c2ea9fee426ce8e911d52d2a85
+  RELEASE_TAG: local-v4.0.32-dot-20261115
+  UPSTREAM_TAG: v4.0.32
+  UPSTREAM_SHA: 93d2381c8730aaf0078d44cd9c060dfa8133f859
 
 jobs:
   build:
@@ -117,5 +117,5 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" ./* \
             --target "$SOURCE_SHA" \
-            --title 'CC Switch 4.0.27 local integration (Windows x64)' \
+            --title 'CC Switch 4.0.32 Dot candidate (Windows x64)' \
             --notes-file RELEASE-NOTES.md --latest=false

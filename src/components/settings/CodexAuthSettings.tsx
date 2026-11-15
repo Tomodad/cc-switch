@@ -155,6 +155,8 @@ export function CodexAuthSettings({
           title: t("settings.unifyCodexSessionHistory"),
           body: t("settings.unifyCodexSessionHistoryDescription"),
         }}
+        description={t("settings.codexPauseOfficialLogin.unifiedPriority")}
+        disabled={settings.codexProxyWithoutOfficialLogin ?? false}
         checked={settings.unifyCodexSessionHistory ?? false}
         onCheckedChange={handleUnifyHistoryChange}
       />
@@ -182,6 +184,8 @@ export function CodexAuthSettings({
         title={t("confirm.unifyCodexHistory.title")}
         message={t("confirm.unifyCodexHistory.message")}
         checkboxLabel={t("confirm.unifyCodexHistory.migrateExisting")}
+        // 新版 Codex 会锁住留在官方组的会话，默认勾上迁入
+        checkboxDefaultChecked
         confirmText={t("confirm.unifyCodexHistory.confirm")}
         variant="info"
         onConfirm={handleEnableConfirm}
