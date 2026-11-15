@@ -3623,7 +3623,20 @@ mod mode_tests {
                 }),
                 None,
             );
-            let state = state_with(AppType::Codex, &[official.clone(), api], &official.id).await;
+            let mut next_api = api.clone();
+            next_api.id = "api-next-model".to_string();
+            next_api.settings_config["config"] = serde_json::Value::String(
+                next_api.settings_config["config"]
+                    .as_str()
+                    .unwrap()
+                    .replace("gpt-5.4", "gpt-5.5"),
+            );
+            let state = state_with(
+                AppType::Codex,
+                &[official.clone(), api, next_api],
+                &official.id,
+            )
+            .await;
             ProviderService::switch(&state, AppType::Codex, &official.id).expect("direct official");
             let config_path = crate::codex_config::get_codex_config_path();
             let selector = || -> Option<String> {
@@ -3682,8 +3695,19 @@ mod mode_tests {
                 // Without a native login, non-unified mode must fall back to the
                 // separate API identity rather than leave Codex on its login page.
                 fs::remove_file(&auth_path).unwrap();
-                crate::services::provider::reapply_current_codex_official_live(&state).unwrap();
+                // Identical contracts intentionally leave client files alone. A
+                // different client model makes this a real route-contract change.
+                set_route(&state, &AppType::Codex, "api-next-model")
+                    .await
+                    .unwrap();
                 assert_eq!(selector().as_deref(), Some("custom"));
+                assert!(
+                    !auth_path.exists(),
+                    "a route switch must not recreate the removed login"
+                );
+                let without_login = fs::read_to_string(&config_path).unwrap();
+                let without_login_doc: toml::Table = toml::from_str(&without_login).unwrap();
+                assert_eq!(without_login_doc["model"].as_str(), Some("gpt-5.5"));
                 assert!(!fs::read_to_string(&config_path)
                     .unwrap()
                     .contains("openai_base_url"));
